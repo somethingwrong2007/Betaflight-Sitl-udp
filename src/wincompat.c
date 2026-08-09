@@ -16,6 +16,11 @@
 #include <windows.h>
 
 extern uint64_t micros64_real(void);
+extern uint64_t sitlMicros64(void);
+extern uint64_t sitlMillis64(void);
+extern uint32_t sitlMicros(void);
+extern uint32_t sitlMillis(void);
+extern void sitlDelayMicroseconds(uint32_t us);
 extern uint32_t sitlGetCycleCounter(void);
 
 void dyad_update(void)
@@ -27,23 +32,60 @@ void dyad_update(void)
     Sleep(10);
 }
 
+// Stepped virtual time, mirroring AJ92/SimITL: time advances by a fixed step
+// per scheduler pass instead of tracking the real-time clock. The scheduler's
+// gyro busy-wait then exits within a few steps (no spin, no starvation), and
+// the gyro/PID loop rate is set by the step size and the run-loop cadence.
+// Set BF_SITL_LOW_CPU=0 to use the official real-time time base instead.
+static uint64_t sitlVirtualTimeUs = 0;
+
+static bool sitlLowCpuMode(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("BF_SITL_LOW_CPU");
+        cached = (env == NULL || strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+void sitlStepTime(uint64_t stepUs)
+{
+    sitlVirtualTimeUs += stepUs;
+}
+
+uint64_t micros64(void)
+{
+    return sitlLowCpuMode() ? sitlVirtualTimeUs : sitlMicros64();
+}
+
+uint32_t micros(void)
+{
+    return sitlLowCpuMode() ? (uint32_t)(sitlVirtualTimeUs & 0xFFFFFFFF) : sitlMicros();
+}
+
+uint64_t millis64(void)
+{
+    return sitlLowCpuMode() ? sitlVirtualTimeUs / 1000 : sitlMillis64();
+}
+
+uint32_t millis(void)
+{
+    return sitlLowCpuMode() ? (uint32_t)((sitlVirtualTimeUs / 1000) & 0xFFFFFFFF) : sitlMillis();
+}
+
 uint32_t getCycleCounter(void)
 {
-    // The SITL scheduler spin-waits on the cycle counter for the next gyro
-    // tick, which burns a full CPU core even when no flight simulator is
-    // attached. Sleeping on every third call turns that busy loop (and the
-    // scheduler's own bookkeeping) into a ~1 ms poll without starving the
-    // low-priority serial/MSP task. The gyro/PID period is widened to 5 ms in
-    // main_windows.c so the widened schedule stays stable. Set
-    // BF_SITL_LOW_CPU=0 for the official behavior.
-    const char *lowCpu = getenv("BF_SITL_LOW_CPU");
-    if (lowCpu == NULL || strcmp(lowCpu, "0") != 0) {
-        static uint32_t callCount = 0;
-        if ((++callCount % 3) == 0) {
-            Sleep(1);
-        }
+    return sitlLowCpuMode() ? (uint32_t)(sitlVirtualTimeUs & 0xFFFFFFFF) : sitlGetCycleCounter();
+}
+
+void delayMicroseconds(uint32_t us)
+{
+    if (sitlLowCpuMode()) {
+        sitlStepTime(us);
+    } else {
+        sitlDelayMicroseconds(us);
     }
-    return sitlGetCycleCounter();
 }
 #endif
 

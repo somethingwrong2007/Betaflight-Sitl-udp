@@ -48,11 +48,14 @@ The first run creates `eeprom.bin` (32 KiB) in the working directory.
 
 On Windows the SITL scheduler normally spin-waits for the next gyro tick,
 which consumes a full CPU core even when no flight simulator is attached.
-This build replaces that busy-wait with a sleeping poll by default, cutting
-SITL CPU use from ~100% of a core to ~2% at the cost of a 10 kHz -> ~200 Hz
-gyro/PID loop (fine for SITL and ground-station use). The serial/MSP task is
-rescheduled to 1 kHz so the configurator stays responsive. To restore the
-official busy-wait behavior, set `BF_SITL_LOW_CPU=0`:
+This build instead runs the scheduler on a stepped virtual clock (the same
+approach as AJ92/SimITL): virtual time advances in fixed 500 us steps, so the
+gyro busy-wait terminates in a couple of steps instead of spinning. The
+gyro/filter/PID loop runs at ~1 kHz (matching a 1 kHz external physics
+simulator), the serial/MSP task gets the alternate scheduler passes so the
+configurator stays responsive, and CPU use stays near 1% of a core. To
+restore the official real-time 10 kHz busy-wait behavior, set
+`BF_SITL_LOW_CPU=0`:
 
 ```powershell
 $env:BF_SITL_LOW_CPU = 0  # official 10 kHz busy-wait

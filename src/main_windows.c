@@ -181,16 +181,16 @@ int main(int argc, char *argv[])
     // Low-CPU mode (see wincompat.c getCycleCounter) paces the scheduler with
     // ~1 ms sleeps, so the gyro/PID period must stay well above that
     // granularity or the scheduler locks into gyro catch-up and starves every
-    // other task (MSP/serial included). 5000 us keeps the spin-wait overshoot
-    // below one period. The serial task also needs a shorter period than its
-    // default 10 ms or it loses the priority selection to medium-priority
+    // other task (MSP/serial included). 1000 us matches the external physics
+    // simulator's 1 kHz rate. The serial task also needs a shorter period than
+    // its default 10 ms or it loses the priority selection to medium-priority
     // tasks at the reduced scheduler cadence. Set BF_SITL_LOW_CPU=0 for the
     // official 10 kHz busy-wait behavior.
     const char *lowCpu = getenv("BF_SITL_LOW_CPU");
     if (lowCpu == NULL || strcmp(lowCpu, "0") != 0) {
-        rescheduleTask(TASK_GYRO, 5000);
-        rescheduleTask(TASK_FILTER, 5000);
-        rescheduleTask(TASK_PID, 5000);
+        rescheduleTask(TASK_GYRO, 1000);
+        rescheduleTask(TASK_FILTER, 1000);
+        rescheduleTask(TASK_PID, 1000);
         // The reduced scheduler cadence makes the default 10 ms serial task
         // (low priority) lose the priority selection to medium-priority
         // tasks, which starves MSP and makes the configurator time out during
@@ -226,11 +226,32 @@ int main(int argc, char *argv[])
 
 void FAST_CODE run(void)
 {
+    extern void sitlStepTime(uint64_t stepUs);
+    const char *lowCpu = getenv("BF_SITL_LOW_CPU");
+    const bool lowCpuMode = (lowCpu == NULL || strcmp(lowCpu, "0") != 0);
+    uint32_t iter = 0;
     while (true) {
+        if (lowCpuMode) {
+            // Virtual time advances 500 us per scheduler pass (2 kHz virtual
+            // clock). With the gyro/PID period rescheduled to 1000 us below,
+            // the scheduler runs gyro+filter+PID every second pass and gives
+            // the serial/MSP task the other passes, so nothing starves.
+            sitlStepTime(500);
+        }
         scheduler();
 
+        if (lowCpuMode) {
+            // Pace the real-time loop: sleep ~1 ms every four passes, which
+            // puts the scheduler cadence near 2 kHz so gyro/PID runs at
+            // ~1 kHz while the serial/MSP task gets the alternate passes.
+            if ((++iter % 4) == 0) {
+                Sleep(1);
+            }
+        }
 #if defined(RUN_LOOP_DELAY_US) && RUN_LOOP_DELAY_US > 0
-        delayMicroseconds_real(RUN_LOOP_DELAY_US);
+        else {
+            delayMicroseconds_real(RUN_LOOP_DELAY_US);
+        }
 #endif
     }
 }

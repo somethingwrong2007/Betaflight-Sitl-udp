@@ -3,6 +3,7 @@ build-*/
 /.edge-test-profile*/
 /bf-configurator/
 /.simitl-ref/
+/.simitl-ref2/
 /test-origin.mjs
 *.bin
 *.log

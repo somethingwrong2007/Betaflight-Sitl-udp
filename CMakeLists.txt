@@ -421,9 +421,11 @@ if(WIN32)
   list(REMOVE_ITEM BF_SOURCES "${BF_ROOT}/src/platform/SIMULATOR/udplink.c")
   list(REMOVE_ITEM BF_SOURCES "${BF_ROOT}/src/main/main.c")
   list(REMOVE_ITEM BF_SOURCES "${BF_ROOT}/src/main/drivers/serial_tcp.c")
-  # Rename sitl.c's getCycleCounter() so wincompat.c can provide a sleeping
-  # variant that stops the SITL scheduler's gyro busy-wait.
-  set_source_files_properties("${BF_ROOT}/src/platform/SIMULATOR/sitl.c" PROPERTIES COMPILE_OPTIONS "-DgetCycleCounter=sitlGetCycleCounter")
+  # Rename sitl.c's time functions so wincompat.c can provide stepped virtual
+  # time (like AJ92/SimITL): the scheduler's gyro busy-wait then terminates in
+  # a few fixed steps instead of spinning in real time.
+  set_source_files_properties("${BF_ROOT}/src/platform/SIMULATOR/sitl.c" PROPERTIES COMPILE_OPTIONS
+    "-Dmicros64=sitlMicros64;-Dmillis64=sitlMillis64;-Dmicros=sitlMicros;-Dmillis=sitlMillis;-DdelayMicroseconds=sitlDelayMicroseconds;-DgetCycleCounter=sitlGetCycleCounter")
   # The dyad-based TCP bridge is replaced by serial_tcp_win.c; dyad_update()
   # busy-spins when no streams exist, so wincompat.c provides a sleeping stub.
   set_source_files_properties("${BF_ROOT}/lib/main/dyad/dyad.c" PROPERTIES COMPILE_OPTIONS "-Ddyad_update=dyad_update_real")
@@ -446,6 +448,7 @@ target_compile_definitions(betaflight_SITL PRIVATE
   SITL
   SIMULATOR
   SIMULATOR_BUILD
+  SITL_ATTITUDE_DIRECT
   __TARGET__=\"SITL\"
   __REVISION__=\"1\"
   __FORKNAME__=\"betaflight\"
