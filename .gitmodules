@@ -1,0 +1,4 @@
+[submodule "extern/betaflight"]
+	path = extern/betaflight
+	url = https://github.com/betaflight/betaflight.git
+	branch = master
