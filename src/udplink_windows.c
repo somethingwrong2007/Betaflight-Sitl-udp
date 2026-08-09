@@ -18,6 +18,61 @@
 
 static bool wsaInitialized = false;
 
+// Unreal FDM clock hook. The official SITL receive thread calls
+// udpRecv(&stateLink, &fdmPkt, sizeof(fdm_packet), 100) on port 9003; the
+// fdm_packet struct starts with `double timestamp` (seconds). Each valid
+// datagram here adds the timestamp delta to a pending queue and signals the
+// main loop, which steps the virtual clock by that amount (see main_windows.c
+// and wincompat.c). This keeps all Unreal integration outside the Betaflight
+// submodule.
+#define SITL_FDM_PORT       9003
+#define SITL_FDM_PACKET_SIZE 144 // sizeof(fdm_packet): 18 doubles
+#define SITL_MAX_FDM_DELTA_US 50000
+
+static HANDLE gFdmEvent = NULL;
+static volatile LONG64 gFdmPendingUs = 0;
+static volatile LONG gFdmPacketCount = 0;
+static double gFdmLastTs = -1.0;
+static double gFdmRemainderUs = 0.0;
+
+void sitlUdpFdmInit(void)
+{
+    if (gFdmEvent == NULL) {
+        gFdmEvent = CreateEventA(NULL, FALSE, FALSE, NULL);
+    }
+}
+
+HANDLE sitlUdpFdmEvent(void)
+{
+    return gFdmEvent;
+}
+
+// Returns and clears the accumulated FDM virtual-time microseconds.
+uint64_t sitlUdpFdmTakePendingUs(void)
+{
+    return (uint64_t)InterlockedExchange64(&gFdmPendingUs, 0);
+}
+
+// True once at least two FDM datagrams have arrived (avoids switching on a
+// single stray packet).
+bool sitlUdpFdmHasData(void)
+{
+    return InterlockedCompareExchange(&gFdmPacketCount, 0, 0) >= 2;
+}
+
+// Reset the detection state when the main loop hands the clock back to real
+// time, so a later re-switch requires fresh FDM packets.
+void sitlUdpFdmReset(void)
+{
+    InterlockedExchange(&gFdmPacketCount, 0);
+    InterlockedExchange64(&gFdmPendingUs, 0);
+    gFdmLastTs = -1.0;
+    gFdmRemainderUs = 0.0;
+    if (gFdmEvent != NULL) {
+        ResetEvent(gFdmEvent);
+    }
+}
+
 static void ensureWsaStartup(void)
 {
     if (!wsaInitialized) {
@@ -91,5 +146,27 @@ int udpRecv(udpLink_t *link, void *data, size_t size, uint32_t timeout_ms)
     int len = (int)sizeof(link->si);
     const int ret = recvfrom((SOCKET)link->fd, data, (int)size, 0,
                              (struct sockaddr *)&link->si, &len);
+    if (ret == (int)size && size == SITL_FDM_PACKET_SIZE && link->port == SITL_FDM_PORT) {
+        const double ts = *(const double *)data;
+
+        if (gFdmLastTs >= 0.0 && ts > gFdmLastTs) {
+            const double deltaUs = (ts - gFdmLastTs) * 1e6 + gFdmRemainderUs;
+            if (deltaUs > 0.0 && deltaUs <= SITL_MAX_FDM_DELTA_US) {
+                const LONG64 wholeUs = (LONG64)deltaUs;
+                gFdmRemainderUs = deltaUs - (double)wholeUs;
+                InterlockedExchangeAdd64(&gFdmPendingUs, wholeUs);
+                if (gFdmEvent != NULL) {
+                    SetEvent(gFdmEvent);
+                }
+            } else {
+                gFdmRemainderUs = 0.0;
+            }
+        } else if (ts < gFdmLastTs) {
+            // Simulator clock restarted; resync the delta baseline only.
+            gFdmRemainderUs = 0.0;
+        }
+        gFdmLastTs = ts;
+        InterlockedIncrement(&gFdmPacketCount);
+    }
     return ret;
 }

@@ -15,12 +15,8 @@
 #ifdef _WIN32
 #include <windows.h>
 
-extern uint64_t sitlMicros64(void);
-extern uint64_t sitlMillis64(void);
-extern uint32_t sitlMicros(void);
-extern uint32_t sitlMillis(void);
+extern uint64_t micros64_real(void);
 extern void sitlDelayMicroseconds(uint32_t us);
-extern uint32_t sitlGetCycleCounter(void);
 
 void dyad_update(void)
 {
@@ -31,37 +27,84 @@ void dyad_update(void)
     Sleep(10);
 }
 
+// Time-base mode: the default official real-time clock, or the Unreal
+// UDP-driven virtual clock (stepped from FDM packet timestamps by the run
+// loop). In UDP mode micros/millis/getCycleCounter follow the external sim
+// clock so gyro/PID run once per 1000 us of Unreal time while the main loop
+// blocks on the UDP socket at near-zero CPU.
+typedef enum {
+    SITL_TIME_REALTIME = 0,
+    SITL_TIME_UDP
+} sitlTimeMode_e;
+
+static sitlTimeMode_e sitlTimeMode = SITL_TIME_REALTIME;
+static uint64_t sitlVirtualTimeUs = 0;
+
+void sitlSetTimeModeUdp(uint64_t syncUs)
+{
+    // Keep the virtual clock continuous with the real-time clock and aligned
+    // to the caller's chosen 100 us grid (the scheduler's gyro deadline grid
+    // is anchored to a fixed residue mod 100, so stepping on that grid never
+    // leaves the scheduler busy-wait spinning on a sub-step remainder).
+    sitlVirtualTimeUs = syncUs;
+    sitlTimeMode = SITL_TIME_UDP;
+}
+
+void sitlSetTimeModeRealtime(void)
+{
+    sitlTimeMode = SITL_TIME_REALTIME;
+}
+
+bool sitlTimeIsUdpDriven(void)
+{
+    return sitlTimeMode == SITL_TIME_UDP;
+}
+
+void sitlStepTime(uint64_t stepUs)
+{
+    sitlVirtualTimeUs += stepUs;
+}
+
 // Official real-time time base. sitl.c's time functions are renamed to
 // sitl* by CMakeLists.txt; these wrappers keep the original symbols available
 // to the rest of the firmware.
 uint64_t micros64(void)
 {
-    return sitlMicros64();
+    // Realtime mode uses the raw monotonic clock directly. The official
+    // sitlMicros64() is scaled by the external simulator's simRate, which is
+    // left at a stale value after an Unreal session ends and would otherwise
+    // make the "official" 1 kHz lock drift from wall time.
+    return sitlTimeMode == SITL_TIME_UDP ? sitlVirtualTimeUs : micros64_real();
 }
 
 uint32_t micros(void)
 {
-    return sitlMicros();
+    return (uint32_t)(micros64() & 0xFFFFFFFF);
 }
 
 uint64_t millis64(void)
 {
-    return sitlMillis64();
+    return micros64() / 1000;
 }
 
 uint32_t millis(void)
 {
-    return sitlMillis();
+    return (uint32_t)((micros64() / 1000) & 0xFFFFFFFF);
 }
 
 uint32_t getCycleCounter(void)
 {
-    return sitlGetCycleCounter();
+    return (uint32_t)(micros64() & 0xFFFFFFFF);
 }
 
 void delayMicroseconds(uint32_t us)
 {
-    sitlDelayMicroseconds(us);
+    // In UDP mode the sim clock is owned by the incoming packet stream;
+    // firmware delayMicroseconds() calls must not advance it or sleep the
+    // scheduler thread.
+    if (sitlTimeMode == SITL_TIME_REALTIME) {
+        sitlDelayMicroseconds(us);
+    }
 }
 #endif
 
