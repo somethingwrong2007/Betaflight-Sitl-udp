@@ -191,11 +191,12 @@ int main(int argc, char *argv[])
         rescheduleTask(TASK_GYRO, 5000);
         rescheduleTask(TASK_FILTER, 5000);
         rescheduleTask(TASK_PID, 5000);
-        // The low-CPU scheduler only runs ~300 times per second, so the
-        // default 10 ms serial task (low priority) loses every priority
-        // selection to medium-priority tasks. A 1 ms period keeps its dynamic
-        // priority high enough that MSP keeps working.
-        rescheduleTask(TASK_SERIAL, 1000);
+        // The reduced scheduler cadence makes the default 10 ms serial task
+        // (low priority) lose the priority selection to medium-priority
+        // tasks, which starves MSP and makes the configurator time out during
+        // its initial request burst. A 100 us period makes the serial task
+        // due on every scheduler pass so MSP stays responsive.
+        rescheduleTask(TASK_SERIAL, 100);
     }
 #endif
 

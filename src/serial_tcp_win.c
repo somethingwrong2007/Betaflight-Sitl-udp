@@ -361,7 +361,16 @@ void tcpDataIn(tcpPort_t *instance, uint8_t *ch, int size)
 {
     tcpPort_t *s = instance;
     pthread_mutex_lock(&s->rxLock);
+    const uint32_t bufSize = s->port.rxBufferSize;
     while (size--) {
+        const uint32_t used = (s->port.rxBufferHead >= s->port.rxBufferTail)
+            ? (s->port.rxBufferHead - s->port.rxBufferTail)
+            : (bufSize - s->port.rxBufferTail + s->port.rxBufferHead);
+        if (used >= bufSize - 1) {
+            // Ring buffer full: drop the rest of this packet instead of
+            // corrupting the stream.
+            break;
+        }
         s->port.rxBuffer[s->port.rxBufferHead] = *(ch++);
         if (s->port.rxBufferHead + 1 >= s->port.rxBufferSize) {
             s->port.rxBufferHead = 0;
