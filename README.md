@@ -46,6 +46,19 @@ The executable is the official Betaflight SITL server:
 
 The first run creates `eeprom.bin` (32 KiB) in the working directory.
 
+On Windows the SITL scheduler normally spin-waits for the next gyro tick,
+which consumes a full CPU core even when no flight simulator is attached.
+This build replaces that busy-wait with a sleeping poll by default, cutting
+SITL CPU use from ~100% of a core to ~2% at the cost of a 10 kHz -> ~200 Hz
+gyro/PID loop (fine for SITL and ground-station use). The serial/MSP task is
+rescheduled to 1 kHz so the configurator stays responsive. To restore the
+official busy-wait behavior, set `BF_SITL_LOW_CPU=0`:
+
+```powershell
+$env:BF_SITL_LOW_CPU = 0  # official 10 kHz busy-wait
+.\betaflight_SITL.exe
+```
+
 ## Betaflight web configurator
 
 The build includes a built-in WebSocket proxy on `ws://127.0.0.1:6761` that

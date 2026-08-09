@@ -421,6 +421,12 @@ if(WIN32)
   list(REMOVE_ITEM BF_SOURCES "${BF_ROOT}/src/platform/SIMULATOR/udplink.c")
   list(REMOVE_ITEM BF_SOURCES "${BF_ROOT}/src/main/main.c")
   list(REMOVE_ITEM BF_SOURCES "${BF_ROOT}/src/main/drivers/serial_tcp.c")
+  # Rename sitl.c's getCycleCounter() so wincompat.c can provide a sleeping
+  # variant that stops the SITL scheduler's gyro busy-wait.
+  set_source_files_properties("${BF_ROOT}/src/platform/SIMULATOR/sitl.c" PROPERTIES COMPILE_OPTIONS "-DgetCycleCounter=sitlGetCycleCounter")
+  # The dyad-based TCP bridge is replaced by serial_tcp_win.c; dyad_update()
+  # busy-spins when no streams exist, so wincompat.c provides a sleeping stub.
+  set_source_files_properties("${BF_ROOT}/lib/main/dyad/dyad.c" PROPERTIES COMPILE_OPTIONS "-Ddyad_update=dyad_update_real")
   list(APPEND BF_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/udplink_windows.c")
   list(APPEND BF_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/wincompat.c")
   list(APPEND BF_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/main_windows.c")
