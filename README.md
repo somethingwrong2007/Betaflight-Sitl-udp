@@ -89,10 +89,12 @@ For an offline, VPN-free web UI (also useful for local game tooling):
 
 `bfweb-server.mjs` serves the built `src/dist` directory and injects a tiny
 script into `index.html` that presets the connection settings in localStorage:
-the Connect menu's Manual entry opens with `ws://127.0.0.1:6761` already in the
-port field. No files from `bf-configurator` are modified. A page served from
-127.0.0.1 connecting back to 127.0.0.1 is exempt from browser local-network
-permission prompts.
+dev auto-options are disabled and virtual mode is turned off, so the
+configurator defaults to the manual connection with `ws://127.0.0.1:6761`
+already in the port field - clicking Connect connects straight to the SITL.
+No files from `bf-configurator` are modified. A page served from 127.0.0.1
+connecting back to 127.0.0.1 is exempt from browser local-network permission
+prompts.
 
 ## Windows notes
 

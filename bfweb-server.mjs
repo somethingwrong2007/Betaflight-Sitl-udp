@@ -4,9 +4,11 @@
  *
  * Serves the built dist/ directory as-is, but injects a tiny script into
  * index.html that pre-fills the connection settings in localStorage:
+ *   - automaticDevOptions : false  (dev URLs otherwise force-enable virtual)
+ *   - showVirtualMode : false      (virtual is skipped in device fallback)
+ *   - showManualMode : true        (manual becomes the default selection)
+ *   - expertMode : true            (manual item is gated behind expert mode)
  *   - portOverride : ws://127.0.0.1:6761
- *   - showManualMode : true  (manual connection appears in the Connect menu)
- *   - expertMode : true      (manual/virtual items are gated behind expert mode)
  *
  * No files from bf-configurator are modified; the injection happens in memory
  * on every request.
@@ -42,9 +44,11 @@ const MIME = {
 
 const PRESET_SCRIPT = `<script>
 try {
-    localStorage.setItem("portOverride", JSON.stringify({ portOverride: "ws://127.0.0.1:6761" }));
+    localStorage.setItem("automaticDevOptions", JSON.stringify({ automaticDevOptions: false }));
+    localStorage.setItem("showVirtualMode", JSON.stringify({ showVirtualMode: false }));
     localStorage.setItem("showManualMode", JSON.stringify({ showManualMode: true }));
     localStorage.setItem("expertMode", JSON.stringify({ expertMode: true }));
+    localStorage.setItem("portOverride", JSON.stringify({ portOverride: "ws://127.0.0.1:6761" }));
 } catch (e) { /* localStorage unavailable */ }
 </script>`;
 
