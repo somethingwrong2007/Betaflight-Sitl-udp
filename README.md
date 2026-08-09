@@ -72,11 +72,22 @@ connect without an external websockify:
 Chrome/Edge 147+ reject WebSocket handshakes that do not echo the client's
 `binary` subprotocol; the built-in proxy handles this automatically.
 
-For an offline, VPN-free web UI (also useful for local game tooling), build the
-official `betaflight-configurator` repo (`npm ci && npm run build`) and serve
-its `src/dist` directory, then open `http://127.0.0.1:8080` and connect with
-`ws://127.0.0.1:6761`. A page served from 127.0.0.1 connecting back to
-127.0.0.1 is exempt from browser local-network permission prompts.
+### Quick start (Windows)
+
+For an offline, VPN-free web UI (also useful for local game tooling):
+
+1. Build the official `betaflight-configurator` repo once (`npm ci && npm run
+   build`) so its `src/dist` directory exists under `bf-configurator/`.
+2. Run `.\start-bf.ps1` - it starts `betaflight_SITL.exe`, starts the local web
+   server on `http://127.0.0.1:8080` and opens the configurator in your
+   browser.
+
+`bfweb-server.mjs` serves the built `src/dist` directory and injects a tiny
+script into `index.html` that presets the connection settings in localStorage:
+the Connect menu's Manual entry opens with `ws://127.0.0.1:6761` already in the
+port field. No files from `bf-configurator` are modified. A page served from
+127.0.0.1 connecting back to 127.0.0.1 is exempt from browser local-network
+permission prompts.
 
 ## Windows notes
 
