@@ -18,8 +18,8 @@ else()
 endif()
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O2 -Wall -Wextra -Wno-unused-parameter")
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DUSE_ACC -DUSE_GYRO -DUSE_BARO -DUSE_GPS -DUSE_OSD -DUSE_CMS -DUSE_BLACKBOX")
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DUSE_SERIAL_TCP -DUSE_PWM_OUTPUT")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -ffunction-sections -fdata-sections -fno-common")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -flto=auto -fuse-linker-plugin -ffast-math -fmerge-all-constants")
 
 # =============================================================================
 # Betaflight SITL source files
@@ -28,6 +28,9 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DUSE_SERIAL_TCP -DUSE_PWM_OUTPUT")
 set(BF_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/extern/betaflight")
 
 set(BF_SOURCES
+  # Entry point
+  ${BF_ROOT}/src/main/main.c
+
   # Build / Version
   ${BF_ROOT}/src/main/build/build_config.c
   ${BF_ROOT}/src/main/build/version.c
@@ -53,6 +56,7 @@ set(BF_SOURCES
   ${BF_ROOT}/src/main/drivers/accgyro/accgyro_virtual.c
   ${BF_ROOT}/src/main/drivers/accgyro/gyro_sync.c
   ${BF_ROOT}/src/main/drivers/barometer/barometer_virtual.c
+  ${BF_ROOT}/src/main/drivers/compass/compass_virtual.c
   ${BF_ROOT}/src/main/drivers/timer_common.c
   ${BF_ROOT}/src/main/drivers/motor.c
   ${BF_ROOT}/src/main/drivers/bus.c
@@ -73,10 +77,9 @@ set(BF_SOURCES
   ${BF_ROOT}/src/main/drivers/vtx_table.c
   ${BF_ROOT}/src/main/drivers/pwm_output.c
 
-  # Target - SITL (RESTORED: official UDP server)
-  ${BF_ROOT}/src/main/target/SITL/sitl.c
-  ${BF_ROOT}/src/main/target/SITL/target.c
-  ${BF_ROOT}/src/main/target/SITL/udplink.c
+  # Target - SITL (official UDP server, moved to src/platform/SIMULATOR)
+  ${BF_ROOT}/src/platform/SIMULATOR/sitl.c
+  ${BF_ROOT}/src/platform/SIMULATOR/udplink.c
 
   # FC
   ${BF_ROOT}/src/main/fc/init.c
@@ -174,6 +177,7 @@ set(BF_SOURCES
   # Blackbox
   ${BF_ROOT}/src/main/blackbox/blackbox.c
   ${BF_ROOT}/src/main/blackbox/blackbox_encoding.c
+  ${BF_ROOT}/src/main/blackbox/blackbox_virtual.c
 
   # Config
   ${BF_ROOT}/src/main/config/config.c
@@ -193,7 +197,8 @@ set(BF_SOURCES
   ${BF_ROOT}/src/main/pg/stats.c
   ${BF_ROOT}/src/main/pg/rcdevice.c
   ${BF_ROOT}/src/main/pg/gps.c
-  ${BF_ROOT}/src/main/pg/gps_rescue.c
+  ${BF_ROOT}/src/main/pg/gps_rescue_multirotor.c
+  ${BF_ROOT}/src/main/pg/gps_rescue_wing.c
   ${BF_ROOT}/src/main/pg/vcd.c
 
   # Scheduler
@@ -205,6 +210,211 @@ set(BF_SOURCES
 )
 
 # =============================================================================
+# Additional sources required by the official SITL target (make TARGET=SITL)
+# =============================================================================
+set(BF_SOURCES ${BF_SOURCES}
+  # Blackbox I/O
+  ${BF_ROOT}/src/main/blackbox/blackbox_io.c
+
+  # CMS
+  ${BF_ROOT}/src/main/cms/cms_menu_gps_lap_timer.c
+  ${BF_ROOT}/src/main/cms/cms_menu_gps_rescue_wing.c
+  ${BF_ROOT}/src/main/cms/cms_menu_quick.c
+  ${BF_ROOT}/src/main/cms/cms_menu_rpm_limit.c
+
+  # Common
+  ${BF_ROOT}/src/main/common/chirp.c
+  ${BF_ROOT}/src/main/common/colorconversion.c
+  ${BF_ROOT}/src/main/common/explog_approx.c
+  ${BF_ROOT}/src/main/common/huffman.c
+  ${BF_ROOT}/src/main/common/huffman_table.c
+  ${BF_ROOT}/src/main/common/pwl.c
+  ${BF_ROOT}/src/main/common/sdft.c
+  ${BF_ROOT}/src/main/common/stopwatch.c
+  ${BF_ROOT}/src/main/common/strtol.c
+  ${BF_ROOT}/src/main/common/uvarint.c
+
+  # Drivers
+  ${BF_ROOT}/src/main/drivers/bus_i2c_utils.c
+  ${BF_ROOT}/src/main/drivers/bus_octospi.c
+  ${BF_ROOT}/src/main/drivers/bus_quadspi.c
+  ${BF_ROOT}/src/main/drivers/buttons.c
+  ${BF_ROOT}/src/main/drivers/camera_control.c
+  ${BF_ROOT}/src/main/drivers/display_canvas.c
+  ${BF_ROOT}/src/main/drivers/dma.c
+  ${BF_ROOT}/src/main/drivers/dshot_command.c
+  ${BF_ROOT}/src/main/drivers/io_preinit.c
+  ${BF_ROOT}/src/main/drivers/lcd_console.c
+  ${BF_ROOT}/src/main/drivers/lcd_panel/lcd_panel_font_5x7.c
+  ${BF_ROOT}/src/main/drivers/lcd_panel/lcd_panel_stub.c
+  ${BF_ROOT}/src/main/drivers/lcd_panel/ssd1306_i2c.c
+  ${BF_ROOT}/src/main/drivers/light_ws2811strip.c
+  ${BF_ROOT}/src/main/drivers/pin_pull_up_down.c
+  ${BF_ROOT}/src/main/drivers/pitot/pitot_ms4525.c
+  ${BF_ROOT}/src/main/drivers/rangefinder/rangefinder_hcsr04.c
+  ${BF_ROOT}/src/main/drivers/rangefinder/rangefinder_lidartf.c
+  ${BF_ROOT}/src/main/drivers/rangefinder/rangefinder_lidarmt.c
+  ${BF_ROOT}/src/main/drivers/rangefinder/rangefinder_nooploop.c
+  ${BF_ROOT}/src/main/drivers/rangefinder/rangefinder_upt1.c
+  ${BF_ROOT}/src/main/drivers/rx/rx_spi.c
+  ${BF_ROOT}/src/main/drivers/serial_impl.c
+  ${BF_ROOT}/src/main/drivers/serial_lcd_console.c
+  ${BF_ROOT}/src/main/drivers/serial_softserial.c
+  ${BF_ROOT}/src/main/drivers/sound_beeper.c
+  ${BF_ROOT}/src/main/drivers/transponder_ir_arcitimer.c
+  ${BF_ROOT}/src/main/drivers/transponder_ir_erlt.c
+  ${BF_ROOT}/src/main/drivers/transponder_ir_ilap.c
+
+  # FC
+  ${BF_ROOT}/src/main/fc/faults.c
+  ${BF_ROOT}/src/main/fc/gps_lap_timer.c
+
+  # Flight
+  ${BF_ROOT}/src/main/flight/alt_hold_multirotor.c
+  ${BF_ROOT}/src/main/flight/alt_hold_wing.c
+  ${BF_ROOT}/src/main/flight/autopilot_wing.c
+  ${BF_ROOT}/src/main/flight/dyn_notch_filter.c
+  ${BF_ROOT}/src/main/flight/flight_plan_capture.c
+  ${BF_ROOT}/src/main/flight/flight_plan_nav.c
+  ${BF_ROOT}/src/main/flight/gps_rescue_wing.c
+  ${BF_ROOT}/src/main/flight/nav_trail.c
+  ${BF_ROOT}/src/main/flight/pos_hold_multirotor.c
+  ${BF_ROOT}/src/main/flight/pos_hold_wing.c
+  ${BF_ROOT}/src/main/flight/position_estimator.c
+  ${BF_ROOT}/src/main/flight/position_filter.c
+  ${BF_ROOT}/src/main/flight/position_nav.c
+  ${BF_ROOT}/src/main/flight/rpm_filter.c
+
+  # IO
+  ${BF_ROOT}/src/main/io/dashboard.c
+  ${BF_ROOT}/src/main/io/displayport_crsf.c
+  ${BF_ROOT}/src/main/io/displayport_fb_osd.c
+  ${BF_ROOT}/src/main/io/displayport_frsky_osd.c
+  ${BF_ROOT}/src/main/io/displayport_hott.c
+  ${BF_ROOT}/src/main/io/displayport_max7456.c
+  ${BF_ROOT}/src/main/io/displayport_srxl.c
+  ${BF_ROOT}/src/main/io/frsky_osd.c
+  ${BF_ROOT}/src/main/io/gimbal_control.c
+  ${BF_ROOT}/src/main/io/ledstrip.c
+  ${BF_ROOT}/src/main/io/pidaudio.c
+  ${BF_ROOT}/src/main/io/piniobox.c
+  ${BF_ROOT}/src/main/io/serial.c
+  ${BF_ROOT}/src/main/io/serial_4way.c
+  ${BF_ROOT}/src/main/io/serial_4way_avrootloader.c
+  ${BF_ROOT}/src/main/io/serial_4way_stk500v2.c
+  ${BF_ROOT}/src/main/io/smartaudio_protocol.c
+  ${BF_ROOT}/src/main/io/spektrum_rssi.c
+  ${BF_ROOT}/src/main/io/spektrum_vtx_control.c
+  ${BF_ROOT}/src/main/io/tramp_protocol.c
+  ${BF_ROOT}/src/main/io/transponder_ir.c
+  ${BF_ROOT}/src/main/io/usb_cdc_hid.c
+  ${BF_ROOT}/src/main/io/usb_msc.c
+  ${BF_ROOT}/src/main/io/vtx.c
+  ${BF_ROOT}/src/main/io/vtx_control.c
+  ${BF_ROOT}/src/main/io/vtx_msp.c
+  ${BF_ROOT}/src/main/io/vtx_rtc6705.c
+  ${BF_ROOT}/src/main/io/vtx_smartaudio.c
+  ${BF_ROOT}/src/main/io/vtx_tramp.c
+
+  # OSD
+  ${BF_ROOT}/src/main/osd/osd_custom_text.c
+  ${BF_ROOT}/src/main/osd/osd_nav_map.c
+
+  # PG
+  ${BF_ROOT}/src/main/pg/adc.c
+  ${BF_ROOT}/src/main/pg/alt_hold_multirotor.c
+  ${BF_ROOT}/src/main/pg/alt_hold_wing.c
+  ${BF_ROOT}/src/main/pg/autopilot.c
+  ${BF_ROOT}/src/main/pg/beeper.c
+  ${BF_ROOT}/src/main/pg/beeper_dev.c
+  ${BF_ROOT}/src/main/pg/bus_i2c.c
+  ${BF_ROOT}/src/main/pg/bus_quadspi.c
+  ${BF_ROOT}/src/main/pg/bus_spi.c
+  ${BF_ROOT}/src/main/pg/can.c
+  ${BF_ROOT}/src/main/pg/dashboard.c
+  ${BF_ROOT}/src/main/pg/displayport_profiles.c
+  ${BF_ROOT}/src/main/pg/dronecan.c
+  ${BF_ROOT}/src/main/pg/dronecan_dna.c
+  ${BF_ROOT}/src/main/pg/dyn_notch.c
+  ${BF_ROOT}/src/main/pg/flash.c
+  ${BF_ROOT}/src/main/pg/flight_plan.c
+  ${BF_ROOT}/src/main/pg/gimbal.c
+  ${BF_ROOT}/src/main/pg/gps_lap_timer.c
+  ${BF_ROOT}/src/main/pg/max7456.c
+  ${BF_ROOT}/src/main/pg/mco.c
+  ${BF_ROOT}/src/main/pg/osd_nav_map.c
+  ${BF_ROOT}/src/main/pg/pilot.c
+  ${BF_ROOT}/src/main/pg/pin_pull_up_down.c
+  ${BF_ROOT}/src/main/pg/pinio.c
+  ${BF_ROOT}/src/main/pg/piniobox.c
+  ${BF_ROOT}/src/main/pg/pos_hold_multirotor.c
+  ${BF_ROOT}/src/main/pg/pos_hold_wing.c
+  ${BF_ROOT}/src/main/pg/rpm_filter.c
+  ${BF_ROOT}/src/main/pg/rx_pwm.c
+  ${BF_ROOT}/src/main/pg/rx_spi.c
+  ${BF_ROOT}/src/main/pg/rx_spi_cc2500.c
+  ${BF_ROOT}/src/main/pg/rx_spi_expresslrs.c
+  ${BF_ROOT}/src/main/pg/sdcard.c
+  ${BF_ROOT}/src/main/pg/sdio.c
+  ${BF_ROOT}/src/main/pg/serial_uart.c
+  ${BF_ROOT}/src/main/pg/timerio.c
+  ${BF_ROOT}/src/main/pg/timerup.c
+  ${BF_ROOT}/src/main/pg/usb.c
+  ${BF_ROOT}/src/main/pg/vtx_io.c
+  ${BF_ROOT}/src/main/pg/vtx_table.c
+
+  # RX
+  ${BF_ROOT}/src/main/rx/crsf.c
+  ${BF_ROOT}/src/main/rx/fport.c
+  ${BF_ROOT}/src/main/rx/frsky_crc.c
+  ${BF_ROOT}/src/main/rx/ghst.c
+  ${BF_ROOT}/src/main/rx/ibus.c
+  ${BF_ROOT}/src/main/rx/jetiexbus.c
+  ${BF_ROOT}/src/main/rx/mavlink.c
+  ${BF_ROOT}/src/main/rx/pwm.c
+  ${BF_ROOT}/src/main/rx/rx_bind.c
+  ${BF_ROOT}/src/main/rx/rx_spi.c
+  ${BF_ROOT}/src/main/rx/rx_spi_common.c
+  ${BF_ROOT}/src/main/rx/sbus.c
+  ${BF_ROOT}/src/main/rx/sbus_channels.c
+  ${BF_ROOT}/src/main/rx/spektrum.c
+  ${BF_ROOT}/src/main/rx/srxl2.c
+  ${BF_ROOT}/src/main/rx/sumd.c
+  ${BF_ROOT}/src/main/rx/sumh.c
+  ${BF_ROOT}/src/main/rx/xbus.c
+
+  # Sensors
+  ${BF_ROOT}/src/main/sensors/battery.c
+  ${BF_ROOT}/src/main/sensors/opticalflow.c
+  ${BF_ROOT}/src/main/sensors/pitot.c
+  ${BF_ROOT}/src/main/sensors/rangefinder.c
+  ${BF_ROOT}/src/main/sensors/sensors.c
+
+  # Target / config
+  ${BF_ROOT}/src/main/target/config_helper.c
+
+  # Telemetry
+  ${BF_ROOT}/src/main/telemetry/frsky_hub.c
+  ${BF_ROOT}/src/main/telemetry/hott.c
+  ${BF_ROOT}/src/main/telemetry/ibus.c
+  ${BF_ROOT}/src/main/telemetry/ibus_shared.c
+  ${BF_ROOT}/src/main/telemetry/jetiexbus.c
+  ${BF_ROOT}/src/main/telemetry/ltm.c
+  ${BF_ROOT}/src/main/telemetry/mavlink.c
+  ${BF_ROOT}/src/main/telemetry/mavlink_mission.c
+  ${BF_ROOT}/src/main/telemetry/msp_shared.c
+  ${BF_ROOT}/src/main/telemetry/smartport.c
+  ${BF_ROOT}/src/main/telemetry/telemetry.c
+)
+
+if(WIN32)
+  # Replace the POSIX udplink.c with a Winsock implementation
+  list(REMOVE_ITEM BF_SOURCES "${BF_ROOT}/src/platform/SIMULATOR/udplink.c")
+  list(APPEND BF_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/udplink_windows.c")
+  list(APPEND BF_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/wincompat.c")
+endif()
+
+# =============================================================================
 # Executable
 # =============================================================================
 add_executable(betaflight_SITL ${BF_SOURCES})
@@ -214,24 +424,14 @@ add_executable(betaflight_SITL ${BF_SOURCES})
 # =============================================================================
 target_compile_definitions(betaflight_SITL PRIVATE
   SITL
+  SIMULATOR
   SIMULATOR_BUILD
-  SIMULATOR_MULTITHREAD
   __TARGET__=\"SITL\"
   __REVISION__=\"1\"
+  __FORKNAME__=\"betaflight\"
+  __MCU_NAME__=\"SIMULATOR\"
   HSE_VALUE=8000000
   FLASH_SIZE=2048
-  USE_ACC
-  USE_GYRO
-  USE_BARO
-  USE_GPS
-  USE_OSD
-  USE_CMS
-  USE_BLACKBOX
-  USE_SERIAL_TCP
-  USE_PWM_OUTPUT
-  USE_DSHOT
-  USE_RX_MSP
-  USE_RX_PWM
 )
 
 # =============================================================================
@@ -240,9 +440,43 @@ target_compile_definitions(betaflight_SITL PRIVATE
 target_include_directories(betaflight_SITL PRIVATE
   ${BF_ROOT}/src/main
   ${BF_ROOT}/src/platform/SIMULATOR/include
+  ${BF_ROOT}/src/platform/SIMULATOR/target/SITL
   ${BF_ROOT}/lib/main/dyad
+  ${BF_ROOT}/lib/main/MAVLink
   ${BF_ROOT}/lib/main/google/olc
 )
+
+# Windows compatibility headers for POSIX socket includes in Betaflight
+if(WIN32)
+  target_include_directories(betaflight_SITL PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/wincompat
+  )
+  target_compile_options(betaflight_SITL PRIVATE
+    "-include${CMAKE_CURRENT_SOURCE_DIR}/wincompat/wincompat.h"
+  )
+endif()
+
+target_compile_definitions(betaflight_SITL PRIVATE
+  _GNU_SOURCE
+)
+
+# Official SITL build also relies on the simulator platform include dir
+target_include_directories(betaflight_SITL PRIVATE
+  ${BF_ROOT}/src/platform/SIMULATOR
+)
+
+# PG registry placement required by Betaflight's parameter-group code
+if(WIN32)
+  target_link_options(betaflight_SITL PRIVATE
+    "-Wl,-T,${CMAKE_CURRENT_SOURCE_DIR}/wincompat/sitl_win.ld"
+    "-Wl,--gc-sections"
+  )
+else()
+  target_link_options(betaflight_SITL PRIVATE
+    "-Wl,-T,${BF_ROOT}/src/platform/SIMULATOR/link/sitl.ld"
+    "-Wl,--gc-sections"
+  )
+endif()
 
 # =============================================================================
 # Platform-specific linking
