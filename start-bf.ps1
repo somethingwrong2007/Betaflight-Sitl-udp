@@ -9,7 +9,7 @@ $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
 $exe = Join-Path $root "build-win-cmake\betaflight_SITL.exe"
 $serverScript = Join-Path $root "bfweb-server.mjs"
-$port = 8080
+$port = if ($env:BFWEB_PORT) { [int]$env:BFWEB_PORT } else { 8080 }
 
 function Test-PortListening([int]$Port) {
     $conn = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
