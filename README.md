@@ -82,6 +82,8 @@ For an offline, VPN-free web UI (also useful for local game tooling):
    server on `http://127.0.0.1:8080` and opens the configurator in your
    browser.
 
+   Or just double-click `start-bf.cmd` - same thing, no PowerShell needed.
+
 `bfweb-server.mjs` serves the built `src/dist` directory and injects a tiny
 script into `index.html` that presets the connection settings in localStorage:
 the Connect menu's Manual entry opens with `ws://127.0.0.1:6761` already in the
