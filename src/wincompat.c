@@ -15,7 +15,6 @@
 #ifdef _WIN32
 #include <windows.h>
 
-extern uint64_t micros64_real(void);
 extern uint64_t sitlMicros64(void);
 extern uint64_t sitlMillis64(void);
 extern uint32_t sitlMicros(void);
@@ -32,62 +31,37 @@ void dyad_update(void)
     Sleep(10);
 }
 
-// Stepped virtual time, mirroring AJ92/SimITL: time advances by a fixed step
-// per scheduler pass instead of tracking the real-time clock. The scheduler's
-// gyro busy-wait then exits within a few steps (no spin, no starvation), and
-// the gyro/PID loop rate is set by the step size and the run-loop cadence.
-// This is an opt-in low-CPU mode: set BF_SITL_LOW_CPU=1 to enable it. The
-// default uses the official real-time time base, where the scheduler
-// busy-waits to the exact gyro deadline for precise 1 kHz pacing.
-static uint64_t sitlVirtualTimeUs = 0;
-
-static bool sitlLowCpuMode(void)
-{
-    static int cached = -1;
-    if (cached < 0) {
-        const char *env = getenv("BF_SITL_LOW_CPU");
-        cached = (env != NULL && strcmp(env, "1") == 0) ? 1 : 0;
-    }
-    return cached != 0;
-}
-
-void sitlStepTime(uint64_t stepUs)
-{
-    sitlVirtualTimeUs += stepUs;
-}
-
+// Official real-time time base. sitl.c's time functions are renamed to
+// sitl* by CMakeLists.txt; these wrappers keep the original symbols available
+// to the rest of the firmware.
 uint64_t micros64(void)
 {
-    return sitlLowCpuMode() ? sitlVirtualTimeUs : sitlMicros64();
+    return sitlMicros64();
 }
 
 uint32_t micros(void)
 {
-    return sitlLowCpuMode() ? (uint32_t)(sitlVirtualTimeUs & 0xFFFFFFFF) : sitlMicros();
+    return sitlMicros();
 }
 
 uint64_t millis64(void)
 {
-    return sitlLowCpuMode() ? sitlVirtualTimeUs / 1000 : sitlMillis64();
+    return sitlMillis64();
 }
 
 uint32_t millis(void)
 {
-    return sitlLowCpuMode() ? (uint32_t)((sitlVirtualTimeUs / 1000) & 0xFFFFFFFF) : sitlMillis();
+    return sitlMillis();
 }
 
 uint32_t getCycleCounter(void)
 {
-    return sitlLowCpuMode() ? (uint32_t)(sitlVirtualTimeUs & 0xFFFFFFFF) : sitlGetCycleCounter();
+    return sitlGetCycleCounter();
 }
 
 void delayMicroseconds(uint32_t us)
 {
-    if (sitlLowCpuMode()) {
-        sitlStepTime(us);
-    } else {
-        sitlDelayMicroseconds(us);
-    }
+    sitlDelayMicroseconds(us);
 }
 #endif
 

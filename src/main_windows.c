@@ -59,6 +59,22 @@
 void run(void);
 
 #ifdef _WIN32
+static uint32_t sitlGyroHz(void)
+{
+    const char *env = getenv("BF_SITL_GYRO_HZ");
+    if (env != NULL && env[0] != '\0') {
+        const long v = strtol(env, NULL, 10);
+        if (v >= 100 && v <= 10000) {
+            return (uint32_t)v;
+        }
+    }
+#ifdef SITL_GYRO_HZ
+    return SITL_GYRO_HZ;
+#else
+    return 1000;
+#endif
+}
+
 static bool directoryExistsOrCreate(const char *path)
 {
     const DWORD attrs = GetFileAttributesA(path);
@@ -131,8 +147,8 @@ int main(int argc, char *argv[])
     // Windows and 0x0A bytes are mangled by CRLF translation.
     _fmode = _O_BINARY;
 
-    // 1 ms system timer resolution so the low-CPU scheduler poll actually
-    // sleeps ~1 ms instead of the default ~15.6 ms timer tick.
+    // 1 ms system timer resolution so short sleeps in the helper threads
+    // (UDP links, WebSocket proxy) do not round up to the ~15.6 ms tick.
     timeBeginPeriod(1);
 #endif
 
@@ -178,26 +194,14 @@ int main(int argc, char *argv[])
 #endif
 
 #ifdef _WIN32
-    // Gyro/filter/PID always run at 1 kHz, matching the external physics
-    // simulator's rate. In the default official real-time mode the scheduler
-    // busy-waits to the exact deadline, so 1000 us is the locked loop period.
-    // In the opt-in low-CPU mode (BF_SITL_LOW_CPU=1, see wincompat.c) the
-    // stepped virtual time paces the scheduler with ~1 ms sleeps; the serial
-    // task then needs a shorter period than its default 10 ms or it loses the
-    // priority selection to medium-priority tasks at the reduced cadence.
-    const char *lowCpu = getenv("BF_SITL_LOW_CPU");
-    const bool lowCpuMode = (lowCpu != NULL && strcmp(lowCpu, "1") == 0);
-    rescheduleTask(TASK_GYRO, 1000);
-    rescheduleTask(TASK_FILTER, 1000);
-    rescheduleTask(TASK_PID, 1000);
-    if (lowCpuMode) {
-        // The reduced scheduler cadence makes the default 10 ms serial task
-        // (low priority) lose the priority selection to medium-priority
-        // tasks, which starves MSP and makes the configurator time out during
-        // its initial request burst. A 100 us period makes the serial task
-        // due on every scheduler pass so MSP stays responsive.
-        rescheduleTask(TASK_SERIAL, 100);
-    }
+    // Gyro/filter/PID run at the configured frequency (default 1 kHz,
+    // override with BF_SITL_GYRO_HZ or the SITL_GYRO_HZ CMake option). The
+    // official real-time scheduler busy-waits to the exact deadline, so the
+    // period is the locked loop time.
+    const uint32_t gyroPeriodUs = 1000000u / sitlGyroHz();
+    rescheduleTask(TASK_GYRO, gyroPeriodUs);
+    rescheduleTask(TASK_FILTER, gyroPeriodUs);
+    rescheduleTask(TASK_PID, gyroPeriodUs);
 #endif
 
 #if ENABLE_LCD_CONSOLE && ENABLE_LCD_PRINTF_REDIRECT
@@ -226,32 +230,13 @@ int main(int argc, char *argv[])
 
 void FAST_CODE run(void)
 {
-    extern void sitlStepTime(uint64_t stepUs);
-    const char *lowCpu = getenv("BF_SITL_LOW_CPU");
-    const bool lowCpuMode = (lowCpu != NULL && strcmp(lowCpu, "1") == 0);
-    uint32_t iter = 0;
+    // Official Betaflight run loop: call the scheduler in a tight loop. The
+    // scheduler itself busy-waits to the exact gyro deadline, which locks the
+    // gyro/filter/PID rate precisely at the cost of one CPU core.
     while (true) {
-        if (lowCpuMode) {
-            // Virtual time advances 500 us per scheduler pass (2 kHz virtual
-            // clock). With the gyro/PID period rescheduled to 1000 us below,
-            // the scheduler runs gyro+filter+PID every second pass and gives
-            // the serial/MSP task the other passes, so nothing starves.
-            sitlStepTime(500);
-        }
         scheduler();
-
-        if (lowCpuMode) {
-            // Pace the real-time loop: sleep ~1 ms every four passes, which
-            // puts the scheduler cadence near 2 kHz so gyro/PID runs at
-            // ~1 kHz while the serial/MSP task gets the alternate passes.
-            if ((++iter % 4) == 0) {
-                Sleep(1);
-            }
-        }
 #if defined(RUN_LOOP_DELAY_US) && RUN_LOOP_DELAY_US > 0
-        else {
-            delayMicroseconds_real(RUN_LOOP_DELAY_US);
-        }
+        delayMicroseconds_real(RUN_LOOP_DELAY_US);
 #endif
     }
 }

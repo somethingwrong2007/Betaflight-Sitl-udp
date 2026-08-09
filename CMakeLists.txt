@@ -441,6 +441,11 @@ endif()
 # =============================================================================
 add_executable(betaflight_SITL ${BF_SOURCES})
 
+# Gyro/filter/PID loop frequency in Hz (the official scheduler busy-waits to
+# this exact deadline). Can also be overridden at runtime with the
+# BF_SITL_GYRO_HZ environment variable.
+set(SITL_GYRO_HZ 1000 CACHE STRING "SITL gyro/filter/PID loop frequency in Hz")
+
 # =============================================================================
 # Compile definitions
 # =============================================================================
@@ -449,6 +454,7 @@ target_compile_definitions(betaflight_SITL PRIVATE
   SIMULATOR
   SIMULATOR_BUILD
   SITL_ATTITUDE_DIRECT
+  SITL_GYRO_HZ=${SITL_GYRO_HZ}
   __TARGET__=\"SITL\"
   __REVISION__=\"1\"
   __FORKNAME__=\"betaflight\"
