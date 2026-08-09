@@ -46,6 +46,25 @@ The executable is the official Betaflight SITL server:
 
 The first run creates `eeprom.bin` (32 KiB) in the working directory.
 
+## Betaflight web configurator
+
+The build includes a built-in WebSocket proxy on `ws://127.0.0.1:6761` that
+bridges to the MSP port on TCP 5761, so the online Betaflight configurator can
+connect without an external websockify:
+
+1. Run `betaflight_SITL`.
+2. Open the configurator and enable manual connection mode.
+3. Enter `ws://127.0.0.1:6761` in the port field and click Connect.
+
+Chrome/Edge 147+ reject WebSocket handshakes that do not echo the client's
+`binary` subprotocol; the built-in proxy handles this automatically.
+
+For an offline, VPN-free web UI (also useful for local game tooling), build the
+official `betaflight-configurator` repo (`npm ci && npm run build`) and serve
+its `src/dist` directory, then open `http://127.0.0.1:8080` and connect with
+`ws://127.0.0.1:6761`. A page served from 127.0.0.1 connecting back to
+127.0.0.1 is exempt from browser local-network permission prompts.
+
 ## Windows notes
 
 The Windows executable needs `libwinpthread-1.dll` next to it (the

@@ -1,5 +1,8 @@
 build/
 build-*/
+/.edge-test-profile*/
+/bf-configurator/
+/test-origin.mjs
 *.bin
 *.log
 compile_commands.json

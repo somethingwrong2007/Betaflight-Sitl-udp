@@ -19,7 +19,16 @@ endif()
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O2 -Wall -Wextra -Wno-unused-parameter")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -ffunction-sections -fdata-sections -fno-common")
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -flto=auto -fuse-linker-plugin -ffast-math -fmerge-all-constants")
+if(WIN32)
+  # Keep LTO for link-time dead-code elimination, but do not LTO-inline dyad:
+  # MinGW's LTO miscompiles dyad's vector/listener code and corrupts the heap.
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -flto=auto -fuse-linker-plugin")
+  set_source_files_properties("${BF_ROOT}/lib/main/dyad/dyad.c" PROPERTIES COMPILE_OPTIONS "-fno-lto")
+else()
+  # LTO is required on Linux to let the linker drop unused references that the
+  # official build removes at link time.
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -flto=auto -fuse-linker-plugin -ffast-math -fmerge-all-constants")
+endif()
 
 # =============================================================================
 # Betaflight SITL source files
@@ -410,8 +419,13 @@ set(BF_SOURCES ${BF_SOURCES}
 if(WIN32)
   # Replace the POSIX udplink.c with a Winsock implementation
   list(REMOVE_ITEM BF_SOURCES "${BF_ROOT}/src/platform/SIMULATOR/udplink.c")
+  list(REMOVE_ITEM BF_SOURCES "${BF_ROOT}/src/main/main.c")
+  list(REMOVE_ITEM BF_SOURCES "${BF_ROOT}/src/main/drivers/serial_tcp.c")
   list(APPEND BF_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/udplink_windows.c")
   list(APPEND BF_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/wincompat.c")
+  list(APPEND BF_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/main_windows.c")
+  list(APPEND BF_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/serial_tcp_win.c")
+  list(APPEND BF_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/ws_proxy_win.c")
 endif()
 
 # =============================================================================
@@ -487,6 +501,7 @@ if(WIN32)
     ws2_32      # Winsock2 (socket, bind, recvfrom, sendto)
     winmm       # Windows Multimedia (timeGetTime, etc.)
     pthread     # POSIX threads (via winpthread)
+    crypt32     # CryptoAPI (WebSocket Sec-WebSocket-Accept)
   )
 else()
   target_link_libraries(betaflight_SITL PRIVATE
