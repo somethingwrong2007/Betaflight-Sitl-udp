@@ -1,0 +1,108 @@
+name: Build BF SITL
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup
+        run: |
+          chmod +x setup.sh
+          ./setup.sh
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential
+
+      - name: Build
+        run: |
+          mkdir build-linux
+          cmake -S . -B build-linux -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-linux --config Release -j$(nproc)
+
+      - name: Inspect
+        run: |
+          ls -la build-linux/
+          file build-linux/betaflight_SITL || true
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: betaflight-sitl-linux
+          path: build-linux/betaflight_SITL
+          if-no-files-found: warn
+
+  build-windows:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup
+        run: |
+          chmod +x setup.sh
+          ./setup.sh
+
+      - name: Install MinGW
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64 gcc-mingw-w64-x86-64-posix g++-mingw-w64-x86-64-posix cmake
+
+      - name: Verify MinGW
+        run: |
+          x86_64-w64-mingw32-gcc-posix --version
+          which x86_64-w64-mingw32-gcc-posix
+
+      - name: Build
+        run: |
+          mkdir build-win
+          cmake -S . -B build-win             -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64-toolchain.cmake             -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-win --config Release -j$(nproc)
+
+      - name: Inspect
+        run: |
+          ls -la build-win/
+          file build-win/betaflight_SITL.exe || true
+
+      - name: Collect DLLs
+        run: |
+          mkdir -p build-win/dist
+          cp build-win/betaflight_SITL.exe build-win/dist/
+          # Copy MinGW runtime DLLs (64-bit only)
+          cp /usr/x86_64-w64-mingw32/lib/libwinpthread-1.dll build-win/dist/ || true
+          for ver in 13-posix 12-posix 11-posix 10-posix; do
+            cp /usr/lib/gcc/x86_64-w64-mingw32/$ver/libgcc_s_seh-1.dll build-win/dist/ 2>/dev/null && break
+          done || true
+          for ver in 13-posix 12-posix 11-posix 10-posix; do
+            cp /usr/lib/gcc/x86_64-w64-mingw32/$ver/libstdc++-6.dll build-win/dist/ 2>/dev/null && break
+          done || true
+          echo "=== dist contents ==="
+          ls -la build-win/dist/
+          echo "=== arch check ==="
+          for f in build-win/dist/*; do file "$f" | grep -E "x86-64|32-bit" || true; done
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: betaflight-sitl-windows
+          path: build-win/betaflight_SITL.exe
+          if-no-files-found: warn
+
+      - name: Upload with DLLs
+        uses: actions/upload-artifact@v4
+        with:
+          name: betaflight-sitl-windows-full
+          path: build-win/dist/**
+          if-no-files-found: warn
