@@ -36,7 +36,9 @@ void dyad_update(void)
 // per scheduler pass instead of tracking the real-time clock. The scheduler's
 // gyro busy-wait then exits within a few steps (no spin, no starvation), and
 // the gyro/PID loop rate is set by the step size and the run-loop cadence.
-// Set BF_SITL_LOW_CPU=0 to use the official real-time time base instead.
+// This is an opt-in low-CPU mode: set BF_SITL_LOW_CPU=1 to enable it. The
+// default uses the official real-time time base, where the scheduler
+// busy-waits to the exact gyro deadline for precise 1 kHz pacing.
 static uint64_t sitlVirtualTimeUs = 0;
 
 static bool sitlLowCpuMode(void)
@@ -44,7 +46,7 @@ static bool sitlLowCpuMode(void)
     static int cached = -1;
     if (cached < 0) {
         const char *env = getenv("BF_SITL_LOW_CPU");
-        cached = (env == NULL || strcmp(env, "0") != 0) ? 1 : 0;
+        cached = (env != NULL && strcmp(env, "1") == 0) ? 1 : 0;
     }
     return cached != 0;
 }

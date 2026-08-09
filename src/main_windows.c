@@ -178,19 +178,19 @@ int main(int argc, char *argv[])
 #endif
 
 #ifdef _WIN32
-    // Low-CPU mode (see wincompat.c getCycleCounter) paces the scheduler with
-    // ~1 ms sleeps, so the gyro/PID period must stay well above that
-    // granularity or the scheduler locks into gyro catch-up and starves every
-    // other task (MSP/serial included). 1000 us matches the external physics
-    // simulator's 1 kHz rate. The serial task also needs a shorter period than
-    // its default 10 ms or it loses the priority selection to medium-priority
-    // tasks at the reduced scheduler cadence. Set BF_SITL_LOW_CPU=0 for the
-    // official 10 kHz busy-wait behavior.
+    // Gyro/filter/PID always run at 1 kHz, matching the external physics
+    // simulator's rate. In the default official real-time mode the scheduler
+    // busy-waits to the exact deadline, so 1000 us is the locked loop period.
+    // In the opt-in low-CPU mode (BF_SITL_LOW_CPU=1, see wincompat.c) the
+    // stepped virtual time paces the scheduler with ~1 ms sleeps; the serial
+    // task then needs a shorter period than its default 10 ms or it loses the
+    // priority selection to medium-priority tasks at the reduced cadence.
     const char *lowCpu = getenv("BF_SITL_LOW_CPU");
-    if (lowCpu == NULL || strcmp(lowCpu, "0") != 0) {
-        rescheduleTask(TASK_GYRO, 1000);
-        rescheduleTask(TASK_FILTER, 1000);
-        rescheduleTask(TASK_PID, 1000);
+    const bool lowCpuMode = (lowCpu != NULL && strcmp(lowCpu, "1") == 0);
+    rescheduleTask(TASK_GYRO, 1000);
+    rescheduleTask(TASK_FILTER, 1000);
+    rescheduleTask(TASK_PID, 1000);
+    if (lowCpuMode) {
         // The reduced scheduler cadence makes the default 10 ms serial task
         // (low priority) lose the priority selection to medium-priority
         // tasks, which starves MSP and makes the configurator time out during
@@ -228,7 +228,7 @@ void FAST_CODE run(void)
 {
     extern void sitlStepTime(uint64_t stepUs);
     const char *lowCpu = getenv("BF_SITL_LOW_CPU");
-    const bool lowCpuMode = (lowCpu == NULL || strcmp(lowCpu, "0") != 0);
+    const bool lowCpuMode = (lowCpu != NULL && strcmp(lowCpu, "1") == 0);
     uint32_t iter = 0;
     while (true) {
         if (lowCpuMode) {
