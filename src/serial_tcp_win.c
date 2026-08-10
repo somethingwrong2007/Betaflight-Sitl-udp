@@ -76,6 +76,17 @@ static void tcpClientDisconnect(tcpPort_t *s, int id, int slot, SOCKET sock)
 
     if (wasActive) {
         closesocket(sock);
+
+        // If the last client went away while the FC was in CLI mode, push an
+        // "exit noreboot" line so the CLI session ends and the next
+        // connection starts clean in MSP mode. Plain "exit" would reboot the
+        // FC, and on SITL that terminates the process. In MSP mode these
+        // bytes are ignored as non-MSP noise, so the injection is safe either
+        // way.
+        if (s->clientCount == 0) {
+            static const char exitCliCmd[] = "exit noreboot\r";
+            tcpDataIn(s, (uint8_t *)exitCliCmd, (int)sizeof(exitCliCmd) - 1);
+        }
     }
 }
 
