@@ -211,8 +211,12 @@ static void ensureWritableWorkingDirectory(void)
 int main(int argc, char *argv[])
 {
 #ifdef _WIN32
-    // Keep SITL progress visible when stdout is redirected to a file/pipe.
-    setvbuf(stdout, NULL, _IONBF, 0);
+    // Keep SITL progress visible when stderr is redirected to a file/pipe.
+    // stdout is fully buffered: the virtual EEPROM writer prints one line
+    // per config word on every save, and unbuffered per-line file writes made
+    // saves take seconds and time out the configurator (which drops the
+    // connection). A large buffer coalesces those writes into a few flushes.
+    setvbuf(stdout, NULL, _IOFBF, 64 * 1024);
     setvbuf(stderr, NULL, _IONBF, 0);
 
     // eeprom.bin is binary data; without this, fopen() uses text mode on
@@ -358,7 +362,7 @@ void FAST_CODE run(void)
             fdmLogged = true;
             fprintf(stderr, "[SITL] UDP FDM packets active\n");
         }
-        if (fdmEvent == NULL || WaitForSingleObject(fdmEvent, 50) == WAIT_TIMEOUT) {
+        if (fdmEvent == NULL || WaitForSingleObject(fdmEvent, 10) == WAIT_TIMEOUT) {
             mspSerialProcess(MSP_EVALUATE_NON_MSP_DATA, mspFcProcessCommand, mspFcProcessReply);
         }
     }
