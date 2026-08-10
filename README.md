@@ -59,16 +59,16 @@ to the microsecond but the busy-wait consumes about one CPU core.
 
 ### UDP
 
-The virtual clock is driven by Unreal FDM packets on UDP 9003: each packet's
-timestamp delta advances the virtual clock in 100 us quanta, so
-gyro/filter/PID fire once per 1000 us of Unreal time at near-zero CPU. When
-no packets are arriving the flight loop idles (virtual clock frozen, CPU ~0)
-while the serial/MSP link stays alive, so the Betaflight configurator remains
-connected.
+The virtual clock is driven by FDM packets arriving on UDP 9003: each
+packet's timestamp delta advances the virtual clock in 100 us quanta, so
+gyro/filter/PID fire once per 1000 us of simulator time at near-zero CPU.
+When no packets are arriving the flight loop idles (virtual clock frozen,
+CPU ~0) while the serial/MSP link stays alive, so the Betaflight
+configurator remains connected.
 
 ```bash
 cmake ..                        # REALTIME (default)
-cmake .. -DSITL_TIME_MODE=UDP   # Unreal FDM-driven
+cmake .. -DSITL_TIME_MODE=UDP   # UDP FDM-driven
 ```
 
 The gyro/filter/PID frequency defaults to 1 kHz and can be changed with the
@@ -93,11 +93,11 @@ executable's folder, then `%LOCALAPPDATA%\Betaflight-SITL`), so always launch
 from the same folder if you want one persistent configuration.
 
 To keep multiple independent configurations, point `BF_SITL_EEPROM` at a
-specific file - e.g. `unreal.bin` for Unreal tuning and `bench.bin` for bench
-testing. The directory is created automatically:
+specific file - e.g. `flight.bin` for flight tuning and `bench.bin` for
+bench testing. The directory is created automatically:
 
 ```powershell
-$env:BF_SITL_EEPROM = "E:\sim\unreal.bin"
+$env:BF_SITL_EEPROM = "E:\sim\flight.bin"
 .\betaflight_SITL.exe
 ```
 

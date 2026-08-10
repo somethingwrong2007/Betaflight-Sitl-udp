@@ -451,7 +451,7 @@ set(SITL_GYRO_HZ 1000 CACHE STRING "SITL gyro/filter/PID loop frequency in Hz")
 # virtual clock from Unreal FDM packets on UDP 9003: the flight loop runs
 # only while packets arrive, and idles (but keeps serial/MSP alive) between
 # packets.
-set(SITL_TIME_MODE "REALTIME" CACHE STRING "SITL time base: REALTIME (official) or UDP (Unreal FDM-driven)")
+set(SITL_TIME_MODE "REALTIME" CACHE STRING "SITL time base: REALTIME (official) or UDP (FDM packet-driven)")
 
 # =============================================================================
 # Compile definitions

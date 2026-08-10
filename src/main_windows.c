@@ -335,11 +335,11 @@ void FAST_CODE run(void)
         sitlStepTime(stepUs);
         scheduler();
     }
-    fprintf(stderr, "[SITL] UDP time mode: waiting for Unreal FDM packets on 127.0.0.1:9003\n");
+    fprintf(stderr, "[SITL] UDP time mode: waiting for FDM packets on 127.0.0.1:9003\n");
 
     while (true) {
         // Consume the pending packet time in fixed quanta: one scheduler pass
-        // per quantum, so gyro/filter/PID fire on the Unreal timestamp grid.
+        // per quantum, so gyro/filter/PID fire on the FDM timestamp grid.
         while (pendingUs >= stepUs) {
             sitlStepTime(stepUs);
             pendingUs -= stepUs;
@@ -356,7 +356,7 @@ void FAST_CODE run(void)
         // ground station connected while waiting.
         if (!fdmLogged && sitlUdpFdmHasData()) {
             fdmLogged = true;
-            fprintf(stderr, "[SITL] Unreal FDM packets active\n");
+            fprintf(stderr, "[SITL] UDP FDM packets active\n");
         }
         if (fdmEvent == NULL || WaitForSingleObject(fdmEvent, 50) == WAIT_TIMEOUT) {
             mspSerialProcess(MSP_EVALUATE_NON_MSP_DATA, mspFcProcessCommand, mspFcProcessReply);
