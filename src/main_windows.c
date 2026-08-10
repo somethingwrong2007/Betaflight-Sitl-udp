@@ -314,6 +314,7 @@ void FAST_CODE run(void)
     extern void sitlStepTime(uint64_t stepUs);
     extern void sitlSetVirtualTimeUs(uint64_t valueUs);
     extern uint64_t micros64_real(void);
+    extern void rxFrameCheck(timeUs_t currentTimeUs, timeDelta_t currentDeltaTimeUs);
     extern HANDLE sitlUdpFdmEvent(void);
     extern uint64_t sitlUdpFdmTakePendingUs(void);
     extern bool sitlUdpFdmHasData(void);
@@ -333,6 +334,7 @@ void FAST_CODE run(void)
     HANDLE fdmEvent = sitlUdpFdmEvent();
     bool fdmLogged = false;
     uint64_t lastIdleRealUs = 0;
+    uint32_t lastRxCheckUs = 0;
     bool idleSinceLastPacket = false;
 
     // The virtual clock starts at 0 and schedulerInit anchored the gyro grid
@@ -343,6 +345,7 @@ void FAST_CODE run(void)
         sitlStepTime(stepUs);
         scheduler();
     }
+    lastRxCheckUs = (uint32_t)micros64();
     fprintf(stderr, "[SITL] UDP time mode: waiting for FDM packets on 127.0.0.1:9003\n");
 
     while (true) {
@@ -367,13 +370,29 @@ void FAST_CODE run(void)
         }
         // Idle: advance the virtual clock 1:1 with real time so millis()
         // keeps moving for MSP/CLI timeouts (e.g. the 100 ms CLI entry
-        // guard), without running the scheduler - the flight loop stays idle.
+        // guard). The flight loop stays idle: the scheduler is only entered
+        // while the virtual clock is safely away from the next gyro deadline.
         const uint64_t nowRealUs = micros64_real();
         if (lastIdleRealUs != 0 && nowRealUs > lastIdleRealUs) {
             sitlStepTime(nowRealUs - lastIdleRealUs);
         }
         lastIdleRealUs = nowRealUs;
         idleSinceLastPacket = true;
+
+        // Consume any pending RC frame. rxFrameCheck() normally runs in the
+        // scheduler's gyro block, which does not run while idle, so UDP RC
+        // input would otherwise never reach rcData.
+        const uint32_t nowVirtualUs = (uint32_t)micros64();
+        rxFrameCheck(nowVirtualUs, nowVirtualUs - lastRxCheckUs);
+        lastRxCheckUs = nowVirtualUs;
+
+        // Enter the scheduler (keeping clear of a gyro deadline) so the RX
+        // task can process the frame and other event-driven tasks stay alive.
+        const uint64_t nextDeadlineUs = ((micros64() / gyroPeriodUs) + 1) * gyroPeriodUs;
+        if ((int64_t)(nextDeadlineUs - micros64()) > 50) {
+            scheduler();
+        }
+
         // No packet time left: idle until the next FDM packet. The virtual
         // clock advances slowly, but the flight loop does not run; the brief
         // periodic wake processes serial/MSP directly (the time-driven
