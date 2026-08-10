@@ -424,8 +424,10 @@ if(WIN32)
   # Rename sitl.c's time functions so wincompat.c can provide stepped virtual
   # time (like AJ92/SimITL): the scheduler's gyro busy-wait then terminates in
   # a few fixed steps instead of spinning in real time.
+  # systemReset is renamed so wincompat.c can install a custom firmware reboot
+  # that relaunches the SITL process automatically instead of just exiting.
   set_source_files_properties("${BF_ROOT}/src/platform/SIMULATOR/sitl.c" PROPERTIES COMPILE_OPTIONS
-    "-Dmicros64=sitlMicros64;-Dmillis64=sitlMillis64;-Dmicros=sitlMicros;-Dmillis=sitlMillis;-DdelayMicroseconds=sitlDelayMicroseconds;-DgetCycleCounter=sitlGetCycleCounter;-Dfopen=sitlFopen;-Dpthread_mutex_trylock=sitlMutexTrylock;-Dpthread_mutex_unlock=sitlMutexUnlock")
+    "-Dmicros64=sitlMicros64;-Dmillis64=sitlMillis64;-Dmicros=sitlMicros;-Dmillis=sitlMillis;-DdelayMicroseconds=sitlDelayMicroseconds;-DgetCycleCounter=sitlGetCycleCounter;-Dfopen=sitlFopen;-Dpthread_mutex_trylock=sitlMutexTrylock;-Dpthread_mutex_unlock=sitlMutexUnlock;-DsystemReset=sitlSystemResetNative")
   # msp_serial.c's millis() calls (CLI entry guard, configurator-activity
   # timeout) must track real time even while the UDP-driven virtual clock is
   # frozen during idle, otherwise the CLI can never be entered and the

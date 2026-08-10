@@ -226,6 +226,14 @@ int main(int argc, char *argv[])
     // 1 ms system timer resolution so short sleeps in the helper threads
     // (UDP links, WebSocket proxy) do not round up to the ~15.6 ms tick.
     timeBeginPeriod(1);
+
+    // A firmware reboot (MSP "Save and Reboot", CLI "save"/"exit") spawns a
+    // hidden copy of this process with BF_SITL_REBOOT_CHILD set so the
+    // simulator comes back automatically. Wait here for the old process to
+    // release the TCP/UDP ports before binding them again.
+    if (getenv("BF_SITL_REBOOT_CHILD") != NULL) {
+        Sleep(2000);
+    }
 #endif
 
     ensureWritableWorkingDirectory();

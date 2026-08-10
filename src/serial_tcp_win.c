@@ -22,6 +22,7 @@
 #include "common/utils.h"
 #include "drivers/serial_tcp.h"
 #include "io/serial.h"
+#include "win_socket_util.h"
 
 #define BASE_PORT 5760
 #define MAX_TCP_CLIENTS 8
@@ -120,6 +121,7 @@ static void *tcpServerThread(void *arg)
         if (client == INVALID_SOCKET) {
             continue;
         }
+        socketNoInherit(client);
 
         pthread_mutex_lock(&clientLocks[id]);
         int slot = -1;
@@ -186,6 +188,7 @@ static int tcpReconfigure(tcpPort_t *s, int id)
     if (listenSock == INVALID_SOCKET) {
         return -1;
     }
+    socketNoInherit(listenSock);
 
     BOOL reuse = TRUE;
     setsockopt(listenSock, SOL_SOCKET, SO_REUSEADDR, (const char *)&reuse, sizeof(reuse));

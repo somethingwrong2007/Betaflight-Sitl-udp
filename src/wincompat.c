@@ -20,6 +20,8 @@
 extern uint64_t micros64_real(void);
 extern void sitlDelayMicroseconds(uint32_t us);
 extern void writeEEPROM(void);
+extern void sitlSystemResetNative(void);
+void systemReset(void);
 
 // sitl.c's fopen() calls are renamed to sitlFopen() by CMakeLists.txt so the
 // virtual EEPROM file can be redirected without touching the Betaflight
@@ -94,10 +96,67 @@ int sitlMutexUnlock(pthread_mutex_t *mutex)
 // CMakeLists.txt. A firmware reboot terminates the SITL process, so persist
 // the current RAM config first - this makes the configurator's "Save and
 // Reboot" always save, even if the MSP_EEPROM_WRITE step was skipped or lost.
+// systemReset() itself is our custom implementation below, which relaunches
+// the simulator so the reboot does not need a manual restart.
 void sitlSystemReset(void)
 {
     writeEEPROM();
     systemReset();
+}
+
+// Spawn a hidden copy of ourselves before the firmware reboot exits this
+// process. The child sees BF_SITL_REBOOT_CHILD=1 in its environment and
+// waits a couple of seconds (see main_windows.c) for the parent to release
+// the TCP/UDP ports, then comes up as the "reborn" flight controller. An
+// environment variable is used instead of a command-line flag so the
+// firmware's targetParseArgs() does not reject it as an unknown argument.
+static void sitlRelaunchSelf(void)
+{
+    const char *cmdline = GetCommandLineA();
+    if (cmdline == NULL) {
+        return;
+    }
+
+    const size_t len = strlen(cmdline);
+    char *childCmdline = (char *)malloc(len + 1);
+    if (childCmdline == NULL) {
+        return;
+    }
+    memcpy(childCmdline, cmdline, len + 1);
+
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof(si));
+    memset(&pi, 0, sizeof(pi));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
+    si.wShowWindow = SW_HIDE;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+
+    SetEnvironmentVariableA("BF_SITL_REBOOT_CHILD", "1");
+    if (CreateProcessA(NULL, childCmdline, NULL, NULL, TRUE, CREATE_NO_WINDOW,
+                       NULL, NULL, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        fprintf(stderr, "[SITL] auto-restart: spawned child PID %lu\n",
+                (unsigned long)pi.dwProcessId);
+    } else {
+        fprintf(stderr, "[SITL] auto-restart failed (error %lu), manual restart required\n",
+                (unsigned long)GetLastError());
+    }
+    SetEnvironmentVariableA("BF_SITL_REBOOT_CHILD", NULL);
+    free(childCmdline);
+}
+
+// Custom firmware reboot installed for every systemReset() caller (CLI save /
+// exit, MSP reboot, CMS, ...). sitl.c's original implementation is compiled
+// as sitlSystemResetNative() so the symbol is free for this wrapper.
+void systemReset(void)
+{
+    sitlRelaunchSelf();
+    sitlSystemResetNative();
 }
 
 // Official real-time time base. sitl.c's time functions are renamed to

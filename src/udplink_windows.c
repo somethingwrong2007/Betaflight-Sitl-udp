@@ -15,6 +15,7 @@
 #include <string.h>
 
 #include "udplink.h"
+#include "win_socket_util.h"
 
 static bool wsaInitialized = false;
 
@@ -95,6 +96,7 @@ int udpInit(udpLink_t *link, const char *addr, int port, bool isServer)
     if (fd == INVALID_SOCKET) {
         return -2;
     }
+    socketNoInherit(fd);
 
     BOOL reuse = TRUE;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&reuse, sizeof(reuse));

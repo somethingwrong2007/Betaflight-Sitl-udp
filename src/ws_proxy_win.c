@@ -18,6 +18,8 @@
 #include <string.h>
 #include <pthread.h>
 
+#include "win_socket_util.h"
+
 #define WS_PORT 6761
 #define MSP_PORT 5761
 #define WS_GUID "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -287,6 +289,7 @@ static void *wsClientThread(void *arg)
     for (int attempt = 0; attempt < 50; attempt++) {
         tcp = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (tcp != INVALID_SOCKET) {
+            socketNoInherit(tcp);
             struct sockaddr_in addr;
             memset(&addr, 0, sizeof(addr));
             addr.sin_family = AF_INET;
@@ -362,6 +365,7 @@ static void *wsListenThread(void *arg)
         if (client == INVALID_SOCKET) {
             continue;
         }
+        socketNoInherit(client);
         pthread_t thread;
         pthread_create(&thread, NULL, wsClientThread, (void *)(intptr_t)client);
         pthread_detach(thread);
@@ -379,6 +383,7 @@ void wsProxyStart(void)
     if (wsListenSocket == INVALID_SOCKET) {
         return;
     }
+    socketNoInherit(wsListenSocket);
 
     BOOL reuse = TRUE;
     setsockopt(wsListenSocket, SOL_SOCKET, SO_REUSEADDR, (const char *)&reuse, sizeof(reuse));
