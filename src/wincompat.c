@@ -15,6 +15,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <pthread.h>
 
 extern uint64_t micros64_real(void);
 extern void sitlDelayMicroseconds(uint32_t us);
@@ -68,6 +69,24 @@ void sitlStepTime(uint64_t stepUs)
 uint32_t sitlMspMillis(void)
 {
     return (uint32_t)(micros64_real() / 1000);
+}
+
+// sitl.c's pthread_mutex_trylock/unlock calls are renamed to these stubs by
+// CMakeLists.txt. The virtual-EEPROM motor-output path has a broken mutex: a
+// trylock that is never unlocked on the main thread plus a mis-owned unlock
+// from the FDM receive thread (undefined behaviour), which can silently skip
+// motor packets. The stubs make that path lock-free, matching the upstream
+// fix of simply removing the gate.
+int sitlMutexTrylock(pthread_mutex_t *mutex)
+{
+    (void)mutex;
+    return 0;
+}
+
+int sitlMutexUnlock(pthread_mutex_t *mutex)
+{
+    (void)mutex;
+    return 0;
 }
 
 // Official real-time time base. sitl.c's time functions are renamed to

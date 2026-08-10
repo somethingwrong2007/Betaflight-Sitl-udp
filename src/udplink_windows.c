@@ -28,7 +28,11 @@ static bool wsaInitialized = false;
 // submodule.
 #define SITL_FDM_PORT       9003
 #define SITL_FDM_PACKET_SIZE 144 // sizeof(fdm_packet): 18 doubles
-#define SITL_MAX_FDM_DELTA_US 50000
+// Cap the virtual time consumed per FDM packet at 5 s. Anything beyond that
+// is a link restart, not a stutter: the run loop drains the delta in 100 us
+// steps, so short UE hitches (frame drops, async-physics stalls) no longer
+// freeze the scheduler and stop the motor output.
+#define SITL_MAX_FDM_DELTA_US 5000000
 
 static HANDLE gFdmEvent = NULL;
 static volatile LONG64 gFdmPendingUs = 0;
