@@ -22,6 +22,9 @@ extern void sitlDelayMicroseconds(uint32_t us);
 extern void writeEEPROM(void);
 extern void sitlSystemResetNative(void);
 void systemReset(void);
+#ifdef USE_BLACKBOX
+extern void blackboxFinish(void);
+#endif
 
 // sitl.c's fopen() calls are renamed to sitlFopen() by CMakeLists.txt so the
 // virtual EEPROM file can be redirected without touching the Betaflight
@@ -155,6 +158,11 @@ static void sitlRelaunchSelf(void)
 // as sitlSystemResetNative() so the symbol is free for this wrapper.
 void systemReset(void)
 {
+#ifdef USE_BLACKBOX
+    // Close any in-progress blackbox log cleanly (writes the end-of-log event)
+    // before relaunching, so a reboot never leaves a truncated .BFL file.
+    blackboxFinish();
+#endif
     sitlRelaunchSelf();
     sitlSystemResetNative();
 }
