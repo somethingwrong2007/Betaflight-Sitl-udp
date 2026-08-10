@@ -46,21 +46,51 @@ The executable is the official Betaflight SITL server:
 
 The first run creates `eeprom.bin` (32 KiB) in the working directory.
 
-On Windows the SITL scheduler normally spin-waits for the next gyro tick,
-which consumes a full CPU core even when no flight simulator is attached.
-This build instead runs the scheduler on a stepped virtual clock (the same
-approach as AJ92/SimITL): virtual time advances in fixed 500 us steps, so the
-gyro busy-wait terminates in a couple of steps instead of spinning. The
-gyro/filter/PID loop runs at ~1 kHz (matching a 1 kHz external physics
-simulator), the serial/MSP task gets the alternate scheduler passes so the
-configurator stays responsive, and CPU use stays near 1% of a core. To
-restore the official real-time 10 kHz busy-wait behavior, set
-`BF_SITL_LOW_CPU=0`:
+## Time base (scheduler) modes
 
-```powershell
-$env:BF_SITL_LOW_CPU = 0  # official 10 kHz busy-wait
-.\betaflight_SITL.exe
+The scheduler time base is selected at compile time with `SITL_TIME_MODE`
+(default `REALTIME`):
+
+### REALTIME (default)
+
+The official Betaflight scheduler busy-waits to the exact gyro deadline.
+Gyro/filter/PID are locked at `SITL_GYRO_HZ` (default 1 kHz). Timing is exact
+to the microsecond but the busy-wait consumes about one CPU core.
+
+### UDP (Unreal FDM-driven)
+
+The virtual clock is driven by Unreal FDM packets on UDP 9003 (the same
+packet-stepping idea as AJ92/SimITL): each packet's timestamp delta advances
+the virtual clock in 100 us quanta, so gyro/filter/PID fire once per 1000 us
+of Unreal time at near-zero CPU. When no packets are arriving the flight loop
+idles (virtual clock frozen, CPU ~0) while the serial/MSP link stays alive,
+so the Betaflight configurator remains connected.
+
+```bash
+cmake ..                        # REALTIME (default)
+cmake .. -DSITL_TIME_MODE=UDP   # Unreal FDM-driven
 ```
+
+The gyro/filter/PID frequency defaults to 1 kHz and can be changed with the
+`SITL_GYRO_HZ` CMake option, or at runtime with the `BF_SITL_GYRO_HZ`
+environment variable.
+
+## Configuration persistence
+
+Settings saved from the Betaflight configurator are stored in `eeprom.bin`
+(32 KiB) in the working directory, mirroring the FC's flash:
+
+- Save: click **Save** in the configurator (or type `save` in its CLI panel)
+  - this sends `MSP_EEPROM_WRITE` and the SITL flushes `eeprom.bin`.
+- Load: automatic at startup from `eeprom.bin`.
+- Reset: `defaults` then `save` in the CLI panel.
+- Text import/export: `diff`/`dump` in the CLI panel produces a text config;
+  `.\betaflight_SITL.exe --config <file>` loads it, saves it to `eeprom.bin`,
+  and exits.
+
+`eeprom.bin` is created next to the working directory (falling back to the
+executable's folder, then `%LOCALAPPDATA%\Betaflight-SITL`), so always launch
+from the same folder if you want one persistent configuration.
 
 ## Betaflight web configurator
 
