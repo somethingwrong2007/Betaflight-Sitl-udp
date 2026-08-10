@@ -52,6 +52,7 @@
 
 #include "scheduler/scheduler.h"
 #include "fc/tasks.h"
+#include "msp/msp.h"
 
 #ifdef CONFIG_IN_FILE
 #include "cli/cli.h"
@@ -60,7 +61,20 @@
 void run(void);
 
 #ifdef _WIN32
+#ifdef SITL_UDP_TIME
 extern void sitlUdpFdmInit(void);
+
+// msp_serial.h pulls in io/serial.h, which collides with the MinGW windows.h
+// include chain; declare just what the idle MSP keep-alive needs.
+typedef enum {
+    MSP_EVALUATE_NON_MSP_DATA = 0,
+    MSP_SKIP_NON_MSP_DATA
+} mspEvaluateNonMspData_e;
+
+void mspSerialProcess(mspEvaluateNonMspData_e evaluateNonMspData,
+                      mspProcessCommandFnPtr mspProcessCommandFn,
+                      mspProcessReplyFnPtr mspProcessReplyFn);
+#endif
 
 static uint32_t sitlGyroHz(void)
 {
@@ -156,7 +170,9 @@ int main(int argc, char *argv[])
 #endif
 
     ensureWritableWorkingDirectory();
+#ifdef SITL_UDP_TIME
     sitlUdpFdmInit();
+#endif
 
 #ifdef USE_MAIN_ARGS
     targetParseArgs(argc, argv);
@@ -234,15 +250,11 @@ int main(int argc, char *argv[])
 
 void FAST_CODE run(void)
 {
+#ifdef SITL_UDP_TIME
     extern void sitlStepTime(uint64_t stepUs);
-    extern void sitlSetTimeModeUdp(uint64_t syncUs);
-    extern void sitlSetTimeModeRealtime(void);
-    extern bool sitlTimeIsUdpDriven(void);
-    extern uint64_t micros64_real(void);
     extern HANDLE sitlUdpFdmEvent(void);
     extern uint64_t sitlUdpFdmTakePendingUs(void);
     extern bool sitlUdpFdmHasData(void);
-    extern void sitlUdpFdmReset(void);
 
     // Virtual clock quantum. Stepping on a grid that divides the gyro period
     // keeps the scheduler's busy-wait aligned: after each step the time left
@@ -250,75 +262,59 @@ void FAST_CODE run(void)
     // spins on a sub-step remainder.
     const uint64_t stepUs = 100;
     const uint32_t gyroPeriodUs = 1000000u / sitlGyroHz();
-    const bool udpTimeCompatible = (gyroPeriodUs % stepUs) == 0;
-    if (!udpTimeCompatible) {
-        fprintf(stderr, "[SITL] gyro period %u us not divisible by %llu us, Unreal UDP time disabled\n",
+    if ((gyroPeriodUs % stepUs) != 0) {
+        fprintf(stderr, "[SITL] gyro period %u us not divisible by %llu us\n",
                 (unsigned)gyroPeriodUs, (unsigned long long)stepUs);
     }
 
-    bool udpMode = false;
     uint64_t pendingUs = 0;
     HANDLE fdmEvent = sitlUdpFdmEvent();
+    bool fdmLogged = false;
+
+    // The virtual clock starts at 0 and schedulerInit anchored the gyro grid
+    // at 0, so fast-forward to the first deadline in fixed quanta. Each pass
+    // keeps the scheduler busy-wait aligned (remaining is always a multiple
+    // of the quantum) and never triggers its catch-up recovery.
+    while (getTask(TASK_GYRO)->lastExecutedAtUs == 0) {
+        sitlStepTime(stepUs);
+        scheduler();
+    }
+    fprintf(stderr, "[SITL] UDP time mode: waiting for Unreal FDM packets on 127.0.0.1:9003\n");
 
     while (true) {
-        if (!udpMode) {
-            // Official Betaflight run loop: call the scheduler in a tight
-            // loop. The scheduler itself busy-waits to the exact gyro
-            // deadline, which locks the gyro/filter/PID rate precisely at the
-            // cost of one CPU core.
+        // Consume the pending packet time in fixed quanta: one scheduler pass
+        // per quantum, so gyro/filter/PID fire on the Unreal timestamp grid.
+        while (pendingUs >= stepUs) {
+            sitlStepTime(stepUs);
+            pendingUs -= stepUs;
             scheduler();
-            // Auto-switch: once Unreal FDM packets arrive, hand the clock to
-            // the packet stream.
-            if (udpTimeCompatible && sitlUdpFdmHasData()) {
-                // Align the virtual clock to the scheduler's gyro deadline
-                // grid (fixed residue mod the quantum) so stepping never
-                // leaves the busy-wait spinning on a sub-step remainder.
-                const timeUs_t gyroExec = getTask(TASK_GYRO)->lastExecutedAtUs;
-                const uint64_t nowUs = micros64();
-                const uint32_t align = (uint32_t)((gyroExec % stepUs + stepUs - (uint32_t)(nowUs % stepUs)) % stepUs);
-                sitlSetTimeModeUdp(nowUs + align);
-                udpMode = true;
-                fprintf(stderr, "[SITL] Unreal FDM detected, switched to UDP-driven virtual time\n");
-            }
-#if defined(RUN_LOOP_DELAY_US) && RUN_LOOP_DELAY_US > 0
-            else {
-                delayMicroseconds_real(RUN_LOOP_DELAY_US);
-            }
-#endif
-        } else {
-            // UDP-driven virtual time: consume the pending packet time in
-            // fixed quanta (one scheduler pass per quantum), then block on
-            // the FDM socket event until the next packet. The scheduler's
-            // gyro fires on its 1000 us grid exactly once per Unreal ms and
-            // the thread sleeps at near-zero CPU between packets.
-            while (pendingUs >= stepUs) {
-                sitlStepTime(stepUs);
-                pendingUs -= stepUs;
-                scheduler();
-            }
-            pendingUs += sitlUdpFdmTakePendingUs();
-            if (pendingUs >= stepUs) {
-                continue;
-            }
-            const DWORD waitResult = (fdmEvent == NULL) ? WAIT_TIMEOUT : WaitForSingleObject(fdmEvent, 500);
-            if (waitResult == WAIT_TIMEOUT) {
-                // No packets for 500 ms: hand the clock back to real time.
-                // First walk the virtual clock forward to real time so the
-                // scheduler's gyro grid (anchored to the last virtual
-                // deadline) stays within one period of the real clock; its
-                // catch-up recovery cannot resume from a larger gap.
-                pendingUs = 0;
-                while (sitlTimeIsUdpDriven() && micros64() < micros64_real()) {
-                    sitlStepTime(stepUs);
-                    if ((micros64() % gyroPeriodUs) == 0) {
-                        scheduler();
-                    }
-                }
-                sitlSetTimeModeRealtime();
-                sitlUdpFdmReset();
-                udpMode = false;
-                fprintf(stderr, "[SITL] Unreal FDM lost, back to real-time mode\n");
-            }
+        }
+        pendingUs += sitlUdpFdmTakePendingUs();
+        if (pendingUs >= stepUs) {
+            continue;
+        }
+        // No packet time left: idle until the next FDM packet. The virtual
+        // clock stays frozen, so the flight loop does not run; the brief
+        // periodic wake processes serial/MSP directly (the time-driven
+        // SERIAL task would never become due on a frozen clock), keeping the
+        // ground station connected while waiting.
+        if (!fdmLogged && sitlUdpFdmHasData()) {
+            fdmLogged = true;
+            fprintf(stderr, "[SITL] Unreal FDM packets active\n");
+        }
+        if (fdmEvent == NULL || WaitForSingleObject(fdmEvent, 50) == WAIT_TIMEOUT) {
+            mspSerialProcess(MSP_EVALUATE_NON_MSP_DATA, mspFcProcessCommand, mspFcProcessReply);
         }
     }
+#else
+    // Official Betaflight run loop: call the scheduler in a tight loop. The
+    // scheduler itself busy-waits to the exact gyro deadline, which locks the
+    // gyro/filter/PID rate precisely at the cost of one CPU core.
+    while (true) {
+        scheduler();
+#if defined(RUN_LOOP_DELAY_US) && RUN_LOOP_DELAY_US > 0
+        delayMicroseconds_real(RUN_LOOP_DELAY_US);
+#endif
+    }
+#endif
 }

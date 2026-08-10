@@ -446,6 +446,13 @@ add_executable(betaflight_SITL ${BF_SOURCES})
 # BF_SITL_GYRO_HZ environment variable.
 set(SITL_GYRO_HZ 1000 CACHE STRING "SITL gyro/filter/PID loop frequency in Hz")
 
+# Time base selection: REALTIME is the official Betaflight scheduler
+# (busy-waits to the exact gyro deadline, one CPU core). UDP drives the
+# virtual clock from Unreal FDM packets on UDP 9003: the flight loop runs
+# only while packets arrive, and idles (but keeps serial/MSP alive) between
+# packets.
+set(SITL_TIME_MODE "REALTIME" CACHE STRING "SITL time base: REALTIME (official) or UDP (Unreal FDM-driven)")
+
 # =============================================================================
 # Compile definitions
 # =============================================================================
@@ -462,6 +469,10 @@ target_compile_definitions(betaflight_SITL PRIVATE
   HSE_VALUE=8000000
   FLASH_SIZE=2048
 )
+
+if(SITL_TIME_MODE STREQUAL "UDP")
+  target_compile_definitions(betaflight_SITL PRIVATE SITL_UDP_TIME)
+endif()
 
 # =============================================================================
 # Include directories

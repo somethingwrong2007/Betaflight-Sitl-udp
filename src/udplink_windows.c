@@ -18,6 +18,7 @@
 
 static bool wsaInitialized = false;
 
+#ifdef SITL_UDP_TIME
 // Unreal FDM clock hook. The official SITL receive thread calls
 // udpRecv(&stateLink, &fdmPkt, sizeof(fdm_packet), 100) on port 9003; the
 // fdm_packet struct starts with `double timestamp` (seconds). Each valid
@@ -60,8 +61,6 @@ bool sitlUdpFdmHasData(void)
     return InterlockedCompareExchange(&gFdmPacketCount, 0, 0) >= 2;
 }
 
-// Reset the detection state when the main loop hands the clock back to real
-// time, so a later re-switch requires fresh FDM packets.
 void sitlUdpFdmReset(void)
 {
     InterlockedExchange(&gFdmPacketCount, 0);
@@ -72,6 +71,7 @@ void sitlUdpFdmReset(void)
         ResetEvent(gFdmEvent);
     }
 }
+#endif
 
 static void ensureWsaStartup(void)
 {
@@ -146,6 +146,7 @@ int udpRecv(udpLink_t *link, void *data, size_t size, uint32_t timeout_ms)
     int len = (int)sizeof(link->si);
     const int ret = recvfrom((SOCKET)link->fd, data, (int)size, 0,
                              (struct sockaddr *)&link->si, &len);
+#ifdef SITL_UDP_TIME
     if (ret == (int)size && size == SITL_FDM_PACKET_SIZE && link->port == SITL_FDM_PORT) {
         const double ts = *(const double *)data;
 
@@ -168,5 +169,6 @@ int udpRecv(udpLink_t *link, void *data, size_t size, uint32_t timeout_ms)
         gFdmLastTs = ts;
         InterlockedIncrement(&gFdmPacketCount);
     }
+#endif
     return ret;
 }
