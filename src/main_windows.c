@@ -112,10 +112,65 @@ static bool trySetWorkingDirectory(const char *path)
     return SetCurrentDirectoryA(path) != 0;
 }
 
+// Create every missing component of a directory path (mkdir -p equivalent).
+static bool createDirectoryChain(char *path)
+{
+    if (path[0] == '\0' || (path[1] == ':' && path[2] == '\0')) {
+        return true; // empty or drive root
+    }
+    const DWORD attrs = GetFileAttributesA(path);
+    if (attrs != INVALID_FILE_ATTRIBUTES) {
+        return (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    }
+    char *slash = strrchr(path, '\\');
+    char *fslash = strrchr(path, '/');
+    if (fslash > slash) {
+        slash = fslash;
+    }
+    if (slash != NULL && slash != path && slash[1] != '\0') {
+        const char saved = *slash;
+        *slash = '\0';
+        const bool parentOk = createDirectoryChain(path);
+        *slash = saved;
+        if (!parentOk) {
+            return false;
+        }
+    }
+    return CreateDirectoryA(path, NULL) != 0 || GetLastError() == ERROR_ALREADY_EXISTS;
+}
+
+// If BF_SITL_EEPROM points into a directory that does not exist yet, create
+// it before init so sitl.c's virtual EEPROM can create the file there.
+static void ensureEepromDirectory(void)
+{
+    const char *eeprom = getenv("BF_SITL_EEPROM");
+    if (eeprom == NULL || eeprom[0] == '\0') {
+        return;
+    }
+    char path[MAX_PATH];
+    strncpy(path, eeprom, sizeof(path) - 1);
+    path[sizeof(path) - 1] = '\0';
+    char *slash = strrchr(path, '\\');
+    char *fslash = strrchr(path, '/');
+    if (fslash > slash) {
+        slash = fslash;
+    }
+    if (slash != NULL && slash != path) {
+        *slash = '\0';
+        createDirectoryChain(path);
+    }
+}
+
 static void ensureWritableWorkingDirectory(void)
 {
-    // If the current directory already lets us create eeprom.bin, keep it.
-    FILE *probe = fopen("eeprom.bin", "a");
+    // If the current directory already lets us create the EEPROM file, keep
+    // it. With BF_SITL_EEPROM set, probe that file (its directory is created
+    // by ensureEepromDirectory) so no stray eeprom.bin appears in the CWD.
+    const char *eepromOverride = getenv("BF_SITL_EEPROM");
+    const char *probeName = (eepromOverride != NULL && eepromOverride[0] != '\0')
+        ? eepromOverride
+        : "eeprom.bin";
+    FILE *probe = fopen(probeName, "a");
     if (probe != NULL) {
         fclose(probe);
         return;
@@ -170,6 +225,7 @@ int main(int argc, char *argv[])
 #endif
 
     ensureWritableWorkingDirectory();
+    ensureEepromDirectory();
 #ifdef SITL_UDP_TIME
     sitlUdpFdmInit();
 #endif

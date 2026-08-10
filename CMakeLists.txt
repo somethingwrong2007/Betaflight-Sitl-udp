@@ -425,7 +425,7 @@ if(WIN32)
   # time (like AJ92/SimITL): the scheduler's gyro busy-wait then terminates in
   # a few fixed steps instead of spinning in real time.
   set_source_files_properties("${BF_ROOT}/src/platform/SIMULATOR/sitl.c" PROPERTIES COMPILE_OPTIONS
-    "-Dmicros64=sitlMicros64;-Dmillis64=sitlMillis64;-Dmicros=sitlMicros;-Dmillis=sitlMillis;-DdelayMicroseconds=sitlDelayMicroseconds;-DgetCycleCounter=sitlGetCycleCounter")
+    "-Dmicros64=sitlMicros64;-Dmillis64=sitlMillis64;-Dmicros=sitlMicros;-Dmillis=sitlMillis;-DdelayMicroseconds=sitlDelayMicroseconds;-DgetCycleCounter=sitlGetCycleCounter;-Dfopen=sitlFopen")
   # The dyad-based TCP bridge is replaced by serial_tcp_win.c; dyad_update()
   # busy-spins when no streams exist, so wincompat.c provides a sleeping stub.
   set_source_files_properties("${BF_ROOT}/lib/main/dyad/dyad.c" PROPERTIES COMPILE_OPTIONS "-Ddyad_update=dyad_update_real")

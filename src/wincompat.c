@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 #include "platform.h"
 #include "drivers/io.h"
@@ -17,6 +18,24 @@
 
 extern uint64_t micros64_real(void);
 extern void sitlDelayMicroseconds(uint32_t us);
+
+// sitl.c's fopen() calls are renamed to sitlFopen() by CMakeLists.txt so the
+// virtual EEPROM file can be redirected without touching the Betaflight
+// submodule. Set BF_SITL_EEPROM to a file path to keep separate configs
+// (e.g. "E:\sim\unreal.bin"); the default stays eeprom.bin in the working
+// directory.
+#define SITL_EEPROM_FILENAME "eeprom.bin"
+
+FILE *sitlFopen(const char *filename, const char *mode)
+{
+    if (strcmp(filename, SITL_EEPROM_FILENAME) == 0) {
+        const char *eeprom = getenv("BF_SITL_EEPROM");
+        if (eeprom != NULL && eeprom[0] != '\0') {
+            return fopen(eeprom, mode);
+        }
+    }
+    return fopen(filename, mode);
+}
 
 void dyad_update(void)
 {
