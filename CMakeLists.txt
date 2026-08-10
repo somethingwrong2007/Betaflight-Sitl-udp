@@ -426,6 +426,12 @@ if(WIN32)
   # a few fixed steps instead of spinning in real time.
   set_source_files_properties("${BF_ROOT}/src/platform/SIMULATOR/sitl.c" PROPERTIES COMPILE_OPTIONS
     "-Dmicros64=sitlMicros64;-Dmillis64=sitlMillis64;-Dmicros=sitlMicros;-Dmillis=sitlMillis;-DdelayMicroseconds=sitlDelayMicroseconds;-DgetCycleCounter=sitlGetCycleCounter;-Dfopen=sitlFopen")
+  # msp_serial.c's millis() calls (CLI entry guard, configurator-activity
+  # timeout) must track real time even while the UDP-driven virtual clock is
+  # frozen during idle, otherwise the CLI can never be entered and the
+  # activity window never expires. wincompat.c provides sitlMspMillis().
+  set_source_files_properties("${BF_ROOT}/src/main/msp/msp_serial.c" PROPERTIES COMPILE_OPTIONS
+    "-Dmillis=sitlMspMillis")
   # The dyad-based TCP bridge is replaced by serial_tcp_win.c; dyad_update()
   # busy-spins when no streams exist, so wincompat.c provides a sleeping stub.
   set_source_files_properties("${BF_ROOT}/lib/main/dyad/dyad.c" PROPERTIES COMPILE_OPTIONS "-Ddyad_update=dyad_update_real")

@@ -59,14 +59,16 @@ void sitlStepTime(uint64_t stepUs)
 {
     sitlVirtualTimeUs += stepUs;
 }
-
-// Re-anchor the virtual clock (used when a packet stream resumes after an
-// idle period, so the scheduler's gyro grid stays one period ahead).
-void sitlSetVirtualTimeUs(uint64_t valueUs)
-{
-    sitlVirtualTimeUs = valueUs;
-}
 #endif
+
+// msp_serial.c's millis() calls are renamed to sitlMspMillis() by
+// CMakeLists.txt so the CLI entry guard and configurator-activity timeout
+// use real time; they must work while the UDP-driven virtual clock is frozen
+// during idle (no packets arriving).
+uint32_t sitlMspMillis(void)
+{
+    return (uint32_t)(micros64_real() / 1000);
+}
 
 // Official real-time time base. sitl.c's time functions are renamed to
 // sitl* by CMakeLists.txt; these wrappers keep the original symbols available
