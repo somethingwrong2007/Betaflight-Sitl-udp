@@ -312,6 +312,8 @@ void FAST_CODE run(void)
 {
 #ifdef SITL_UDP_TIME
     extern void sitlStepTime(uint64_t stepUs);
+    extern void sitlSetVirtualTimeUs(uint64_t valueUs);
+    extern uint64_t micros64_real(void);
     extern HANDLE sitlUdpFdmEvent(void);
     extern uint64_t sitlUdpFdmTakePendingUs(void);
     extern bool sitlUdpFdmHasData(void);
@@ -330,6 +332,8 @@ void FAST_CODE run(void)
     uint64_t pendingUs = 0;
     HANDLE fdmEvent = sitlUdpFdmEvent();
     bool fdmLogged = false;
+    uint64_t lastIdleRealUs = 0;
+    bool idleSinceLastPacket = false;
 
     // The virtual clock starts at 0 and schedulerInit anchored the gyro grid
     // at 0, so fast-forward to the first deadline in fixed quanta. Each pass
@@ -351,12 +355,29 @@ void FAST_CODE run(void)
         }
         pendingUs += sitlUdpFdmTakePendingUs();
         if (pendingUs >= stepUs) {
+            if (idleSinceLastPacket) {
+                // The virtual clock drifted 1:1 with real time while idle;
+                // re-anchor it to the scheduler's last gyro deadline so the
+                // resumed packet stream starts exactly one period before it
+                // (the scheduler cannot recover from a larger gap).
+                sitlSetVirtualTimeUs(getTask(TASK_GYRO)->lastExecutedAtUs);
+                idleSinceLastPacket = false;
+            }
             continue;
         }
+        // Idle: advance the virtual clock 1:1 with real time so millis()
+        // keeps moving for MSP/CLI timeouts (e.g. the 100 ms CLI entry
+        // guard), without running the scheduler - the flight loop stays idle.
+        const uint64_t nowRealUs = micros64_real();
+        if (lastIdleRealUs != 0 && nowRealUs > lastIdleRealUs) {
+            sitlStepTime(nowRealUs - lastIdleRealUs);
+        }
+        lastIdleRealUs = nowRealUs;
+        idleSinceLastPacket = true;
         // No packet time left: idle until the next FDM packet. The virtual
-        // clock stays frozen, so the flight loop does not run; the brief
+        // clock advances slowly, but the flight loop does not run; the brief
         // periodic wake processes serial/MSP directly (the time-driven
-        // SERIAL task would never become due on a frozen clock), keeping the
+        // SERIAL task would never become due at this cadence), keeping the
         // ground station connected while waiting.
         if (!fdmLogged && sitlUdpFdmHasData()) {
             fdmLogged = true;

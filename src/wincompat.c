@@ -59,6 +59,13 @@ void sitlStepTime(uint64_t stepUs)
 {
     sitlVirtualTimeUs += stepUs;
 }
+
+// Re-anchor the virtual clock (used when a packet stream resumes after an
+// idle period, so the scheduler's gyro grid stays one period ahead).
+void sitlSetVirtualTimeUs(uint64_t valueUs)
+{
+    sitlVirtualTimeUs = valueUs;
+}
 #endif
 
 // Official real-time time base. sitl.c's time functions are renamed to
