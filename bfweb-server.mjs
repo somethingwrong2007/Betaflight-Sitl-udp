@@ -52,6 +52,24 @@ try {
 } catch (e) { /* localStorage unavailable */ }
 </script>`;
 
+// The configurator build registers a Workbox service worker that precaches
+// index.html, so after the first visit the browser serves the *un-injected*
+// page from the SW cache and the connection presets above never run (the
+// dev-URL detection then force-enables virtual mode). Replace sw.js with an
+// inert stub that clears all caches on activation and caches nothing, so
+// every navigation hits this server and gets the injected index.html.
+const SW_STUB = `self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', (event) => {
+    event.waitUntil((async () => {
+        if (self.caches) {
+            const keys = await self.caches.keys();
+            await Promise.all(keys.map((key) => self.caches.delete(key)));
+        }
+        await self.clients.claim();
+    })());
+});
+`;
+
 async function sendFile(res, filePath, type) {
     try {
         const data = await readFile(filePath);
@@ -71,6 +89,15 @@ const server = http.createServer(async (req, res) => {
     let pathname = decodeURIComponent(url.pathname);
     if (pathname === "/") {
         pathname = "/index.html";
+    }
+
+    if (pathname === "/sw.js") {
+        res.writeHead(200, {
+            "Content-Type": "text/javascript; charset=utf-8",
+            "Cache-Control": "no-cache",
+        });
+        res.end(SW_STUB);
+        return;
     }
 
     const filePath = path.join(DIST, path.normalize(pathname).replace(/^([/\\])+/, ""));
