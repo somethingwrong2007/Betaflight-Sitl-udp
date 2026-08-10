@@ -432,6 +432,12 @@ if(WIN32)
   # activity window never expires. wincompat.c provides sitlMspMillis().
   set_source_files_properties("${BF_ROOT}/src/main/msp/msp_serial.c" PROPERTIES COMPILE_OPTIONS
     "-Dmillis=sitlMspMillis")
+  # A firmware reboot terminates the SITL process; make sure the current RAM
+  # config is persisted first (wincompat.c's sitlSystemReset calls
+  # writeEEPROM() before the real systemReset), so "Save and Reboot" always
+  # saves even if the MSP_EEPROM_WRITE step was skipped or lost.
+  set_source_files_properties("${BF_ROOT}/src/main/msp/msp.c" PROPERTIES COMPILE_OPTIONS
+    "-DsystemReset=sitlSystemReset")
   # The dyad-based TCP bridge is replaced by serial_tcp_win.c; dyad_update()
   # busy-spins when no streams exist, so wincompat.c provides a sleeping stub.
   set_source_files_properties("${BF_ROOT}/lib/main/dyad/dyad.c" PROPERTIES COMPILE_OPTIONS "-Ddyad_update=dyad_update_real")

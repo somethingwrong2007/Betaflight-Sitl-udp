@@ -19,6 +19,7 @@
 
 extern uint64_t micros64_real(void);
 extern void sitlDelayMicroseconds(uint32_t us);
+extern void writeEEPROM(void);
 
 // sitl.c's fopen() calls are renamed to sitlFopen() by CMakeLists.txt so the
 // virtual EEPROM file can be redirected without touching the Betaflight
@@ -87,6 +88,16 @@ int sitlMutexUnlock(pthread_mutex_t *mutex)
 {
     (void)mutex;
     return 0;
+}
+
+// msp.c's systemReset() calls are renamed to sitlSystemReset() by
+// CMakeLists.txt. A firmware reboot terminates the SITL process, so persist
+// the current RAM config first - this makes the configurator's "Save and
+// Reboot" always save, even if the MSP_EEPROM_WRITE step was skipped or lost.
+void sitlSystemReset(void)
+{
+    writeEEPROM();
+    systemReset();
 }
 
 // Official real-time time base. sitl.c's time functions are renamed to
