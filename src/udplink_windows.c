@@ -20,36 +20,17 @@
 
 static bool wsaInitialized = false;
 
-#ifdef SITL_UDP_TIME
-// Unreal FDM clock hook. The official SITL receive thread calls
-// udpRecv(&stateLink, &fdmPkt, sizeof(fdm_packet), 100) on port 9003; the
-// fdm_packet struct starts with `double timestamp` (seconds). Each valid
-// datagram here adds the timestamp delta to a pending queue and signals the
-// main loop, which steps the virtual clock by that amount (see main_windows.c
-// and wincompat.c). This keeps all Unreal integration outside the Betaflight
-// submodule.
-#define SITL_FDM_PORT       9003
-#define SITL_FDM_PACKET_SIZE 144 // sizeof(fdm_packet): 18 doubles
 // Optional extended tail appended after the official fdm_packet:
 // double battery_voltage (V), double battery_current (A),
 // double motor_rpm[4]. Senders that only send the 144-byte packet keep the
-// defaults below.
+// defaults below. These shims are compiled in every Windows mode because
+// CMakeLists.txt routes battery.c's ADC meter reads to them; in REALTIME
+// mode (no FDM tail parser) they simply report the defaults.
 #define SITL_FDM_EXTENDED_SIZE 192
 #define SITL_FDM_EXT_BATTERY_VOLTAGE 144
 #define SITL_FDM_EXT_BATTERY_CURRENT 152
 #define SITL_FDM_EXT_MOTOR_RPM 160
 #define SITL_FDM_EXT_MOTOR_RPM_COUNT 4
-// Cap the virtual time consumed per FDM packet at 5 s. Anything beyond that
-// is a link restart, not a stutter: the run loop drains the delta in 100 us
-// steps, so short UE hitches (frame drops, async-physics stalls) no longer
-// freeze the scheduler and stop the motor output.
-#define SITL_MAX_FDM_DELTA_US 5000000
-
-static HANDLE gFdmEvent = NULL;
-static volatile LONG64 gFdmPendingUs = 0;
-static volatile LONG gFdmPacketCount = 0;
-static double gFdmLastTs = -1.0;
-static double gFdmRemainderUs = 0.0;
 
 static double sitlBatteryVoltage = 16.8; // V, 4S default so the FC always sees a battery
 static double sitlBatteryCurrent = 0.0;  // A
@@ -101,6 +82,28 @@ float simTelemetryMotorFrequencyHz(uint8_t motorIndex)
     }
     return (float)(sitlMotorRpm[motorIndex] / 60.0);
 }
+
+#ifdef SITL_UDP_TIME
+// Unreal FDM clock hook. The official SITL receive thread calls
+// udpRecv(&stateLink, &fdmPkt, sizeof(fdm_packet), 100) on port 9003; the
+// fdm_packet struct starts with `double timestamp` (seconds). Each valid
+// datagram here adds the timestamp delta to a pending queue and signals the
+// main loop, which steps the virtual clock by that amount (see main_windows.c
+// and wincompat.c). This keeps all Unreal integration outside the Betaflight
+// submodule.
+#define SITL_FDM_PORT       9003
+#define SITL_FDM_PACKET_SIZE 144 // sizeof(fdm_packet): 18 doubles
+// Cap the virtual time consumed per FDM packet at 5 s. Anything beyond that
+// is a link restart, not a stutter: the run loop drains the delta in 100 us
+// steps, so short UE hitches (frame drops, async-physics stalls) no longer
+// freeze the scheduler and stop the motor output.
+#define SITL_MAX_FDM_DELTA_US 5000000
+
+static HANDLE gFdmEvent = NULL;
+static volatile LONG64 gFdmPendingUs = 0;
+static volatile LONG gFdmPacketCount = 0;
+static double gFdmLastTs = -1.0;
+static double gFdmRemainderUs = 0.0;
 
 void sitlUdpFdmInit(void)
 {

@@ -68,7 +68,7 @@ jobs:
       - name: Build
         run: |
           mkdir build-win
-          cmake -S . -B build-win             -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64-toolchain.cmake             -DCMAKE_BUILD_TYPE=Release
+          cmake -S . -B build-win             -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64-toolchain.cmake             -DSITL_TIME_MODE=UDP             -DCMAKE_BUILD_TYPE=Release
           cmake --build build-win --config Release -j$(nproc)
 
       - name: Inspect
