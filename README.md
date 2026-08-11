@@ -1,37 +1,124 @@
 # BF-SITL-UDP
 
-Official Betaflight SITL compiled as a standalone UDP server for Windows and Linux.
+Standalone Betaflight SITL compiled as a UDP server for Windows and Linux.
+It keeps the official Betaflight SITL target intact (the `extern/betaflight`
+submodule is pinned and never modified) and layers all simulator plumbing on
+top: a Winsock UDP/TCP layer, an optional FDM-packet-driven virtual clock, a
+WebSocket bridge for the web configurator, config persistence, automatic
+process restart on firmware reboots, and virtual blackbox logging.
 
-- UDP 9001: Motor outputs, RealFlight bridge format (servo_packet_raw)
-- UDP 9002: Motor outputs, Gazebo format (servo_packet)
-- UDP 9003: Flight dynamics in (fdm_packet)
-- UDP 9004: RC channels in (rc_packet)
-- TCP 5761: MSP / Betaflight Configurator (UART1)
+The main use case is coupling Betaflight to an external physics simulator
+(e.g. an Unreal Engine project) over UDP, while still using the stock
+Betaflight Configurator for tuning.
 
-The Betaflight submodule is pinned to current master, where the SITL target
-lives under `src/platform/SIMULATOR`. The CMake build mirrors the official
-`make TARGET=SITL` source list, and a small Winsock shim replaces the POSIX
-UDP layer when cross-compiling for Windows.
+## Feature highlights
+
+- Two compile-time scheduler modes:
+  - `REALTIME`: the official scheduler busy-waits to the exact gyro deadline.
+  - `UDP`: the virtual clock is driven by FDM packet timestamps, so
+    gyro/filter/PID run at 1 kHz of *simulator* time while the process uses a
+    few percent of one CPU core and idles at ~0% when no packets arrive.
+- Default 1 kHz gyro/filter/PID loop, overridable at build time or runtime.
+- MSP over TCP 5761, built-in WebSocket proxy on 6761, and an optional local
+  web configurator on 8080 (offline, no VPN needed).
+- Full config persistence: Save, Save-and-Reboot, CLI `save`, `defaults`,
+  `diff`/`dump`, and `--config` file import.
+- Firmware reboots ("Save and Reboot", CLI `save`/`exit`) relaunch the SITL
+  process automatically; the connection comes back after ~2 s.
+- Virtual blackbox enabled by default: logs are written to `LOG00001.BFL`
+  in the working directory and can be opened in the configurator's Blackbox
+  tab.
+- Windows-only fixes for real-world pitfalls: non-inheritable sockets (no
+  duplicate listeners after auto-restart), a lock-free motor-update path, and
+  clean blackbox shutdown on reboot.
+
+## Ports
+
+| Port | Direction | Protocol | Purpose |
+|------|-----------|----------|---------|
+| 9001 | out | UDP `servo_packet_raw` | Motor outputs (raw PWM bridge format) |
+| 9002 | out | UDP `servo_packet` | Motor outputs (normalized Gazebo format) |
+| 9003 | in  | UDP `fdm_packet` | Flight dynamics / IMU state (drives the virtual clock in UDP mode) |
+| 9004 | in  | UDP `rc_packet` | RC channel inputs |
+| 5761 | both| TCP | MSP / CLI (UART1) |
+| 6761 | both| WebSocket | Configurator bridge to TCP 5761 |
+| 8080 | -   | HTTP | Optional local Betaflight Configurator (start-bf) |
+
+## Repository layout and submodule policy
+
+```
+CMakeLists.txt            build system, all Betaflight symbol renames
+src/
+  main_windows.c          Windows entry point and scheduler run loop
+  wincompat.c             POSIX shims, virtual clock, auto-restart, systemReset
+  win_socket_util.h       socket handle-inheritance fix
+  serial_tcp_win.c        Winsock MSP serial bridge (TCP 5761)
+  ws_proxy_win.c          WebSocket proxy (6761 -> 5761)
+  udplink_windows.c       Winsock UDP transport + FDM clock hooks
+cmake/
+  mingw-w64-toolchain.cmake
+bfweb-server.mjs          local web configurator server (8080)
+start-bf.cmd / .ps1       one-click launcher (Windows)
+extern/betaflight/        pinned Betaflight submodule - DO NOT EDIT
+```
+
+Because the submodule must stay pristine, almost every customization is done
+with per-file CMake `-D` symbol renames. For example:
+
+- `sitl.c` time functions (`micros`, `millis`, `delayMicroseconds`, ...) are
+  renamed to `sitl*` so `wincompat.c` can provide stepped virtual time.
+- `sitl.c`'s `systemReset` is renamed to `sitlSystemResetNative` so a custom
+  `systemReset()` can save config and auto-restart first.
+- `msp.c`'s `systemReset` is renamed to `sitlSystemReset` (persist EEPROM
+  before rebooting), and `msp_serial.c`'s `millis` to `sitlMspMillis`
+  (real-time CLI guard while the virtual clock is frozen).
 
 ## Build
 
 ### Linux (native)
+
 ```bash
+./setup.sh                                # init submodules
+cmake -S . -B build-linux -DCMAKE_BUILD_TYPE=Release
+cmake --build build-linux -j$(nproc)
+```
+
+### Windows (cross-compile from Linux/WSL)
+
+```bash
+sudo apt install mingw-w64 gcc-mingw-w64-x86-64-posix g++-mingw-w64-x86-64-posix cmake
 ./setup.sh
-mkdir build && cd build
-cmake ..
-make -j$(nproc)
+cmake -S . -B build-win-cmake \
+  -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64-toolchain.cmake \
+  -DSITL_TIME_MODE=UDP \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build-win-cmake -j$(nproc)
 ```
 
-### Windows (cross-compile from Linux)
-```bash
-sudo apt install mingw-w64 cmake
-mkdir build-win && cd build-win
-cmake .. -DCMAKE_TOOLCHAIN_FILE=../cmake/mingw-w64-toolchain.cmake
-make -j$(nproc)
-```
+The Windows executable needs `libwinpthread-1.dll` next to it. GCC/C++ runtime
+DLLs are statically linked; GitHub Actions collects everything into the
+`betaflight-sitl-windows-full` artifact.
 
-## Usage
+### CMake options
+
+| Option | Values | Default | Description |
+|--------|--------|---------|-------------|
+| `SITL_TIME_MODE` | `REALTIME` / `UDP` | `REALTIME` | Scheduler time base |
+| `SITL_GYRO_HZ` | 100-10000 | `1000` | Gyro/filter/PID frequency |
+| `SITL_ATTITUDE_DIRECT` | (defined) | on | Bypass the onboard IMU estimator and take attitude directly from the FDM quaternion (legacy SITL behavior) |
+| `DEFAULT_BLACKBOX_DEVICE` | (defined) | `BLACKBOX_DEVICE_VIRTUAL` | Fresh EEPROMs log blackbox to files by default |
+
+`SITL_GYRO_HZ` can also be overridden at runtime with `BF_SITL_GYRO_HZ`.
+
+### CI
+
+`.github/workflows/build.yml` builds Linux and Windows binaries on push/PR:
+
+- `betaflight-sitl-linux` - native Linux executable
+- `betaflight-sitl-windows` - Windows executable only
+- `betaflight-sitl-windows-full` - executable + `libwinpthread-1.dll`
+
+## Running
 
 The executable is the official Betaflight SITL server:
 
@@ -39,17 +126,39 @@ The executable is the official Betaflight SITL server:
 ./betaflight_SITL --ip 127.0.0.1 --gpx
 ```
 
-- `--ip <address>`: IP address to send motor outputs to (default: `127.0.0.1`)
+- `--ip <address>`: IP address to send motor outputs to (default `127.0.0.1`)
 - `--config <file>`: load a CLI config file, save it to EEPROM, then exit
 - `--gpx`: write a GPS track to `sitl_track.gpx`
 - `--help`, `-h`: show usage
 
 The first run creates `eeprom.bin` (32 KiB) in the working directory.
 
-## Time base (scheduler) modes
+### Quick start (Windows)
 
-The scheduler time base is selected at compile time with `SITL_TIME_MODE`
-(default `REALTIME`):
+Double-click `start-bf.cmd` (or run `start-bf.ps1`), which:
+
+1. Starts `build-win-cmake\betaflight_SITL.exe` hidden if it is not running.
+2. Starts `bfweb-server.mjs` on `http://127.0.0.1:8080` (if not already
+   running; override the port with `BFWEB_PORT`).
+3. Opens the configurator in the default browser.
+
+`bfweb-server.mjs` serves a locally built `bf-configurator/src/dist` and
+injects a small script into `index.html` that presets the connection
+settings: manual connection mode, WebSocket URL `ws://127.0.0.1:6761`, and
+automatic development options disabled. No files from `bf-configurator` are
+modified, and the configurator's service worker is neutralized so the preset
+always applies. A page served from 127.0.0.1 connecting back to 127.0.0.1 is
+exempt from browser local-network permission prompts.
+
+To build the local configurator once (needed for `start-bf`):
+
+```bash
+cd bf-configurator
+npm ci
+npm run build
+```
+
+## Time base (scheduler) modes
 
 ### REALTIME (default)
 
@@ -57,90 +166,182 @@ The official Betaflight scheduler busy-waits to the exact gyro deadline.
 Gyro/filter/PID are locked at `SITL_GYRO_HZ` (default 1 kHz). Timing is exact
 to the microsecond but the busy-wait consumes about one CPU core.
 
-### UDP
+### UDP (FDM packet-driven)
 
-The virtual clock is driven by FDM packets arriving on UDP 9003: each
-packet's timestamp delta advances the virtual clock in 100 us quanta, so
-gyro/filter/PID fire once per 1000 us of simulator time at near-zero CPU.
-When no packets are arriving the flight loop idles (virtual clock frozen,
-CPU ~0) while the serial/MSP link stays alive, so the Betaflight
-configurator remains connected.
+The virtual clock is driven by `fdm_packet` timestamps arriving on UDP 9003:
+
+- Each packet's timestamp delta is accumulated and consumed in 100 us quanta,
+  so gyro/filter/PID fire exactly once per 1000 us of simulator time at
+  default settings.
+- While packets arrive the flight loop runs at the configured rate and CPU
+  use stays low (a few percent of one core).
+- When no packets arrive the virtual clock freezes: the flight loop idles at
+  ~0% CPU, failsafe/signal-loss timers do not expire, and the serial/MSP link
+  stays alive so the configurator remains connected.
+- RC frames on 9004 are still consumed while idle, and the CLI entry guard
+  uses real time, so CLI works even with a frozen virtual clock.
+- A single FDM delta is capped at 5 s (Windows) so a stale packet cannot jump
+  the clock; longer gaps simply mean the next packet continues from there.
 
 ```bash
-cmake ..                        # REALTIME (default)
-cmake .. -DSITL_TIME_MODE=UDP   # UDP FDM-driven
+cmake -S . -B build-win-cmake -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64-toolchain.cmake -DSITL_TIME_MODE=UDP
+cmake -S . -B build-win-cmake -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64-toolchain.cmake -DSITL_TIME_MODE=REALTIME
 ```
 
-The gyro/filter/PID frequency defaults to 1 kHz and can be changed with the
-`SITL_GYRO_HZ` CMake option, or at runtime with the `BF_SITL_GYRO_HZ`
-environment variable.
+## Data flow / protocol
+
+All structs are defined in
+`extern/betaflight/src/platform/SIMULATOR/target/SITL/target.h`.
+
+### fdm_packet (9003, 144 bytes = 18 doubles)
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `timestamp` | double | seconds; drives the virtual clock in UDP mode |
+| `imu_angular_velocity_rpy[3]` | double | rad/s |
+| `imu_linear_acceleration_xyz[3]` | double | m/s^2, body frame |
+| `imu_orientation_quat[4]` | double | w, x, y, z |
+| `velocity_xyz[3]` | double | m/s, earth frame |
+| `position_xyz[3]` | double | m / lat / lon / alt |
+| `pressure` | double | Pa (legacy bridges) |
+
+The timestamp must increase monotonically (a `double` in seconds, not a
+float). The Unreal bridge in FPVSkyline accepts `0` and fills in its own
+monotonic clock automatically.
+
+### rc_packet (9004)
+
+```c
+typedef struct {
+    double timestamp;                              // seconds
+    uint16_t channels[SIMULATOR_MAX_RC_CHANNELS];  // 16 channels, 1000-2000
+} rc_packet;
+```
+
+If the simulator produces normalized `-1..1` stick values, map them with
+`1500 + input * 500` before sending.
+
+### servo packets (9001 / 9002)
+
+```c
+typedef struct {
+    float motor_speed[4];   // 9002: normalized [0,1], [-1,1] in 3D mode
+} servo_packet;
+
+typedef struct {
+    uint16_t motorCount;                // 9001: number of motors (4)
+    float pwm_output_raw[SIMULATOR_MAX_PWM_CHANNELS]; // raw PWM values
+} servo_packet_raw;
+```
+
+Motor packets are emitted once per PID loop iteration, i.e. only while the
+virtual clock is advancing. When disarmed, 9002 is all zeros and 9001 holds
+the idle PWM (1000).
 
 ## Configuration persistence
 
-Settings saved from the Betaflight configurator are stored in `eeprom.bin`
-(32 KiB) in the working directory, mirroring the FC's flash:
+Settings saved from the configurator are stored in `eeprom.bin` (32 KiB),
+mirroring the FC's flash:
 
-- Save: click **Save** in the configurator (or type `save` in its CLI panel)
-  - this sends `MSP_EEPROM_WRITE` and the SITL flushes `eeprom.bin`.
-- Load: automatic at startup from `eeprom.bin`.
-- Reset: `defaults` then `save` in the CLI panel.
-- Text import/export: `diff`/`dump` in the CLI panel produces a text config;
-  `.\betaflight_SITL.exe --config <file>` loads it, saves it to `eeprom.bin`,
-  and exits.
+- **Save**: click Save in the configurator or type `save` in the CLI panel
+  (sends `MSP_EEPROM_WRITE`).
+- **Save and Reboot**: also works reliably - `MSP_REBOOT` writes the EEPROM
+  first, then reboots.
+- **Load**: automatic at startup from `eeprom.bin`.
+- **Reset**: `defaults` then `save` in the CLI panel.
+- **Text import/export**: `diff`/`dump` prints a text config;
+  `betaflight_SITL --config <file>` loads it, saves it, and exits.
 
-`eeprom.bin` is created next to the working directory (falling back to the
-executable's folder, then `%LOCALAPPDATA%\Betaflight-SITL`), so always launch
-from the same folder if you want one persistent configuration.
+`eeprom.bin` is created in the working directory, falling back to the
+executable's folder, then `%LOCALAPPDATA%\Betaflight-SITL`, then the temp
+directory. Always launch from the same folder for one persistent config.
 
-To keep multiple independent configurations, point `BF_SITL_EEPROM` at a
-specific file - e.g. `flight.bin` for flight tuning and `bench.bin` for
-bench testing. The directory is created automatically:
+For multiple independent configurations, point `BF_SITL_EEPROM` at a
+specific file (the directory is created automatically):
 
 ```powershell
 $env:BF_SITL_EEPROM = "E:\sim\flight.bin"
 .\betaflight_SITL.exe
 ```
 
-## Betaflight web configurator
+### Automatic restart on firmware reboot (Windows)
 
-The build includes a built-in WebSocket proxy on `ws://127.0.0.1:6761` that
-bridges to the MSP port on TCP 5761, so the online Betaflight configurator can
-connect without an external websockify:
+Any firmware reboot (`MSP_REBOOT`, CLI `save`, CLI `exit`, CMS save-exit)
+no longer leaves the simulator dead:
 
-1. Run `betaflight_SITL`.
-2. Open the configurator and enable manual connection mode.
-3. Enter `ws://127.0.0.1:6761` in the port field and click Connect.
+1. `systemReset()` calls `blackboxFinish()` (clean log close), writes the
+   EEPROM when the command is a save-type reboot, then spawns a hidden copy
+   of the process (`BF_SITL_REBOOT_CHILD=1`).
+2. The child waits 2 s for the old process to release all ports, then starts
+   as the "reborn" FC with the same working directory and log files.
+3. The configurator connection drops for ~2-3 s; reconnect manually if the
+   page does not retry automatically.
 
-Chrome/Edge 147+ reject WebSocket handshakes that do not echo the client's
-`binary` subprotocol; the built-in proxy handles this automatically.
+Windows sockets are marked non-inheritable so the child does not inherit the
+parent's listeners (which would leave connections landing on a socket nobody
+accepts from). CLI semantics are preserved: `save` persists, plain `exit`
+reboots without saving.
 
-### Quick start (Windows)
+### Tuning note: configurator shows 999/333
 
-For an offline, VPN-free web UI (also useful for local game tooling):
+The Setup page computes `pidHz = 1e6 / cycleTime` and `gyroHz = pidHz *
+pid_process_denom`. If the config has `use_unsynced_pwm = OFF` with PWM
+protocol at 480 Hz, Betaflight forces `pid_process_denom = 3`, so the PID
+loop runs at ~333 Hz and the display reads `999/333` (the gyro itself is
+still 1000 Hz). To keep a 1 kHz PID loop, set `use_unsynced_pwm = ON` and
+`pid_process_denom = 1` (or use a faster motor protocol).
 
-1. Build the official `betaflight-configurator` repo once (`npm ci && npm run
-   build`) so its `src/dist` directory exists under `bf-configurator/`.
-2. Run `.\start-bf.ps1` - it starts `betaflight_SITL.exe`, starts the local web
-   server on `http://127.0.0.1:8080` and opens the configurator in your
-   browser.
+## Blackbox
 
-   Or just double-click `start-bf.cmd` - same thing, no PowerShell needed.
+The SITL target builds Betaflight's virtual blackbox device, which writes
+standard `.BFL` logs to the working directory:
 
-`bfweb-server.mjs` serves the built `src/dist` directory and injects a tiny
-script into `index.html` that presets the connection settings in localStorage:
-dev auto-options are disabled and virtual mode is turned off, so the
-configurator defaults to the manual connection with `ws://127.0.0.1:6761`
-already in the port field - clicking Connect connects straight to the SITL.
-No files from `bf-configurator` are modified. A page served from 127.0.0.1
-connecting back to 127.0.0.1 is exempt from browser local-network permission
-prompts.
+- Fresh EEPROMs default to `blackbox_device = VIRTUAL` (compile-time default).
+- Existing EEPROMs keep their saved value; set it once with
+  `set blackbox_device = VIRTUAL` + `save`.
+- Logs are named `LOG00001.BFL`, `LOG00002.BFL`, ... (auto-incrementing).
+- `blackbox_mode = NORMAL` (default) records while armed; `ALWAYS` records
+  from boot without arming; `MOTOR_TEST` records during motor tests.
+- `blackbox_sample_rate` selects 1/1, 1/2, 1/4, 1/8 or 1/16 of the PID rate
+  (default 1/4, i.e. 250 Hz at a 1 kHz PID loop).
 
-## Windows notes
+Workflow:
 
-The Windows executable needs `libwinpthread-1.dll` next to it (the
-`betaflight-sitl-windows-full` artifact includes it). GCC and C++ runtime DLLs
-are statically linked.
+1. Fly (or set `blackbox_mode = ALWAYS` for bench recordings).
+2. Disarm / stop - the log is flushed and closed.
+3. Open the Betaflight Configurator's Blackbox tab and load
+   `build-win-cmake\LOG00001.BFL` (or wherever the working directory is).
 
-## Protocol
+Recorded fields include loop iteration, gyro (filtered and unfiltered), PID
+terms (P/I/D/F per axis), RC commands, setpoints, battery, motors, and the
+IMU quaternion. Rebooting the SITL calls `blackboxFinish()` first, so a
+Save-and-Reboot never truncates an open log.
 
-See Betaflight SITL documentation for `fdm_packet`, `servo_packet`, and `rc_packet` structures.
+## Environment variables
+
+| Variable | Purpose |
+|----------|---------|
+| `BF_SITL_EEPROM` | Path to the virtual EEPROM file (default `eeprom.bin` in CWD) |
+| `BF_SITL_GYRO_HZ` | Runtime gyro/filter/PID frequency override (100-10000) |
+| `BFWEB_PORT` | Port for the local web configurator (default 8080) |
+| `BF_SITL_REBOOT_CHILD` | Internal marker for the auto-restart child process |
+
+## Windows notes and troubleshooting
+
+- The executable needs `libwinpthread-1.dll` next to it.
+- `sitl-launch.out.log` / `sitl-launch.err.log` in `build-win-cmake` contain
+  SITL output; `bfweb-server.*.log` in the repo root contain web server
+  output. Logs continue into the same files after an auto-restart.
+- When the last TCP client disconnects while the FC is in CLI mode, SITL
+  injects `exit noreboot` so the CLI session ends without killing the
+  process; the next connection starts clean.
+- The web configurator logs a harmless `zh/messages.json 404` warning for
+  the Chinese locale and falls back to English.
+- Chrome/Edge 147+ require WebSocket handshakes to echo the `binary`
+  subprotocol; the built-in proxy handles this automatically.
+
+## Protocol reference
+
+See the Betaflight SITL documentation for the complete `fdm_packet`,
+`servo_packet`, and `rc_packet` definitions and the official simulation
+bridge documentation.
