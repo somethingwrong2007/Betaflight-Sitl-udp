@@ -208,7 +208,9 @@ static void ensureWritableWorkingDirectory(void)
 }
 #endif
 
-int main(int argc, char *argv[])
+// Shared boot sequence for both the standalone executable and the in-process
+// DLL (SITL_LINK_MODE=LOCAL calls this from sitl_local_init()).
+void sitlBoot(int argc, char *argv[])
 {
 #ifdef _WIN32
     // Keep SITL progress visible when stderr is redirected to a file/pipe.
@@ -301,19 +303,30 @@ int main(int argc, char *argv[])
     }
 #endif
 
-#ifdef CONFIG_IN_FILE
+#if defined(CONFIG_IN_FILE) && !defined(SITL_LOCAL)
     {
         const char *configFile = targetGetConfigFile();
         if (configFile) {
             cliProcessConfigFile(configFile);
-            return 0;
+            return;
         }
     }
 #endif
 
-    run();
+}
 
+int main(int argc, char *argv[])
+{
+    sitlBoot(argc, argv);
+
+#ifdef SITL_LOCAL
+    // Library mode: the host process calls sitl_local_init()/step() itself.
+    // Running the DLL's main directly just boots and exits.
     return 0;
+#else
+    run();
+    return 0;
+#endif
 }
 
 void FAST_CODE run(void)

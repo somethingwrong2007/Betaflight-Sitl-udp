@@ -171,6 +171,7 @@ void sitlUdpFdmReset(void)
 }
 #endif
 
+#ifndef SITL_LOCAL
 static void ensureWsaStartup(void)
 {
     if (!wsaInitialized) {
@@ -180,9 +181,46 @@ static void ensureWsaStartup(void)
         }
     }
 }
+#endif
+
+#ifdef SITL_LOCAL
+// In LOCAL mode the DLL does not touch the network: udpInit() records the
+// link identity only, udpSend() captures the motor packets into a slot that
+// sitl_local_step() returns to the host, and udpRecv() just sleeps so the
+// legacy UDP receive threads idle instead of spinning.
+static uint8_t gLocalMotorPacket[256];
+static volatile LONG gLocalMotorPacketLen = 0;
+
+void sitlLocalCaptureMotorPacket(const void *data, size_t size)
+{
+    if (size > sizeof(gLocalMotorPacket)) {
+        size = sizeof(gLocalMotorPacket);
+    }
+    memcpy(gLocalMotorPacket, data, size);
+    InterlockedExchange(&gLocalMotorPacketLen, (LONG)size);
+}
+
+bool sitlLocalTakeMotorPacket(void *out, size_t size)
+{
+    const LONG len = InterlockedExchange(&gLocalMotorPacketLen, 0);
+    if (len <= 0 || (size_t)len > size) {
+        return false;
+    }
+    memcpy(out, gLocalMotorPacket, (size_t)len);
+    return true;
+}
+#endif
 
 int udpInit(udpLink_t *link, const char *addr, int port, bool isServer)
 {
+#ifdef SITL_LOCAL
+    memset(link, 0, sizeof(*link));
+    link->port = port;
+    link->isServer = isServer;
+    link->fd = -1;
+    (void)addr;
+    return 0;
+#else
     ensureWsaStartup();
 
     SOCKET fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -218,16 +256,34 @@ int udpInit(udpLink_t *link, const char *addr, int port, bool isServer)
     }
 
     return 0;
+#endif
 }
 
 int udpSend(udpLink_t *link, const void *data, size_t size)
 {
+#ifdef SITL_LOCAL
+    if (link->port == 9001 || link->port == 9002) {
+        sitlLocalCaptureMotorPacket(data, size);
+    }
+    return (int)size;
+#else
     return sendto((SOCKET)link->fd, data, (int)size, 0,
                   (const struct sockaddr *)&link->si, sizeof(link->si));
+#endif
 }
 
 int udpRecv(udpLink_t *link, void *data, size_t size, uint32_t timeout_ms)
 {
+#ifdef SITL_LOCAL
+    (void)link;
+    (void)data;
+    (void)size;
+    // Keep the legacy UDP receive threads from busy-spinning: they sleep for
+    // the timeout and report no data. All sensor input comes from
+    // sitl_local_step() instead.
+    Sleep(timeout_ms);
+    return -1;
+#else
     fd_set fds;
     struct timeval tv;
 
@@ -301,4 +357,5 @@ int udpRecv(udpLink_t *link, void *data, size_t size, uint32_t timeout_ms)
     const int ret = recvfrom((SOCKET)link->fd, data, (int)size, 0,
                              (struct sockaddr *)&link->si, &len);
     return ret;
+#endif
 }

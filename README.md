@@ -104,6 +104,7 @@ DLLs are statically linked; GitHub Actions collects everything into the
 | Option | Values | Default | Description |
 |--------|--------|---------|-------------|
 | `SITL_TIME_MODE` | `REALTIME` / `UDP` | `REALTIME` | Scheduler time base |
+| `SITL_LINK_MODE` | `UDP` / `LOCAL` | `UDP` | `UDP` builds the standalone server; `LOCAL` builds an in-process DLL (`betaflight_SITL.dll`) with a synchronous step API |
 | `SITL_GYRO_HZ` | 100-10000 | `1000` | Gyro/filter/PID frequency |
 | `SITL_ATTITUDE_DIRECT` | defined / not defined | defined | Direct input mode: the virtual gyro is fed straight from the FDM angular velocity and the FDM quaternion is injected as attitude, so the FC does not run its own IMU estimator. Remove this define to enable `USE_IMU_CALC` instead: attitude is estimated by the firmware's Mahony filter from the virtual accelerometer/gyroscope/magnetometer feeds. |
 | `DEFAULT_BLACKBOX_DEVICE` | (defined) | `BLACKBOX_DEVICE_VIRTUAL` | Fresh EEPROMs log blackbox to files by default |
@@ -192,6 +193,54 @@ The virtual clock is driven by `fdm_packet` timestamps arriving on UDP 9003:
 cmake -S . -B build-win-cmake -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64-toolchain.cmake -DSITL_TIME_MODE=UDP
 cmake -S . -B build-win-cmake -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64-toolchain.cmake -DSITL_TIME_MODE=REALTIME
 ```
+
+### LOCAL (in-process library, zero UDP)
+
+For engines that want the flight controller inside their own process (e.g.
+Unreal's async physics tick at 1000 Hz), build the SITL as a DLL:
+
+```bash
+cmake -S . -B build-win-local -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64-toolchain.cmake \
+  -DSITL_TIME_MODE=UDP -DSITL_LINK_MODE=LOCAL -DCMAKE_BUILD_TYPE=Release
+cmake --build build-win-local --config Release -j$(nproc)
+```
+
+This produces `betaflight_SITL.dll` (exports `sitl_local_init`,
+`sitl_local_step`, `sitl_local_time_us`, `sitl_local_shutdown`) plus a
+`sitl_local_tester.exe` harness. The DLL needs `libwinpthread-1.dll`,
+`libgcc_s_seh-1.dll` and `libstdc++-6.dll` next to it (GCC 13 on CI names
+the same files under the 13-posix runtime).
+
+The host calls the API synchronously - no UDP, no stale reads:
+
+```c
+sitl_local_init();                                  // boots the FC once
+while (physicsTick) {
+    sitl_local_input_t in = /* FDM state, same fields/conventions as fdm_packet */;
+    sitl_local_output_t out;
+    sitl_local_step(&in, 1000, &out);               // 1000 = 1 ms virtual step
+    // out.pwm_output_raw[0..motor_count-1] are the motor PWM values (1000..2000)
+}
+```
+
+`sitl_local_step()` feeds the virtual sensors, advances the virtual clock by
+`dtUs`, runs one scheduler pass (gyro/filter/PID) and returns the motor
+outputs for that exact state in the same call. RC channels are taken from
+`in.rc_channels` (AETR + aux, 1000..2000); a frame is announced to the
+firmware only when the channel values change, so the measured RC rate follows
+the real update rate.
+
+The web configurator still works: boot keeps the TCP/WebSocket proxy on
+127.0.0.1:5761/6761 and a background thread services MSP. Caveats:
+
+- `SITL_ATTITUDE_DIRECT` (the current default) injects the FDM quaternion;
+  remove it to let `USE_IMU_CALC` estimate attitude from the virtual
+  acc/gyro/mag feeds.
+- "Save and Reboot" persists the configuration but does not restart the
+  in-process FC (there is no process to relaunch); restart the host session
+  for a full reboot.
+- The MSP thread runs concurrently with the scheduler; configurator operations
+  are infrequent, but they are not synchronized against the flight loop.
 
 ## Data flow / protocol
 

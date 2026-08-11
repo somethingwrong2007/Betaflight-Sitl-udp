@@ -121,6 +121,7 @@ void sitlSystemReset(void)
     systemReset();
 }
 
+#ifndef SITL_LOCAL
 // Spawn a hidden copy of ourselves before the firmware reboot exits this
 // process. The child sees BF_SITL_REBOOT_CHILD=1 in its environment and
 // waits a couple of seconds (see main_windows.c) for the parent to release
@@ -166,6 +167,7 @@ static void sitlRelaunchSelf(void)
     SetEnvironmentVariableA("BF_SITL_REBOOT_CHILD", NULL);
     free(childCmdline);
 }
+#endif
 
 // Custom firmware reboot installed for every systemReset() caller (CLI save /
 // exit, MSP reboot, CMS, ...). sitl.c's original implementation is compiled
@@ -177,8 +179,16 @@ void systemReset(void)
     // before relaunching, so a reboot never leaves a truncated .BFL file.
     blackboxFinish();
 #endif
+#ifdef SITL_LOCAL
+    // In-process library mode: there is no standalone process to relaunch and
+    // exiting would kill the host engine. Persist the configuration (the MSP
+    // caller already ran writeEEPROM via sitlSystemReset) and leave the FC
+    // running.
+    writeEEPROM();
+#else
     sitlRelaunchSelf();
     sitlSystemResetNative();
+#endif
 }
 
 // Battery voltage/current and motor RPM fed from the extended FDM packet

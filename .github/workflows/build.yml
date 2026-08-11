@@ -106,3 +106,48 @@ jobs:
           name: betaflight-sitl-windows-full
           path: build-win/dist/**
           if-no-files-found: warn
+
+  build-windows-local:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup
+        run: |
+          chmod +x setup.sh
+          ./setup.sh
+
+      - name: Install MinGW
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64 gcc-mingw-w64-x86-64-posix g++-mingw-w64-x86-64-posix cmake
+
+      - name: Build LOCAL DLL
+        run: |
+          mkdir build-win-local
+          cmake -S . -B build-win-local             -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64-toolchain.cmake             -DSITL_TIME_MODE=UDP             -DSITL_LINK_MODE=LOCAL             -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-win-local --config Release -j$(nproc)
+
+      - name: Collect DLLs
+        run: |
+          mkdir -p build-win-local/dist
+          cp build-win-local/betaflight_SITL.dll build-win-local/dist/
+          cp build-win-local/sitl_local_tester.exe build-win-local/dist/ || true
+          cp /usr/x86_64-w64-mingw32/lib/libwinpthread-1.dll build-win-local/dist/ || true
+          for ver in 13-posix 12-posix 11-posix 10-posix; do
+            cp /usr/lib/gcc/x86_64-w64-mingw32/$ver/libgcc_s_seh-1.dll build-win-local/dist/ 2>/dev/null && break
+          done || true
+          for ver in 13-posix 12-posix 11-posix 10-posix; do
+            cp /usr/lib/gcc/x86_64-w64-mingw32/$ver/libstdc++-6.dll build-win-local/dist/ 2>/dev/null && break
+          done || true
+          ls -la build-win-local/dist/
+
+      - name: Upload LOCAL DLL
+        uses: actions/upload-artifact@v4
+        with:
+          name: betaflight-sitl-windows-local
+          path: build-win-local/dist/**
+          if-no-files-found: warn

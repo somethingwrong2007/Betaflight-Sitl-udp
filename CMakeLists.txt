@@ -8,6 +8,8 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # =============================================================================
 # Platform flags
 # =============================================================================
+set(SITL_LINK_MODE "UDP" CACHE STRING "SITL link mode: UDP (network server) or LOCAL (in-process DLL API)")
+
 if(WIN32)
   message(STATUS "Building for Windows (MinGW)")
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DWIN32 -D_WINDOWS")
@@ -28,6 +30,14 @@ else()
   # LTO is required on Linux to let the linker drop unused references that the
   # official build removes at link time.
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -flto=auto -fuse-linker-plugin -ffast-math -fmerge-all-constants")
+endif()
+
+if(SITL_LINK_MODE STREQUAL "LOCAL")
+  # A MinGW DLL keeps more sections alive than the exe (export/import
+  # bookkeeping), which makes LTO + --gc-sections drop definitions while
+  # retaining references to target-only helpers (dma, mpu, dshot). Build the
+  # library without LTO; per-function sections still let --gc-sections trim it.
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fno-lto")
 endif()
 
 # =============================================================================
@@ -453,12 +463,27 @@ if(WIN32)
   list(APPEND BF_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/main_windows.c")
   list(APPEND BF_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/serial_tcp_win.c")
   list(APPEND BF_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/ws_proxy_win.c")
+  if(SITL_LINK_MODE STREQUAL "LOCAL")
+    list(APPEND BF_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/sitl_local.c")
+  endif()
 endif()
 
 # =============================================================================
-# Executable
+# Target type: UDP mode produces the standalone server executable; LOCAL mode
+# produces an in-process DLL that Unreal's async physics tick calls directly
+# (zero UDP latency).
 # =============================================================================
-add_executable(betaflight_SITL ${BF_SOURCES})
+if(SITL_LINK_MODE STREQUAL "LOCAL")
+  add_library(betaflight_SITL SHARED ${BF_SOURCES})
+  set_target_properties(betaflight_SITL PROPERTIES PREFIX "")
+  # MinGW auto-exports every global symbol in a DLL by default, which keeps
+  # firmware sections alive that the executable build normally garbage
+  # collects (and that reference target-only helpers). Export only the API
+  # functions marked __declspec(dllexport) in sitl_local.h.
+  target_link_options(betaflight_SITL PRIVATE "-Wl,--exclude-all-symbols")
+else()
+  add_executable(betaflight_SITL ${BF_SOURCES})
+endif()
 
 # Gyro/filter/PID loop frequency in Hz (the official scheduler busy-waits to
 # this exact deadline). Can also be overridden at runtime with the
@@ -507,6 +532,16 @@ target_compile_definitions(betaflight_SITL PRIVATE
 
 if(SITL_TIME_MODE STREQUAL "UDP")
   target_compile_definitions(betaflight_SITL PRIVATE SITL_UDP_TIME)
+endif()
+
+if(SITL_LINK_MODE STREQUAL "LOCAL")
+  # The in-process library uses the same packet-free virtual clock stepping as
+  # UDP mode, but the time is advanced by sitl_local_step() instead of by
+  # incoming FDM datagrams.
+  target_compile_definitions(betaflight_SITL PRIVATE
+    SITL_LOCAL
+    SITL_UDP_TIME
+  )
 endif()
 
 # =============================================================================
@@ -578,3 +613,12 @@ endif()
 install(TARGETS betaflight_SITL
   RUNTIME DESTINATION bin
 )
+
+# =============================================================================
+# LOCAL mode: command-line tester that exercises the DLL at 1000 Hz
+# =============================================================================
+if(SITL_LINK_MODE STREQUAL "LOCAL")
+  add_executable(sitl_local_tester tools/sitl_local_tester.c)
+  target_link_libraries(sitl_local_tester PRIVATE betaflight_SITL)
+  target_include_directories(sitl_local_tester PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+endif()
