@@ -31,7 +31,9 @@
 #include "flight/imu.h"
 #include "sitl_gyro.h"
 #include "fc/runtime_config.h"
+#include "config/feature.h"
 #include "msp/msp.h"
+#include "sensors/battery.h"
 
 #include "sitl_local.h"
 #include "sim_telemetry.h"
@@ -61,6 +63,7 @@ extern uint64_t micros64(void);
 // Firmware entry points used by the synchronous step.
 extern void scheduler(void);
 extern void rxUpdateUdpChannels(const uint16_t *channels, uint8_t channelCount);
+extern void rxInit(void);
 
 // msp_serial.h pulls in io/serial.h, which collides with the MinGW windows.h
 // include chain; declare just what the background MSP keep-alive needs (the
@@ -84,6 +87,7 @@ static volatile LONG gMspThreadStop = 0;
 
 static uint16_t gLastRc[SITL_LOCAL_MAX_RC_CHANNELS];
 static bool gLastRcValid = false;
+static uint64_t gLastRcAnnounceUs = 0;
 
 static double gGpsOriginLat = 0.0;
 static double gGpsOriginLon = 0.0;
@@ -132,6 +136,15 @@ int sitl_local_init(void)
     }
 
     sitlBoot(0, NULL);
+
+    // Make the local link self-sufficient regardless of the EEPROM contents:
+    // force the UDP RX provider (sensor input arrives via sitl_local_step,
+    // not a serial receiver) and pin the battery meters to the ADC shims that
+    // read simTelemetrySet() values.
+    featureEnableImmediate(FEATURE_RX_UDP);
+    rxInit();
+    batteryConfigMutable()->voltageMeterSource = VOLTAGE_METER_ADC;
+    batteryConfigMutable()->currentMeterSource = CURRENT_METER_ADC;
 
     gLocalRunning = true;
     gMspThreadStop = 0;
@@ -236,10 +249,17 @@ void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
     // --- battery / RPM telemetry ---
     simTelemetrySet(in->battery_voltage, in->battery_current, in->motor_rpm, 4);
 
-    // --- RC (announce a new frame only when channels changed) ---
-    if (!gLastRcValid || memcmp(gLastRc, in->rc_channels, sizeof(gLastRc)) != 0) {
+    // --- RC ---
+    // Announce a new frame whenever the channel values change, and at least
+    // every 8 ms (the ~120 Hz floor) even when the sticks are stationary.
+    // Announcing only on change makes the FC lose signal while sticks are
+    // centered (RXLOSS after the 150 ms fail-safe window).
+    const uint64_t nowUs = micros64();
+    const bool rcChanged = !gLastRcValid || memcmp(gLastRc, in->rc_channels, sizeof(gLastRc)) != 0;
+    if (rcChanged || (nowUs - gLastRcAnnounceUs) >= 8000) {
         memcpy(gLastRc, in->rc_channels, sizeof(gLastRc));
         gLastRcValid = true;
+        gLastRcAnnounceUs = nowUs;
         rxUpdateUdpChannels(in->rc_channels, SITL_LOCAL_MAX_RC_CHANNELS);
     }
 
