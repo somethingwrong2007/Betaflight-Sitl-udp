@@ -97,6 +97,15 @@ int sitlMutexTrylock(pthread_mutex_t *mutex)
 int sitlMutexUnlock(pthread_mutex_t *mutex)
 {
     (void)mutex;
+#ifdef SITL_UDP_TIME
+    // updateState() ends with pthread_mutex_unlock(&updateLock), renamed to
+    // this stub by CMakeLists.txt. Commit the FDM packet's virtual time only
+    // now, i.e. after the virtual sensors for that packet have been written
+    // (see sitlUdpFdmCommitPending() in udplink_windows.c). In REALTIME mode
+    // there is no virtual clock, so this stays a no-op.
+    extern void sitlUdpFdmCommitPending(void);
+    sitlUdpFdmCommitPending();
+#endif
     return 0;
 }
 

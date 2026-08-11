@@ -174,6 +174,10 @@ The virtual clock is driven by `fdm_packet` timestamps arriving on UDP 9003:
 - Each packet's timestamp delta is accumulated and consumed in 100 us quanta,
   so gyro/filter/PID fire exactly once per 1000 us of simulator time at
   default settings.
+- The receive thread writes the virtual sensors for a packet before it commits
+  that packet's time delta, so the flight loop never consumes time that has no
+  matching IMU/sensor data (a packet's time becomes available only after its
+  sensors are written).
 - While packets arrive the flight loop runs at the configured rate and CPU
   use stays low (a few percent of one core).
 - When no packets arrive the virtual clock freezes: the flight loop idles at

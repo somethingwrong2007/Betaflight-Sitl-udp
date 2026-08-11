@@ -93,10 +93,19 @@ float simTelemetryMotorFrequencyHz(uint8_t motorIndex)
 // Unreal FDM clock hook. The official SITL receive thread calls
 // udpRecv(&stateLink, &fdmPkt, sizeof(fdm_packet), 100) on port 9003; the
 // fdm_packet struct starts with `double timestamp` (seconds). Each valid
-// datagram here adds the timestamp delta to a pending queue and signals the
-// main loop, which steps the virtual clock by that amount (see main_windows.c
-// and wincompat.c). This keeps all Unreal integration outside the Betaflight
-// submodule.
+// datagram is committed in two phases so the flight loop can never consume
+// time before the matching virtual sensors exist:
+//   1. udpRecv() computes the timestamp delta and stashes it in gFdmCommitUs
+//      (no pending-queue update, no event).
+//   2. updateState() writes the virtual acc/gyro/baro/mag/GPS, then ends with
+//      pthread_mutex_unlock(&updateLock), which CMake renames to
+//      sitlMutexUnlock() (wincompat.c). That stub calls
+//      sitlUdpFdmCommitPending(), which publishes gFdmCommitUs to
+//      gFdmPendingUs and signals the main loop.
+// The main loop then steps the virtual clock by that amount (main_windows.c),
+// so gyro/filter/PID always run against sensor data from the packet that
+// delivered the time. This keeps all Unreal integration outside the
+// Betaflight submodule.
 // Cap the virtual time consumed per FDM packet at 5 s. Anything beyond that
 // is a link restart, not a stutter: the run loop drains the delta in 100 us
 // steps, so short UE hitches (frame drops, async-physics stalls) no longer
@@ -105,6 +114,7 @@ float simTelemetryMotorFrequencyHz(uint8_t motorIndex)
 
 static HANDLE gFdmEvent = NULL;
 static volatile LONG64 gFdmPendingUs = 0;
+static volatile LONG64 gFdmCommitUs = 0; // packet delta awaiting sensor write
 static volatile LONG gFdmPacketCount = 0;
 static double gFdmLastTs = -1.0;
 static double gFdmRemainderUs = 0.0;
@@ -127,6 +137,20 @@ uint64_t sitlUdpFdmTakePendingUs(void)
     return (uint64_t)InterlockedExchange64(&gFdmPendingUs, 0);
 }
 
+// Called from sitlMutexUnlock() (the CMake-renamed pthread_mutex_unlock at
+// the end of updateState): publish the deferred FDM delta only after the
+// virtual sensors for this packet have been written.
+void sitlUdpFdmCommitPending(void)
+{
+    const LONG64 us = InterlockedExchange64(&gFdmCommitUs, 0);
+    if (us > 0) {
+        InterlockedExchangeAdd64(&gFdmPendingUs, us);
+        if (gFdmEvent != NULL) {
+            SetEvent(gFdmEvent);
+        }
+    }
+}
+
 // True once at least two FDM datagrams have arrived (avoids switching on a
 // single stray packet).
 bool sitlUdpFdmHasData(void)
@@ -138,6 +162,7 @@ void sitlUdpFdmReset(void)
 {
     InterlockedExchange(&gFdmPacketCount, 0);
     InterlockedExchange64(&gFdmPendingUs, 0);
+    InterlockedExchange64(&gFdmCommitUs, 0);
     gFdmLastTs = -1.0;
     gFdmRemainderUs = 0.0;
     if (gFdmEvent != NULL) {
@@ -253,16 +278,18 @@ int udpRecv(udpLink_t *link, void *data, size_t size, uint32_t timeout_ms)
             if (deltaUs > 0.0 && deltaUs <= SITL_MAX_FDM_DELTA_US) {
                 const LONG64 wholeUs = (LONG64)deltaUs;
                 gFdmRemainderUs = deltaUs - (double)wholeUs;
-                InterlockedExchangeAdd64(&gFdmPendingUs, wholeUs);
-                if (gFdmEvent != NULL) {
-                    SetEvent(gFdmEvent);
-                }
+                // Defer: sitlUdpFdmCommitPending() publishes this delta after
+                // updateState() has written the sensors for this packet.
+                InterlockedExchange64(&gFdmCommitUs, wholeUs);
             } else {
                 gFdmRemainderUs = 0.0;
+                // Out-of-range delta: do not leave a stale packet pending.
+                InterlockedExchange64(&gFdmCommitUs, 0);
             }
         } else if (ts < gFdmLastTs) {
             // Simulator clock restarted; resync the delta baseline only.
             gFdmRemainderUs = 0.0;
+            InterlockedExchange64(&gFdmCommitUs, 0);
         }
         gFdmLastTs = ts;
         InterlockedIncrement(&gFdmPacketCount);
