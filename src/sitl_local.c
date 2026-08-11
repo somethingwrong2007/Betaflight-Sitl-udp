@@ -263,9 +263,24 @@ void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
         rxUpdateUdpChannels(in->rc_channels, SITL_LOCAL_MAX_RC_CHANNELS);
     }
 
-    // --- run one scheduler pass on the virtual clock ---
-    sitlStepTime(dtUs);
-    scheduler();
+    // --- run the scheduler on the same 100 us quantum grid as UDP mode ---
+    // A single scheduler() call exactly on the gyro deadline only runs the
+    // realtime tasks (gyro/filter/PID). Non-realtime tasks (RX, failsafe, OSD,
+    // blackbox) are only selected when time is left before the next deadline
+    // (schedLoopRemainingCycles > CHECK_GUARD_MARGIN_US), so stepping in
+    // 100 us quanta gives the pre-deadline passes a chance to run them -
+    // otherwise TASK_RX never processes RC frames and RXLOSS stays active.
+    uint32_t remainingUs = dtUs;
+    const uint32_t quantumUs = 100;
+    while (remainingUs >= quantumUs) {
+        sitlStepTime(quantumUs);
+        remainingUs -= quantumUs;
+        scheduler();
+    }
+    if (remainingUs > 0) {
+        sitlStepTime(remainingUs);
+        scheduler();
+    }
 
     // --- motor outputs captured by udpSend() in LOCAL mode ---
     if (out) {

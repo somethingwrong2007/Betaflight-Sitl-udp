@@ -224,8 +224,10 @@ while (physicsTick) {
 ```
 
 `sitl_local_step()` feeds the virtual sensors, advances the virtual clock by
-`dtUs`, runs one scheduler pass (gyro/filter/PID) and returns the motor
-outputs for that exact state in the same call. RC channels are taken from
+`dtUs` on the same 100 us quantum grid as UDP mode (so the non-realtime
+tasks, including RX and failsafe, get scheduler time before each gyro
+deadline), runs the scheduler and returns the motor outputs for that exact
+state in the same call. RC channels are taken from
 `in.rc_channels` (AETR + aux, 1000..2000); a new frame is announced whenever
 the values change and at least every 8 ms even while the sticks are
 stationary, so the FC never times out into RXLOSS. `sitl_local_init()` also
