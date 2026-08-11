@@ -349,6 +349,26 @@ terms (P/I/D/F per axis), RC commands, setpoints, battery, motors, and the
 IMU quaternion. Rebooting the SITL calls `blackboxFinish()` first, so a
 Save-and-Reboot never truncates an open log.
 
+## CHIRP auto-tuning support
+
+The build enables Betaflight's `USE_CHIRP` excitation feature, which injects
+a swept-sine test signal into the PID loop for offline system
+identification / auto-tuning from blackbox logs:
+
+1. `set debug_mode = CHIRP` + `save` (persisted).
+2. In the configurator's Modes tab, assign a switch/aux channel to the
+   **CHIRP** mode.
+3. Arm, then flip the CHIRP switch. The FC sweeps each axis in turn
+   (roll -> pitch -> yaw) using the chirp profile settings:
+   `chirp_frequency_start_deci_hz` (default 2 -> 0.2 Hz),
+   `chirp_frequency_end_deci_hz` (6000 -> 600 Hz), `chirp_time_seconds`
+   (20 s), per-axis amplitudes and the lead/lag phase-compensation
+   frequencies.
+4. Disarm; open the blackbox log. The header records all `chirp_*`
+   parameters and the log contains `debug[0..3]` CHIRP channels (phase,
+   active axis, instantaneous frequency, raw excitation) for the analysis
+   tool.
+
 ## Environment variables
 
 | Variable | Purpose |
