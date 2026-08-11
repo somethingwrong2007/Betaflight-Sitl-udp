@@ -85,10 +85,6 @@ static bool gLocalRunning = false;
 static HANDLE gMspThread = NULL;
 static volatile LONG gMspThreadStop = 0;
 
-static uint16_t gLastRc[SITL_LOCAL_MAX_RC_CHANNELS];
-static bool gLastRcValid = false;
-static uint64_t gLastRcAnnounceUs = 0;
-
 static double gGpsOriginLat = 0.0;
 static double gGpsOriginLon = 0.0;
 static bool gGpsOriginSet = false;
@@ -250,18 +246,12 @@ void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
     simTelemetrySet(in->battery_voltage, in->battery_current, in->motor_rpm, 4);
 
     // --- RC ---
-    // Announce a new frame whenever the channel values change, and at least
-    // every 8 ms (the ~120 Hz floor) even when the sticks are stationary.
-    // Announcing only on change makes the FC lose signal while sticks are
-    // centered (RXLOSS after the 150 ms fail-safe window).
-    const uint64_t nowUs = micros64();
-    const bool rcChanged = !gLastRcValid || memcmp(gLastRc, in->rc_channels, sizeof(gLastRc)) != 0;
-    if (rcChanged || (nowUs - gLastRcAnnounceUs) >= 8000) {
-        memcpy(gLastRc, in->rc_channels, sizeof(gLastRc));
-        gLastRcValid = true;
-        gLastRcAnnounceUs = nowUs;
-        rxUpdateUdpChannels(in->rc_channels, SITL_LOCAL_MAX_RC_CHANNELS);
-    }
+    // Report a new frame on every step, exactly like the UDP transport
+    // (1 kHz frames, mostly duplicates). The host controller may only change
+    // at ~125 Hz, but duplicate frames let Betaflight's RC smoothing and
+    // feedforward interpolation run on the same 1 kHz grid as the UDP mode,
+    // so smoothing/feedforward behavior and the measured RX rate match it.
+    rxUpdateUdpChannels(in->rc_channels, SITL_LOCAL_MAX_RC_CHANNELS);
 
     // --- run the scheduler on the same 100 us quantum grid as UDP mode ---
     // A single scheduler() call exactly on the gyro deadline only runs the

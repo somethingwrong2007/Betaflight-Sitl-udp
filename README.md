@@ -228,11 +228,12 @@ while (physicsTick) {
 tasks, including RX and failsafe, get scheduler time before each gyro
 deadline), runs the scheduler and returns the motor outputs for that exact
 state in the same call. RC channels are taken from
-`in.rc_channels` (AETR + aux, 1000..2000); a new frame is announced whenever
-the values change and at least every 8 ms even while the sticks are
-stationary, so the FC never times out into RXLOSS. `sitl_local_init()` also
-forces the UDP RX provider and the ADC battery/current meters so RC and
-voltage work regardless of the EEPROM configuration.
+`in.rc_channels` (AETR + aux, 1000..2000); a new frame is announced on every
+step (1 kHz, mostly duplicates when the sticks are stationary), matching the
+UDP transport so RC smoothing, feedforward and the measured RX rate behave
+identically. `sitl_local_init()` also forces the UDP RX provider and the ADC
+battery/current meters so RC and voltage work regardless of the EEPROM
+configuration.
 
 The web configurator still works: boot keeps the TCP/WebSocket proxy on
 127.0.0.1:5761/6761 and a background thread services MSP. Caveats:
