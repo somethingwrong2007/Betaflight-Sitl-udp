@@ -105,7 +105,7 @@ DLLs are statically linked; GitHub Actions collects everything into the
 |--------|--------|---------|-------------|
 | `SITL_TIME_MODE` | `REALTIME` / `UDP` | `REALTIME` | Scheduler time base |
 | `SITL_GYRO_HZ` | 100-10000 | `1000` | Gyro/filter/PID frequency |
-| `SITL_ATTITUDE_DIRECT` | (defined) | on | Bypass the onboard IMU estimator and take attitude directly from the FDM quaternion (legacy SITL behavior) |
+| `SITL_ATTITUDE_DIRECT` | defined / not defined | not defined | When defined, bypasses the onboard IMU estimator and injects the FDM quaternion directly (legacy behavior). The default build keeps `USE_IMU_CALC` on: attitude is estimated by the firmware's Mahony filter from the virtual accelerometer/gyroscope/magnetometer feeds. |
 | `DEFAULT_BLACKBOX_DEVICE` | (defined) | `BLACKBOX_DEVICE_VIRTUAL` | Fresh EEPROMs log blackbox to files by default |
 | `SITL_BRUSHLESS_PWM_RATE` | Hz | `20000` | Virtual brushless PWM rate used by config validation; raised so "sync PWM with PID" mode does not force `pid_process_denom` up |
 

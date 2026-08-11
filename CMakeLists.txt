@@ -487,7 +487,6 @@ target_compile_definitions(betaflight_SITL PRIVATE
   SITL
   SIMULATOR
   SIMULATOR_BUILD
-  SITL_ATTITUDE_DIRECT
   SITL_GYRO_HZ=${SITL_GYRO_HZ}
   BRUSHLESS_MOTORS_PWM_RATE=${SITL_BRUSHLESS_PWM_RATE}
   DEFAULT_BLACKBOX_DEVICE=BLACKBOX_DEVICE_VIRTUAL
@@ -499,6 +498,11 @@ target_compile_definitions(betaflight_SITL PRIVATE
   HSE_VALUE=8000000
   FLASH_SIZE=2048
 )
+
+# Do not define SITL_ATTITUDE_DIRECT: the SITL target runs the real IMU
+# estimator (USE_IMU_CALC, Mahony on the virtual acc/gyro/mag feeds) and
+# defining it makes target.h undefine USE_IMU_CALC, reverting to direct
+# quaternion injection from the FDM packet.
 
 if(SITL_TIME_MODE STREQUAL "UDP")
   target_compile_definitions(betaflight_SITL PRIVATE SITL_UDP_TIME)
