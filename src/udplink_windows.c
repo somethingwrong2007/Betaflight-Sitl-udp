@@ -31,6 +31,12 @@ static bool wsaInitialized = false;
 #define SITL_FDM_EXT_BATTERY_CURRENT 152
 #define SITL_FDM_EXT_MOTOR_RPM 160
 #define SITL_FDM_EXT_MOTOR_RPM_COUNT 4
+// Official FDM packet geometry. Compiled in every Windows mode: udpRecv() on
+// port 9003 reads into the extended buffer (and parses the telemetry tail)
+// regardless of the time base, while the virtual-clock bookkeeping stays
+// under SITL_UDP_TIME below.
+#define SITL_FDM_PORT       9003
+#define SITL_FDM_PACKET_SIZE 144 // sizeof(fdm_packet): 18 doubles
 
 static double sitlBatteryVoltage = 16.8; // V, 4S default so the FC always sees a battery
 static double sitlBatteryCurrent = 0.0;  // A
@@ -91,8 +97,6 @@ float simTelemetryMotorFrequencyHz(uint8_t motorIndex)
 // main loop, which steps the virtual clock by that amount (see main_windows.c
 // and wincompat.c). This keeps all Unreal integration outside the Betaflight
 // submodule.
-#define SITL_FDM_PORT       9003
-#define SITL_FDM_PACKET_SIZE 144 // sizeof(fdm_packet): 18 doubles
 // Cap the virtual time consumed per FDM packet at 5 s. Anything beyond that
 // is a link restart, not a stutter: the run loop drains the delta in 100 us
 // steps, so short UE hitches (frame drops, async-physics stalls) no longer
@@ -213,11 +217,13 @@ int udpRecv(udpLink_t *link, void *data, size_t size, uint32_t timeout_ms)
         return -1;
     }
 
-#ifdef SITL_UDP_TIME
     if (size == SITL_FDM_PACKET_SIZE && link->port == SITL_FDM_PORT) {
         // Read into a buffer large enough for the optional telemetry tail so
         // recvfrom() does not truncate it, then hand the firmware exactly the
-        // official fdm_packet bytes.
+        // official fdm_packet bytes. This path runs in every Windows time
+        // mode: the extended battery/RPM tail is parsed here even in
+        // REALTIME mode (where the FC clock is wall time and the FDM
+        // timestamp only drives the simulator state).
         uint8_t rxBuf[SITL_FDM_EXTENDED_SIZE];
         int rxLen = (int)sizeof(link->si);
         const int ret = recvfrom((SOCKET)link->fd, (char *)rxBuf, (int)sizeof(rxBuf), 0,
@@ -239,6 +245,7 @@ int udpRecv(udpLink_t *link, void *data, size_t size, uint32_t timeout_ms)
             simTelemetrySet(voltage, current, rpm, SITL_FDM_EXT_MOTOR_RPM_COUNT);
         }
 
+#ifdef SITL_UDP_TIME
         const double ts = *(const double *)data;
 
         if (gFdmLastTs >= 0.0 && ts > gFdmLastTs) {
@@ -259,9 +266,9 @@ int udpRecv(udpLink_t *link, void *data, size_t size, uint32_t timeout_ms)
         }
         gFdmLastTs = ts;
         InterlockedIncrement(&gFdmPacketCount);
+#endif
         return SITL_FDM_PACKET_SIZE;
     }
-#endif
 
     int len = (int)sizeof(link->si);
     const int ret = recvfrom((SOCKET)link->fd, data, (int)size, 0,
