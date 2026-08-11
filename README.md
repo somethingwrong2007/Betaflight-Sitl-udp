@@ -210,6 +210,35 @@ The timestamp must increase monotonically (a `double` in seconds, not a
 float). The Unreal bridge in FPVSkyline accepts `0` and fills in its own
 monotonic clock automatically.
 
+### Extended FDM packet (Windows UDP mode, optional)
+
+The first 144 bytes stay the official `fdm_packet`. A sender may append
+simulator telemetry that the SITL feeds into the virtual battery/RPM sensors:
+
+| Offset | Type | Field |
+|--------|------|-------|
+| 144 | double | battery voltage (V) |
+| 152 | double | battery current (A) |
+| 160 | double[4] | motor RPM (per motor) |
+
+Total extended size: 192 bytes. Senders that only send the official 144-byte
+packet still work: voltage defaults to 16.8 V (4S), current to 0 A and RPM to
+0, so the FC always sees a battery.
+
+With the extended fields, the configurator and blackbox show real voltage,
+current and mAh draw. Fresh EEPROMs default `battery_meter` and
+`current_meter` to `ADC` (the UDP-fed path); existing EEPROMs need this once:
+
+```
+set battery_meter = ADC
+set current_meter = ADC
+save
+```
+
+The per-motor RPM is parsed and kept available, but Betaflight's RPM filter
+and blackbox RPM fields require DSHOT telemetry, which the official SITL
+target excludes on x86, so the firmware does not consume RPM yet.
+
 ### rc_packet (9004)
 
 ```c

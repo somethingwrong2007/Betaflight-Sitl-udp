@@ -17,6 +17,11 @@
 #include <windows.h>
 #include <pthread.h>
 
+#include "common/time.h"
+#include "sensors/voltage.h"
+#include "sensors/current.h"
+#include "sim_telemetry.h"
+
 extern uint64_t micros64_real(void);
 extern void sitlDelayMicroseconds(uint32_t us);
 extern void writeEEPROM(void);
@@ -165,6 +170,38 @@ void systemReset(void)
 #endif
     sitlRelaunchSelf();
     sitlSystemResetNative();
+}
+
+// Battery voltage/current and motor RPM fed from the extended FDM packet
+// (see sim_telemetry.h). battery.c's ADC meter calls are renamed to these by
+// CMakeLists.txt so the virtual FC reports what the simulator sends.
+void sitlBatteryVoltageRefresh(void)
+{
+    // No-op: the value comes from the UDP telemetry feed.
+}
+
+void sitlBatteryVoltageRead(voltageSensorADC_e adcChannel, voltageMeter_t *voltageMeter)
+{
+    UNUSED(adcChannel);
+    const uint16_t v = simTelemetryVoltageCentiVolts();
+    voltageMeter->displayFiltered = v;
+    voltageMeter->unfiltered = v;
+#if defined(USE_BATTERY_VOLTAGE_SAG_COMPENSATION)
+    voltageMeter->sagFiltered = v;
+#endif
+}
+
+void sitlBatteryCurrentRefresh(int32_t lastUpdateAt)
+{
+    simTelemetryCurrentRefresh(lastUpdateAt);
+}
+
+void sitlBatteryCurrentRead(currentMeter_t *meter)
+{
+    const int32_t centiAmps = (int32_t)(simTelemetryCurrentAmps() * 100.0f);
+    meter->amperage = centiAmps;
+    meter->amperageLatest = centiAmps;
+    meter->mAhDrawn = (int32_t)simTelemetryMahDrawn();
 }
 
 // Official real-time time base. sitl.c's time functions are renamed to

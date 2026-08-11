@@ -440,6 +440,11 @@ if(WIN32)
   # saves even if the MSP_EEPROM_WRITE step was skipped or lost.
   set_source_files_properties("${BF_ROOT}/src/main/msp/msp.c" PROPERTIES COMPILE_OPTIONS
     "-DsystemReset=sitlSystemReset")
+  # UDP-fed battery telemetry: battery.c's ADC meter reads are renamed to
+  # wincompat shims that return voltage/current from the extended FDM packet
+  # (sim_telemetry.h), and fresh EEPROMs default the meters to that path.
+  set_source_files_properties("${BF_ROOT}/src/main/sensors/battery.c" PROPERTIES COMPILE_OPTIONS
+    "-DvoltageMeterADCRefresh=sitlBatteryVoltageRefresh;-DvoltageMeterADCRead=sitlBatteryVoltageRead;-DcurrentMeterADCRefresh=sitlBatteryCurrentRefresh;-DcurrentMeterADCRead=sitlBatteryCurrentRead;-DDEFAULT_VOLTAGE_METER_SOURCE=VOLTAGE_METER_ADC;-DDEFAULT_CURRENT_METER_SOURCE=CURRENT_METER_ADC")
   # The dyad-based TCP bridge is replaced by serial_tcp_win.c; dyad_update()
   # busy-spins when no streams exist, so wincompat.c provides a sleeping stub.
   set_source_files_properties("${BF_ROOT}/lib/main/dyad/dyad.c" PROPERTIES COMPILE_OPTIONS "-Ddyad_update=dyad_update_real")
