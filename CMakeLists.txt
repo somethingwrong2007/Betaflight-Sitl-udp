@@ -460,6 +460,14 @@ add_executable(betaflight_SITL ${BF_SOURCES})
 # BF_SITL_GYRO_HZ environment variable.
 set(SITL_GYRO_HZ 1000 CACHE STRING "SITL gyro/filter/PID loop frequency in Hz")
 
+# Virtual brushless motor PWM rate used by Betaflight's config validation.
+# Real ESCs cap standard PWM near 480 Hz, which makes the firmware raise
+# pid_process_denom (PID drops to ~333 Hz at a 1 kHz gyro) whenever the
+# "PWM speed independent of PID" option is disabled. The SITL has no real
+# PWM hardware, so raise the cap: synced mode keeps a 1 kHz PID loop and the
+# motor UDP packets still go out once per PID iteration.
+set(SITL_BRUSHLESS_PWM_RATE 20000 CACHE STRING "Virtual brushless motor PWM rate used by config validation")
+
 # Time base selection: REALTIME is the official Betaflight scheduler
 # (busy-waits to the exact gyro deadline, one CPU core). UDP drives the
 # virtual clock from Unreal FDM packets on UDP 9003: the flight loop runs
@@ -476,6 +484,7 @@ target_compile_definitions(betaflight_SITL PRIVATE
   SIMULATOR_BUILD
   SITL_ATTITUDE_DIRECT
   SITL_GYRO_HZ=${SITL_GYRO_HZ}
+  BRUSHLESS_MOTORS_PWM_RATE=${SITL_BRUSHLESS_PWM_RATE}
   DEFAULT_BLACKBOX_DEVICE=BLACKBOX_DEVICE_VIRTUAL
   __TARGET__=\"SITL\"
   __REVISION__=\"1\"

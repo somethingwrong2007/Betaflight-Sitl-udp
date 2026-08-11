@@ -107,6 +107,7 @@ DLLs are statically linked; GitHub Actions collects everything into the
 | `SITL_GYRO_HZ` | 100-10000 | `1000` | Gyro/filter/PID frequency |
 | `SITL_ATTITUDE_DIRECT` | (defined) | on | Bypass the onboard IMU estimator and take attitude directly from the FDM quaternion (legacy SITL behavior) |
 | `DEFAULT_BLACKBOX_DEVICE` | (defined) | `BLACKBOX_DEVICE_VIRTUAL` | Fresh EEPROMs log blackbox to files by default |
+| `SITL_BRUSHLESS_PWM_RATE` | Hz | `20000` | Virtual brushless PWM rate used by config validation; raised so "sync PWM with PID" mode does not force `pid_process_denom` up |
 
 `SITL_GYRO_HZ` can also be overridden at runtime with `BF_SITL_GYRO_HZ`.
 
@@ -285,11 +286,13 @@ reboots without saving.
 ### Tuning note: configurator shows 999/333
 
 The Setup page computes `pidHz = 1e6 / cycleTime` and `gyroHz = pidHz *
-pid_process_denom`. If the config has `use_unsynced_pwm = OFF` with PWM
-protocol at 480 Hz, Betaflight forces `pid_process_denom = 3`, so the PID
-loop runs at ~333 Hz and the display reads `999/333` (the gyro itself is
-still 1000 Hz). To keep a 1 kHz PID loop, set `use_unsynced_pwm = ON` and
-`pid_process_denom = 1` (or use a faster motor protocol).
+pid_process_denom`. On real hardware, `use_unsynced_pwm = OFF` with a 480 Hz
+PWM protocol forces `pid_process_denom = 3`, so the PID loop runs at ~333 Hz
+and the display reads `999/333` (the gyro itself is still 1000 Hz). This
+build raises the virtual brushless PWM rate to 20000 Hz, so that limit never
+applies: both `use_unsynced_pwm` settings keep a 1 kHz PID loop. If a saved
+config still contains `pid_process_denom = 3`, set it back to 1 once (`set
+pid_process_denom = 1` + `save`).
 
 ## Blackbox
 
