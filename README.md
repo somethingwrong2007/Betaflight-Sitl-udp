@@ -207,7 +207,8 @@ cmake --build build-win-local --config Release -j$(nproc)
 
 This produces `betaflight_SITL.dll` (exports `sitl_local_init`,
 `sitl_local_step`, `sitl_local_time_us`, `sitl_local_shutdown`) plus a
-`sitl_local_tester.exe` harness. The DLL needs `libwinpthread-1.dll`,
+`sitl_local_tester.exe` harness and a `sitl_local_host.exe` debug host that
+keeps the FC stepping at 1000 Hz for configurator/MSP testing. The DLL needs `libwinpthread-1.dll`,
 `libgcc_s_seh-1.dll` and `libstdc++-6.dll` next to it (GCC 13 on CI names
 the same files under the 13-posix runtime).
 
@@ -234,6 +235,13 @@ UDP transport so RC smoothing, feedforward and the measured RX rate behave
 identically. `sitl_local_init()` also forces the UDP RX provider and the ADC
 battery/current meters so RC and voltage work regardless of the EEPROM
 configuration.
+
+The virtual EEPROM is stored at a fixed, writable location in LOCAL mode:
+`%LOCALAPPDATA%\Betaflight-SITL\eeprom.bin` (override with `BF_SITL_EEPROM`).
+This keeps configuration persistent no matter where the host process (UE) is
+launched from. Plain "Save" works and persists; "Save and Reboot" also
+persists but does not restart the in-process FC, so use plain Save or restart
+the host session for a full reboot.
 
 The web configurator still works: boot keeps the TCP/WebSocket proxy on
 127.0.0.1:5761/6761 and a background thread services MSP. Caveats:

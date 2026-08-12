@@ -15,6 +15,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <string.h>
 #include <math.h>
 #include <stdlib.h>
@@ -129,6 +130,23 @@ int sitl_local_init(void)
 {
     if (gLocalRunning) {
         return 0;
+    }
+
+    // Use a stable, writable EEPROM location regardless of the host process's
+    // working directory (UE can be launched from anywhere). Respect an
+    // explicit BF_SITL_EEPROM override if the host already set one.
+    const char *eepromOverride = getenv("BF_SITL_EEPROM");
+    if (eepromOverride == NULL || eepromOverride[0] == '\0') {
+        char appDataPath[MAX_PATH];
+        if (GetEnvironmentVariableA("LOCALAPPDATA", appDataPath, sizeof(appDataPath)) > 0) {
+            char eepromPath[MAX_PATH];
+            _snprintf(eepromPath, sizeof(eepromPath), "%s\\Betaflight-SITL\\eeprom.bin", appDataPath);
+            // _putenv_s updates the CRT environment table; SetEnvironmentVariableA
+            // only touches the OS block, which getenv() in this process would not
+            // see (sitlFopen redirects the EEPROM via getenv).
+            _putenv_s("BF_SITL_EEPROM", eepromPath);
+            fprintf(stderr, "[SITL] LOCAL mode EEPROM: %s\n", eepromPath);
+        }
     }
 
     sitlBoot(0, NULL);

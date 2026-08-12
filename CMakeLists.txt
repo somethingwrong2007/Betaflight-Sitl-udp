@@ -621,4 +621,8 @@ if(SITL_LINK_MODE STREQUAL "LOCAL")
   add_executable(sitl_local_tester tools/sitl_local_tester.c)
   target_link_libraries(sitl_local_tester PRIVATE betaflight_SITL)
   target_include_directories(sitl_local_tester PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+  add_executable(sitl_local_host tools/sitl_local_host.c)
+  target_link_libraries(sitl_local_host PRIVATE betaflight_SITL)
+  target_include_directories(sitl_local_host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 endif()
