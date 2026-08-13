@@ -28,6 +28,7 @@
 #include "drivers/barometer/barometer_virtual.h"
 #include "drivers/compass/compass_virtual.h"
 #include "drivers/dma.h"
+#include "drivers/dshot.h"
 #include "io/gps_virtual.h"
 #include "flight/imu.h"
 #include "sitl_gyro.h"
@@ -66,6 +67,7 @@ extern uint64_t micros64(void);
 extern void scheduler(void);
 extern void rxInit(void);
 extern void sitlAuditLog(const char *fmt, ...);
+extern bool useDshotTelemetry;
 
 // msp_serial.h pulls in io/serial.h, which collides with the MinGW windows.h
 // include chain; declare just what the background MSP keep-alive needs (the
@@ -133,6 +135,36 @@ dmaChannelDescriptor_t dmaDescriptors[1] = {{0}};
 
 bool useDshotTelemetry;
 
+// DSHOT hardware entry points are target-only and not compiled for SITL;
+// provide inert versions so the USE_DSHOT code paths link. The virtual PWM
+// motor device is used at runtime, so these are never called.
+bool isDshotBitbangActive(const motorDevConfig_t *motorDevConfig)
+{
+    (void)motorDevConfig;
+    return false;
+}
+
+bool dshotBitbangDevInit(motorDevice_t *device, const motorDevConfig_t *motorConfig)
+{
+    (void)device;
+    (void)motorConfig;
+    return false;
+}
+
+bool dshotPwmDevInit(motorDevice_t *device, const motorDevConfig_t *motorConfig)
+{
+    (void)device;
+    (void)motorConfig;
+    return false;
+}
+
+dshotBitbangStatus_e dshotBitbangGetStatus(void)
+{
+    return DSHOT_BITBANG_STATUS_OK;
+}
+
+dshotTelemetryCycleCounters_t dshotDMAHandlerCycleCounters;
+
 #ifndef USE_GPS_LAP_TIMER
 gpsLapTimerConfig_t gpsLapTimerConfig_System;
 #endif
@@ -173,6 +205,11 @@ int sitl_local_init(void)
     }
 
     sitlBoot(0, NULL);
+
+    // Simulated motor RPM participates in the firmware (RPM filter, motor
+    // telemetry, OSD/MSP): mark DSHOT telemetry as active so the RPM filter
+    // and telemetry consumers use the bridged values from the wrappers.
+    useDshotTelemetry = true;
 
     // Make the local link self-sufficient regardless of the EEPROM contents:
     // force the UDP RX provider (sensor input arrives via sitl_local_step,

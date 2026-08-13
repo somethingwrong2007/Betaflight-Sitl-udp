@@ -545,6 +545,21 @@ if(SITL_LINK_MODE STREQUAL "LOCAL")
   target_compile_definitions(betaflight_SITL PRIVATE
     SITL_LOCAL
     SITL_UDP_TIME
+    USE_DSHOT
+    USE_RPM_FILTER
+  )
+
+  # Feed simulated motor RPM into the firmware's DSHOT-telemetry consumers
+  # (RPM filter, dynamic idle, OSD/MSP motor telemetry, blackbox eRPM).
+  # dshot.c's definitions are renamed so wincompat.c can provide wrappers
+  # that return simTelemetryMotorFrequencyHz() values when present.
+  set_source_files_properties("${BF_ROOT}/src/main/drivers/dshot.c" PROPERTIES COMPILE_OPTIONS
+    "-DgetDshotRpm=sitlDshotRpmReal;-DgetDshotRpmAverage=sitlDshotRpmAverageReal;-DgetDshotErpm=sitlDshotErpmReal;-DgetMotorFrequencyHz=sitlMotorFrequencyHzReal;-DgetMinMotorFrequencyHz=sitlMinMotorFrequencyHzReal")
+
+  # Prepend wincompat so the x86 build/atomic.h shadow wins over the
+  # ARM-only submodule header (required once USE_DSHOT is enabled).
+  target_include_directories(betaflight_SITL PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/wincompat
   )
 endif()
 

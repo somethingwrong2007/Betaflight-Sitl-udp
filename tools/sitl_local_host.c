@@ -26,6 +26,10 @@ int main(void)
     in.orientation_quat[0] = 1.0;
     in.position_xyz[2] = 1.0;
     in.battery_voltage = 16.8;
+    in.motor_rpm[0] = 12000.0;
+    in.motor_rpm[1] = 11000.0;
+    in.motor_rpm[2] = 10000.0;
+    in.motor_rpm[3] = 9000.0;
     for (int i = 0; i < SITL_LOCAL_MAX_RC_CHANNELS; i++) {
         in.rc_channels[i] = 1500;
     }

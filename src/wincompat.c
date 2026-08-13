@@ -66,6 +66,79 @@ void sitlMspWriteEEPROM(void)
     writeEEPROM();
 }
 
+#ifdef SITL_LOCAL
+// Simulated motor RPM bridge. dshot.c's getDshotRpm/getDshotRpmAverage/
+// getDshotErpm/getMotorFrequencyHz/getMinMotorFrequencyHz are renamed to the
+// sitl*Real symbols below; these wrappers return the simulator-provided RPM
+// (sitl_local_input_t.motor_rpm / the UDP extended tail) whenever it is
+// nonzero, and fall back to the real (always-zero in SITL) telemetry state.
+#include "pg/motor.h"
+
+#define SITL_ERPM_PER_LSB 100.0f
+#define SITL_SIM_MOTOR_COUNT 4
+
+extern float sitlDshotRpmReal(uint8_t motorIndex);
+extern float sitlDshotRpmAverageReal(void);
+extern uint16_t sitlDshotErpmReal(uint8_t motorIndex);
+extern float sitlMotorFrequencyHzReal(uint8_t motorIndex);
+extern float sitlMinMotorFrequencyHzReal(void);
+
+static float sitlSimMotorHz(uint8_t motorIndex)
+{
+    return simTelemetryMotorFrequencyHz(motorIndex);
+}
+
+float getDshotRpm(uint8_t motorIndex)
+{
+    const float hz = sitlSimMotorHz(motorIndex);
+    return hz > 0.0f ? hz * 60.0f : sitlDshotRpmReal(motorIndex);
+}
+
+float getDshotRpmAverage(void)
+{
+    float sumHz = 0.0f;
+    int count = 0;
+    for (int i = 0; i < SITL_SIM_MOTOR_COUNT; i++) {
+        const float hz = sitlSimMotorHz((uint8_t)i);
+        if (hz > 0.0f) {
+            sumHz += hz;
+            count++;
+        }
+    }
+    return count > 0 ? (sumHz / (float)count) * 60.0f : sitlDshotRpmAverageReal();
+}
+
+uint16_t getDshotErpm(uint8_t motorIndex)
+{
+    const float hz = sitlSimMotorHz(motorIndex);
+    if (hz > 0.0f) {
+        // eRPM = mechanical RPM * pole pairs; raw dshot LSB = eRPM / 100
+        const float polePairs = (float)motorConfig()->motorPoleCount / 2.0f;
+        return (uint16_t)(hz * 60.0f * polePairs / SITL_ERPM_PER_LSB);
+    }
+    return sitlDshotErpmReal(motorIndex);
+}
+
+float getMotorFrequencyHz(uint8_t motorIndex)
+{
+    const float hz = sitlSimMotorHz(motorIndex);
+    return hz > 0.0f ? hz : sitlMotorFrequencyHzReal(motorIndex);
+}
+
+float getMinMotorFrequencyHz(void)
+{
+    float minHz = 0.0f;
+    int count = 0;
+    for (int i = 0; i < SITL_SIM_MOTOR_COUNT; i++) {
+        const float hz = sitlSimMotorHz((uint8_t)i);
+        if (hz > 0.0f) {
+            minHz = (count++ == 0) ? hz : (hz < minHz ? hz : minHz);
+        }
+    }
+    return count > 0 ? minHz : sitlMinMotorFrequencyHzReal();
+}
+#endif // SITL_LOCAL
+
 // sitl.c's fopen() calls are renamed to sitlFopen() by CMakeLists.txt so the
 // virtual EEPROM file can be redirected without touching the Betaflight
 // submodule. Set BF_SITL_EEPROM to a file path to keep separate configs

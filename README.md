@@ -238,6 +238,13 @@ feedforward sees mathematically consistent deltas. `sitl_local_init()` also
 forces the UDP RX provider and the ADC battery/current meters so RC and
 voltage work regardless of the EEPROM configuration.
 
+Motor RPM from `in.motor_rpm[0..3]` (and the UDP extended tail) is bridged
+into the firmware's DSHOT-telemetry consumers (`getDshotRpm`,
+`getDshotRpmAverage`, `getDshotErpm`, `getMotorFrequencyHz`,
+`getMinMotorFrequencyHz`), so the RPM filter (`USE_RPM_FILTER` is enabled in
+LOCAL builds), dynamic idle, OSD and the configurator's motor telemetry all
+see the simulated RPM. 4 motors are supported.
+
 The virtual EEPROM is stored at a fixed, writable location in LOCAL mode:
 `%LOCALAPPDATA%\Betaflight-SITL\eeprom.bin` (override with `BF_SITL_EEPROM`).
 This keeps configuration persistent no matter where the host process (UE) is
