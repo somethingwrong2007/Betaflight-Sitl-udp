@@ -554,7 +554,7 @@ if(SITL_LINK_MODE STREQUAL "LOCAL")
   # dshot.c's definitions are renamed so wincompat.c can provide wrappers
   # that return simTelemetryMotorFrequencyHz() values when present.
   set_source_files_properties("${BF_ROOT}/src/main/drivers/dshot.c" PROPERTIES COMPILE_OPTIONS
-    "-DgetDshotRpm=sitlDshotRpmReal;-DgetDshotRpmAverage=sitlDshotRpmAverageReal;-DgetDshotErpm=sitlDshotErpmReal;-DgetMotorFrequencyHz=sitlMotorFrequencyHzReal;-DgetMinMotorFrequencyHz=sitlMinMotorFrequencyHzReal")
+    "-DgetDshotRpm=sitlDshotRpmReal;-DgetDshotRpmAverage=sitlDshotRpmAverageReal;-DgetDshotErpm=sitlDshotErpmReal;-DgetMotorFrequencyHz=sitlMotorFrequencyHzReal;-DgetMinMotorFrequencyHz=sitlMinMotorFrequencyHzReal;-DisDshotTelemetryActive=sitlIsDshotTelemetryActiveReal")
 
   # Prepend wincompat so the x86 build/atomic.h shadow wins over the
   # ARM-only submodule header (required once USE_DSHOT is enabled).

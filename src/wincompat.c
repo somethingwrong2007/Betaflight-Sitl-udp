@@ -137,6 +137,16 @@ float getMinMotorFrequencyHz(void)
     }
     return count > 0 ? minHz : sitlMinMotorFrequencyHzReal();
 }
+
+bool isDshotTelemetryActive(void)
+{
+    // The LOCAL link always bridges host-provided motor RPM, so DSHOT
+    // telemetry is active from the FC's perspective. The real implementation
+    // requires decoded per-motor telemetry frames (telemetryTypes eRPM bit),
+    // which the virtual PWM path never produces; without this override the
+    // FC blocks arming with ARMING_DISABLED_DSHOT_TELEM (core.c).
+    return true;
+}
 #endif // SITL_LOCAL
 
 // sitl.c's fopen() calls are renamed to sitlFopen() by CMakeLists.txt so the
