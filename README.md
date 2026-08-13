@@ -245,12 +245,20 @@ launched from. Plain "Save" works and persists; "Save and Reboot" also
 persists but does not restart the in-process FC, so use plain Save or restart
 the host session for a full reboot.
 
+For save/connection troubleshooting, the DLL appends an audit trail to
+`%LOCALAPPDATA%\Betaflight-SITL\sitl-audit.log`: the resolved EEPROM path at
+init, WebSocket configurator connect/disconnect events, and every MSP
+`writeEEPROM` that reaches the firmware (with the armed state at that moment).
+If a Save produces no `writeEEPROM` entry, the command was rejected before
+writing - the usual cause is saving while the FC is armed (Betaflight rejects
+`MSP_EEPROM_WRITE` while armed), so disarm before saving.
+
 The web configurator still works: boot keeps the TCP/WebSocket proxy on
 127.0.0.1:5761/6761 and a background thread services MSP. Caveats:
 
-- `SITL_ATTITUDE_DIRECT` (the current default) injects the FDM quaternion;
-  remove it to let `USE_IMU_CALC` estimate attitude from the virtual
-  acc/gyro/mag feeds.
+- Attitude is estimated by the firmware's Mahony filter (`USE_IMU_CALC`) from
+  the virtual acc/gyro/mag feeds. Defining `SITL_ATTITUDE_DIRECT` instead
+  injects the FDM quaternion directly and disables the estimator.
 - "Save and Reboot" persists the configuration but does not restart the
   in-process FC (there is no process to relaunch); restart the host session
   for a full reboot.
