@@ -114,6 +114,17 @@ static float localRcReadRaw(const rxRuntimeState_t *state, uint8_t channel)
     return channel < SITL_LOCAL_MAX_RC_CHANNELS ? (float)gLocalRc[channel] : 0.0f;
 }
 
+// Called from sitlBoot() after the EEPROM config is loaded and before
+// initPhase3() runs motorDevInit(). Enabling USE_DSHOT (needed for the RPM
+// bridge) makes the default motor protocol DSHOT600, whose hardware init is
+// a false-returning stub in this build - the motor device would become the
+// null device and produce no output. The virtual PWM device is the correct
+// motor backend for SITL, so pin the protocol to PWM here.
+void sitlLocalPreMotorInit(void)
+{
+    motorConfigMutable()->dev.motorProtocol = MOTOR_PROTOCOL_PWM;
+}
+
 // --- LOCAL-mode link stubs ---
 // The DLL keeps a few firmware paths alive that the executable build
 // garbage-collects (PE export/import bookkeeping). Their implementations are

@@ -259,9 +259,23 @@ void sitlBoot(int argc, char *argv[])
 
 #ifdef ENABLE_MULTICORE_INIT
     multicoreExecuteBlocking(initPhase1);
-    multicoreExecuteBlocking(initPhase2);
 #else
     initPhase1();
+#endif
+
+#ifdef SITL_LOCAL
+    // Force the virtual PWM motor backend after the EEPROM config is loaded
+    // (initPhase1) and before mixerInit()/motorDevInit() run (initPhase2):
+    // enabling USE_DSHOT for the RPM bridge would otherwise make the default
+    // motor protocol DSHOT600 and select a stub dshot device that produces no
+    // motor output.
+    extern void sitlLocalPreMotorInit(void);
+    sitlLocalPreMotorInit();
+#endif
+
+#ifdef ENABLE_MULTICORE_INIT
+    multicoreExecuteBlocking(initPhase2);
+#else
     initPhase2();
 #endif
 
