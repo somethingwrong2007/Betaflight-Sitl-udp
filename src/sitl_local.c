@@ -34,6 +34,7 @@
 #include "fc/runtime_config.h"
 #include "config/feature.h"
 #include "msp/msp.h"
+#include "rx/rx.h"
 #include "sensors/battery.h"
 
 #include "sitl_local.h"
@@ -63,7 +64,6 @@ extern uint64_t micros64(void);
 
 // Firmware entry points used by the synchronous step.
 extern void scheduler(void);
-extern void rxUpdateUdpChannels(const uint16_t *channels, uint8_t channelCount);
 extern void rxInit(void);
 
 // msp_serial.h pulls in io/serial.h, which collides with the MinGW windows.h
@@ -89,6 +89,27 @@ static volatile LONG gMspThreadStop = 0;
 static double gGpsOriginLat = 0.0;
 static double gGpsOriginLon = 0.0;
 static bool gGpsOriginSet = false;
+
+// RC is a "latest value cache" (AJ92/SimITL approach): the frame status is
+// always COMPLETE so the FC can never time out into RXLOSS, and the read
+// callback returns the cache. The cache and lastRcFrameTimeUs are updated
+// only when the host data actually changes, so Betaflight's measured RC rate
+// tracks the real data rate (~125 Hz for an XInput controller) instead of the
+// 1000 Hz host step rate.
+static uint16_t gLocalRc[SITL_LOCAL_MAX_RC_CHANNELS];
+static bool gLocalRcValid = false;
+
+static uint8_t localRcFrameStatus(rxRuntimeState_t *state)
+{
+    (void)state;
+    return RX_FRAME_COMPLETE;
+}
+
+static uint16_t localRcReadRaw(rxRuntimeState_t *state, uint8_t channel)
+{
+    (void)state;
+    return channel < SITL_LOCAL_MAX_RC_CHANNELS ? gLocalRc[channel] : 0;
+}
 
 // --- LOCAL-mode link stubs ---
 // The DLL keeps a few firmware paths alive that the executable build
@@ -157,6 +178,12 @@ int sitl_local_init(void)
     // read simTelemetrySet() values.
     featureEnableImmediate(FEATURE_RX_UDP);
     rxInit();
+
+    // Take over the RC provider functions with the cache semantics above.
+    rxRuntimeState.rcReadRawFn = localRcReadRaw;
+    rxRuntimeState.rcFrameStatusFn = localRcFrameStatus;
+    rxRuntimeState.channelCount = SITL_LOCAL_MAX_RC_CHANNELS;
+
     batteryConfigMutable()->voltageMeterSource = VOLTAGE_METER_ADC;
     batteryConfigMutable()->currentMeterSource = CURRENT_METER_ADC;
 
@@ -264,12 +291,14 @@ void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
     simTelemetrySet(in->battery_voltage, in->battery_current, in->motor_rpm, 4);
 
     // --- RC ---
-    // Report a new frame on every step, exactly like the UDP transport
-    // (1 kHz frames, mostly duplicates). The host controller may only change
-    // at ~125 Hz, but duplicate frames let Betaflight's RC smoothing and
-    // feedforward interpolation run on the same 1 kHz grid as the UDP mode,
-    // so smoothing/feedforward behavior and the measured RX rate match it.
-    rxUpdateUdpChannels(in->rc_channels, SITL_LOCAL_MAX_RC_CHANNELS);
+    // Refresh the cache and the data-rate timestamp only when the host
+    // actually changed the channels. Frame status stays COMPLETE regardless,
+    // so the link never drops while sticks are stationary.
+    if (!gLocalRcValid || memcmp(gLocalRc, in->rc_channels, sizeof(gLocalRc)) != 0) {
+        memcpy(gLocalRc, in->rc_channels, sizeof(gLocalRc));
+        gLocalRcValid = true;
+        rxRuntimeState.lastRcFrameTimeUs = (timeUs_t)(micros64() & 0xFFFFFFFF);
+    }
 
     // --- run the scheduler on the same 100 us quantum grid as UDP mode ---
     // A single scheduler() call exactly on the gyro deadline only runs the

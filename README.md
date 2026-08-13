@@ -229,12 +229,14 @@ while (physicsTick) {
 tasks, including RX and failsafe, get scheduler time before each gyro
 deadline), runs the scheduler and returns the motor outputs for that exact
 state in the same call. RC channels are taken from
-`in.rc_channels` (AETR + aux, 1000..2000); a new frame is announced on every
-step (1 kHz, mostly duplicates when the sticks are stationary), matching the
-UDP transport so RC smoothing, feedforward and the measured RX rate behave
-identically. `sitl_local_init()` also forces the UDP RX provider and the ADC
-battery/current meters so RC and voltage work regardless of the EEPROM
-configuration.
+`in.rc_channels` (AETR + aux, 1000..2000). RC uses the AJ92/SimITL "latest
+value cache" model: the frame status is always COMPLETE (RXLOSS is impossible
+by construction) and the channel cache plus `lastRcFrameTimeUs` are updated
+only when the host data actually changes, so Betaflight's measured RC rate
+tracks the real controller update rate (e.g. ~125 Hz for XInput) and
+feedforward sees mathematically consistent deltas. `sitl_local_init()` also
+forces the UDP RX provider and the ADC battery/current meters so RC and
+voltage work regardless of the EEPROM configuration.
 
 The virtual EEPROM is stored at a fixed, writable location in LOCAL mode:
 `%LOCALAPPDATA%\Betaflight-SITL\eeprom.bin` (override with `BF_SITL_EEPROM`).
