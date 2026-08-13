@@ -106,7 +106,7 @@ DLLs are statically linked; GitHub Actions collects everything into the
 | `SITL_TIME_MODE` | `REALTIME` / `UDP` | `REALTIME` | Scheduler time base |
 | `SITL_LINK_MODE` | `UDP` / `LOCAL` | `UDP` | `UDP` builds the standalone server; `LOCAL` builds an in-process DLL (`betaflight_SITL.dll`) with a synchronous step API |
 | `SITL_GYRO_HZ` | 100-10000 | `1000` | Gyro/filter/PID frequency |
-| `SITL_ATTITUDE_DIRECT` | defined / not defined | defined | Direct input mode: the virtual gyro is fed straight from the FDM angular velocity and the FDM quaternion is injected as attitude, so the FC does not run its own IMU estimator. Remove this define to enable `USE_IMU_CALC` instead: attitude is estimated by the firmware's Mahony filter from the virtual accelerometer/gyroscope/magnetometer feeds. |
+| `SITL_ATTITUDE_DIRECT` | defined / not defined | not defined | When defined, the virtual gyro is fed straight from the FDM angular velocity and the FDM quaternion is injected as attitude (no onboard estimator). The default build keeps `USE_IMU_CALC` on: attitude is estimated by the firmware's Mahony filter from the virtual accelerometer/gyroscope/magnetometer feeds. |
 | `DEFAULT_BLACKBOX_DEVICE` | (defined) | `BLACKBOX_DEVICE_VIRTUAL` | Fresh EEPROMs log blackbox to files by default |
 | `SITL_BRUSHLESS_PWM_RATE` | Hz | `20000` | Virtual brushless PWM rate used by config validation; raised so "sync PWM with PID" mode does not force `pid_process_denom` up |
 
