@@ -76,6 +76,10 @@ typedef enum {
     LOCAL_MSP_EVALUATE_NON_MSP_DATA = 0,
     LOCAL_MSP_SKIP_NON_MSP_DATA
 } localMspEvaluateNonMspData_e;
+// mspSerialProcess is invoked from the scheduler's TASK_SERIAL (inside
+// sitl_local_step) and from the background thread below. The firmware's
+// parser is not reentrant, but the scheduler path only runs while the host
+// is stepping, so the calls are effectively serialized in practice.
 extern void mspSerialProcess(localMspEvaluateNonMspData_e evaluateNonMspData,
                              mspProcessCommandFnPtr mspProcessCommandFn,
                              mspProcessReplyFnPtr mspProcessReplyFn);
@@ -186,7 +190,9 @@ static DWORD WINAPI localMspThreadProc(LPVOID arg)
     while (!gMspThreadStop) {
         mspSerialProcess(LOCAL_MSP_EVALUATE_NON_MSP_DATA,
                          mspFcProcessCommand, mspFcProcessReply);
-        Sleep(5);
+        // 1 ms poll: keeps the configurator responsive when the host is not
+        // stepping (no scheduler TASK_SERIAL) without adding meaningful CPU.
+        Sleep(1);
     }
     return 0;
 }

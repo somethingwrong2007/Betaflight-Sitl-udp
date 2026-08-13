@@ -122,6 +122,12 @@ static void *tcpServerThread(void *arg)
             continue;
         }
         socketNoInherit(client);
+        // Disable Nagle: replies are small and should go out immediately
+        // instead of waiting for the delayed-ACK timer.
+        {
+            BOOL noDelay = TRUE;
+            setsockopt(client, IPPROTO_TCP, TCP_NODELAY, (const char *)&noDelay, sizeof(noDelay));
+        }
 
         pthread_mutex_lock(&clientLocks[id]);
         int slot = -1;
@@ -316,6 +322,27 @@ static void tcpWrite(serialPort_t *instance, uint8_t ch)
     tcpDataOut(s);
 }
 
+// Batch write: without this the generic serialWriteBufNoFlush() falls back to
+// one blocking send() per byte (Nagle delays make each byte take tens of ms),
+// which stalls MSP replies and makes the configurator time out on back-to-back
+// requests. The caller has already checked that the TX ring can hold `count`.
+static void tcpWriteBuf(serialPort_t *instance, const void *dataPtr, int count)
+{
+    tcpPort_t *s = (tcpPort_t *)instance;
+    const uint8_t *data = (const uint8_t *)dataPtr;
+    pthread_mutex_lock(&s->txLock);
+    for (int i = 0; i < count; i++) {
+        s->port.txBuffer[s->port.txBufferHead] = data[i];
+        if (s->port.txBufferHead + 1 >= s->port.txBufferSize) {
+            s->port.txBufferHead = 0;
+        } else {
+            s->port.txBufferHead++;
+        }
+    }
+    pthread_mutex_unlock(&s->txLock);
+    tcpDataOut(s);
+}
+
 void tcpDataOut(tcpPort_t *instance)
 {
     tcpPort_t *s = instance;
@@ -340,7 +367,6 @@ void tcpDataOut(tcpPort_t *instance)
     if (len == 0) {
         return;
     }
-
     pthread_mutex_lock(&clientLocks[s->id]);
     for (int i = 0; i < MAX_TCP_CLIENTS; i++) {
         const SOCKET sock = clientSockets[s->id][i];
@@ -405,7 +431,7 @@ static const struct serialPortVTable tcpVTable = {
     .setMode = NULL,
     .setCtrlLineStateCb = NULL,
     .setBaudRateCb = NULL,
-    .writeBuf = NULL,
+    .writeBuf = tcpWriteBuf,
     .beginWrite = NULL,
     .endWrite = NULL,
 };
