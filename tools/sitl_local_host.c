@@ -32,8 +32,15 @@ int main(void)
 
     sitl_local_output_t out;
     fprintf(stderr, "[host] running at 1000 Hz, Ctrl+C to stop\n");
+    uint32_t stepCount = 0;
     while (1) {
+        // Sweep throttle/AUX1 every second so MSP_RC can verify channels
+        // actually propagate through the FC.
+        const bool phase = ((stepCount / 1000) % 2) != 0;
+        in.rc_channels[2] = phase ? 1600 : 1500; // throttle
+        in.rc_channels[4] = phase ? 2000 : 1500; // AUX1
         sitl_local_step(&in, 1000, &out);
+        stepCount++;
 #ifdef _WIN32
         Sleep(1);
 #endif

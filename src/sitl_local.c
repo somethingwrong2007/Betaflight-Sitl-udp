@@ -105,10 +105,10 @@ static uint8_t localRcFrameStatus(rxRuntimeState_t *state)
     return RX_FRAME_COMPLETE;
 }
 
-static uint16_t localRcReadRaw(rxRuntimeState_t *state, uint8_t channel)
+static float localRcReadRaw(const rxRuntimeState_t *state, uint8_t channel)
 {
     (void)state;
-    return channel < SITL_LOCAL_MAX_RC_CHANNELS ? gLocalRc[channel] : 0;
+    return channel < SITL_LOCAL_MAX_RC_CHANNELS ? (float)gLocalRc[channel] : 0.0f;
 }
 
 // --- LOCAL-mode link stubs ---
@@ -177,6 +177,17 @@ int sitl_local_init(void)
     // not a serial receiver) and pin the battery meters to the ADC shims that
     // read simTelemetrySet() values.
     featureEnableImmediate(FEATURE_RX_UDP);
+
+    // Seed the UDP provider's channel count before rxInit() snapshots it into
+    // rx.c's file-static rxChannelCount. After the takeover below the frame
+    // status callback no longer updates rxChannelCount (frameStatusUdp does),
+    // and readRxChannelsApplyRanges()/detectAndApplySignalLossBehaviour()
+    // loop over rxChannelCount - if it stays 0 no channel is ever read.
+    uint16_t initRc[SITL_LOCAL_MAX_RC_CHANNELS];
+    for (int i = 0; i < SITL_LOCAL_MAX_RC_CHANNELS; i++) {
+        initRc[i] = 1000;
+    }
+    rxUpdateUdpChannels(initRc, SITL_LOCAL_MAX_RC_CHANNELS);
     rxInit();
 
     // Take over the RC provider functions with the cache semantics above.
