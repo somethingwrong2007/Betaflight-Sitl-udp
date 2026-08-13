@@ -8,6 +8,7 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdarg.h>
 
 #include "platform.h"
 #include "drivers/io.h"
@@ -20,6 +21,7 @@
 #include "common/time.h"
 #include "sensors/voltage.h"
 #include "sensors/current.h"
+#include "fc/runtime_config.h"
 #include "sim_telemetry.h"
 
 extern uint64_t micros64_real(void);
@@ -30,6 +32,39 @@ void systemReset(void);
 #ifdef USE_BLACKBOX
 extern void blackboxFinish(void);
 #endif
+
+// Append one line to %LOCALAPPDATA%\Betaflight-SITL\sitl-audit.log so save /
+// connection problems in the in-process LOCAL build are traceable without
+// capturing the host process stderr.
+void sitlAuditLog(const char *fmt, ...)
+{
+    char path[MAX_PATH];
+    if (GetEnvironmentVariableA("LOCALAPPDATA", path, sizeof(path)) <= 0) {
+        return;
+    }
+    strncat(path, "\\Betaflight-SITL\\sitl-audit.log", sizeof(path) - strlen(path) - 1);
+
+    FILE *log = fopen(path, "a");
+    if (log == NULL) {
+        return;
+    }
+    fprintf(log, "[%llu] ", (unsigned long long)(micros64_real() / 1000));
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(log, fmt, ap);
+    va_end(ap);
+    fprintf(log, "\n");
+    fclose(log);
+}
+
+// msp.c's writeEEPROM() calls are renamed to this in LOCAL mode so a save
+// attempt is visible in the audit log (including whether the FC was armed,
+// which makes MSP_EEPROM_WRITE get rejected before writeEEPROM is reached).
+void sitlMspWriteEEPROM(void)
+{
+    sitlAuditLog("MSP writeEEPROM reached (armed=%u)", (unsigned)(ARMING_FLAG(ARMED) != 0));
+    writeEEPROM();
+}
 
 // sitl.c's fopen() calls are renamed to sitlFopen() by CMakeLists.txt so the
 // virtual EEPROM file can be redirected without touching the Betaflight

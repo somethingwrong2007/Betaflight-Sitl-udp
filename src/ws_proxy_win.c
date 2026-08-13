@@ -20,6 +20,8 @@
 
 #include "win_socket_util.h"
 
+extern void sitlAuditLog(const char *fmt, ...);
+
 #define WS_PORT 6761
 #define MSP_PORT 5761
 #define WS_GUID "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -284,6 +286,7 @@ static void *wsClientThread(void *arg)
         return NULL;
     }
     fprintf(stderr, "[wsproxy] WebSocket client connected\n");
+    sitlAuditLog("configurator connected via WebSocket");
 
     SOCKET tcp = INVALID_SOCKET;
     for (int attempt = 0; attempt < 50; attempt++) {
@@ -352,6 +355,7 @@ static void *wsClientThread(void *arg)
     }
 
     fprintf(stderr, "[wsproxy] client disconnected\n");
+    sitlAuditLog("configurator disconnected");
     closesocket(tcp);
     closesocket(ws);
     return NULL;

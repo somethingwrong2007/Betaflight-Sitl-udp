@@ -65,6 +65,7 @@ extern uint64_t micros64(void);
 // Firmware entry points used by the synchronous step.
 extern void scheduler(void);
 extern void rxInit(void);
+extern void sitlAuditLog(const char *fmt, ...);
 
 // msp_serial.h pulls in io/serial.h, which collides with the MinGW windows.h
 // include chain; declare just what the background MSP keep-alive needs (the
@@ -167,6 +168,7 @@ int sitl_local_init(void)
             // see (sitlFopen redirects the EEPROM via getenv).
             _putenv_s("BF_SITL_EEPROM", eepromPath);
             fprintf(stderr, "[SITL] LOCAL mode EEPROM: %s\n", eepromPath);
+            sitlAuditLog("sitl_local_init: eeprom=%s", eepromPath);
         }
     }
 

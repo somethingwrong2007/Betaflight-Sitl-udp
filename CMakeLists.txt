@@ -448,8 +448,13 @@ if(WIN32)
   # config is persisted first (wincompat.c's sitlSystemReset calls
   # writeEEPROM() before the real systemReset), so "Save and Reboot" always
   # saves even if the MSP_EEPROM_WRITE step was skipped or lost.
-  set_source_files_properties("${BF_ROOT}/src/main/msp/msp.c" PROPERTIES COMPILE_OPTIONS
-    "-DsystemReset=sitlSystemReset")
+  if(SITL_LINK_MODE STREQUAL "LOCAL")
+    set_source_files_properties("${BF_ROOT}/src/main/msp/msp.c" PROPERTIES COMPILE_OPTIONS
+      "-DsystemReset=sitlSystemReset;-DwriteEEPROM=sitlMspWriteEEPROM")
+  else()
+    set_source_files_properties("${BF_ROOT}/src/main/msp/msp.c" PROPERTIES COMPILE_OPTIONS
+      "-DsystemReset=sitlSystemReset")
+  endif()
   # UDP-fed battery telemetry: battery.c's ADC meter reads are renamed to
   # wincompat shims that return voltage/current from the extended FDM packet
   # (sim_telemetry.h), and fresh EEPROMs default the meters to that path.
