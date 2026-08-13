@@ -211,6 +211,11 @@ int sitl_local_init(void)
     // and telemetry consumers use the bridged values from the wrappers.
     useDshotTelemetry = true;
 
+    // The FC blocks arming for powerOnArmingGraceTime seconds after every
+    // boot. In-process LOCAL sessions start a new boot each time the host
+    // loads the DLL, so remove the grace block immediately.
+    unsetArmingDisabled(ARMING_DISABLED_BOOT_GRACE_TIME);
+
     // Make the local link self-sufficient regardless of the EEPROM contents:
     // force the UDP RX provider (sensor input arrives via sitl_local_step,
     // not a serial receiver) and pin the battery meters to the ADC shims that
