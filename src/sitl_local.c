@@ -97,19 +97,27 @@ static double gGpsOriginLat = 0.0;
 static double gGpsOriginLon = 0.0;
 static bool gGpsOriginSet = false;
 
-// RC is a "latest value cache" (AJ92/SimITL approach): the frame status is
-// always COMPLETE so the FC can never time out into RXLOSS, and the read
-// callback returns the cache. The cache and lastRcFrameTimeUs are updated
-// only when the host data actually changes, so Betaflight's measured RC rate
-// tracks the real data rate (~125 Hz for an XInput controller) instead of the
-// 1000 Hz host step rate.
+// RC is a "latest value cache": the read callback returns the cache, and the
+// frame status presents a fixed 125 Hz cadence (one COMPLETE every 8 ms of
+// virtual time, PENDING in between) like a real receiver. Always-COMPLETE
+// made the RX task and feedforward run at the 1 kHz scheduler rate, so a
+// stick snap produced two huge 1 ms feedforward samples instead of a
+// 125 Hz impulse spread over ~16 ms, inflating the setpoint-speed peak and
+// causing overshoot. The cache is refreshed whenever the host data changes;
+// lastRcFrameTimeUs is stamped at frame ticks only.
 static uint16_t gLocalRc[SITL_LOCAL_MAX_RC_CHANNELS];
 static bool gLocalRcValid = false;
+static uint64_t gLocalRcAnnounceUs = 0;
 
 static uint8_t localRcFrameStatus(rxRuntimeState_t *state)
 {
     (void)state;
-    return RX_FRAME_COMPLETE;
+    if (gLocalRcValid && (micros64() - gLocalRcAnnounceUs) >= 8000) {
+        gLocalRcAnnounceUs = micros64();
+        rxRuntimeState.lastRcFrameTimeUs = (timeUs_t)(gLocalRcAnnounceUs & 0xFFFFFFFF);
+        return RX_FRAME_COMPLETE;
+    }
+    return RX_FRAME_PENDING;
 }
 
 static float localRcReadRaw(const rxRuntimeState_t *state, uint8_t channel)
@@ -363,13 +371,12 @@ void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
     simTelemetrySet(in->battery_voltage, in->battery_current, in->motor_rpm, 4);
 
     // --- RC ---
-    // Refresh the cache and the data-rate timestamp only when the host
-    // actually changed the channels. Frame status stays COMPLETE regardless,
-    // so the link never drops while sticks are stationary.
+    // Refresh the cache only when the host data actually changed. The frame
+    // status callback emits COMPLETE on a fixed 8 ms cadence, so the FC sees
+    // a real 125 Hz receiver (values sampled at frame boundaries).
     if (!gLocalRcValid || memcmp(gLocalRc, in->rc_channels, sizeof(gLocalRc)) != 0) {
         memcpy(gLocalRc, in->rc_channels, sizeof(gLocalRc));
         gLocalRcValid = true;
-        rxRuntimeState.lastRcFrameTimeUs = (timeUs_t)(micros64() & 0xFFFFFFFF);
     }
 
     // --- run the scheduler on the same 100 us quantum grid as UDP mode ---
