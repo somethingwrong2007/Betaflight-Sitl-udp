@@ -287,12 +287,6 @@ void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
         return;
     }
 
-    // --- virtual accelerometer (same signs/scales as sitl.c updateState) ---
-    const int16_t ax = (int16_t)constrain(-in->linear_acceleration_xyz[0] * LOCAL_ACC_SCALE, -32767, 32767);
-    const int16_t ay = (int16_t)constrain(-in->linear_acceleration_xyz[1] * LOCAL_ACC_SCALE, -32767, 32767);
-    const int16_t az = (int16_t)constrain(-in->linear_acceleration_xyz[2] * LOCAL_ACC_SCALE, -32767, 32767);
-    virtualAccSet(virtualAccDev, ax, ay, az);
-
     // --- virtual gyro (Gazebo bridge axis mapping) ---
     double gyroRoll, gyroPitch, gyroYaw;
     sitlGyroBodyFromSim(in->angular_velocity_rpy, ENABLE_GAZEBO_BRIDGE,
@@ -318,20 +312,43 @@ void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
     const float attQy = k * (pktQy + pktQx);
     const float attQz = k * (pktQz + pktQw);
 
+    // Body->world (NWU) rotation matrix; rows select the earth axis, columns
+    // the body axis (same layout as imu.c's rMat).
+    const float r00 = 1.0f - 2.0f * (attQy * attQy + attQz * attQz);
+    const float r01 = 2.0f * (attQx * attQy - attQw * attQz);
+    const float r02 = 2.0f * (attQx * attQz + attQw * attQy);
+    const float r10 = 2.0f * (attQx * attQy + attQw * attQz);
+    const float r11 = 1.0f - 2.0f * (attQx * attQx + attQz * attQz);
+    const float r12 = 2.0f * (attQy * attQz - attQw * attQx);
+    const float r20 = 2.0f * (attQx * attQz - attQw * attQy);
+    const float r21 = 2.0f * (attQy * attQz + attQw * attQx);
+    const float r22 = 1.0f - 2.0f * (attQx * attQx + attQy * attQy);
+
+    // --- virtual accelerometer (same signs/scales as sitl.c updateState) ---
+    // Mahony only uses the accel when its magnitude is within 0.9..1.1 g
+    // (imuIsAccelerometerHealthy); otherwise attitude is pure gyro
+    // integration and roll/pitch never converge. If the host feed is missing
+    // or wrong (e.g. not gravity-compensated), derive a healthy 1 g specific
+    // force from the FDM attitude instead: earth-up in body = R^T * (0,0,1)
+    // = row U of the rotation matrix.
+    int16_t ax = (int16_t)constrain(-in->linear_acceleration_xyz[0] * LOCAL_ACC_SCALE, -32767, 32767);
+    int16_t ay = (int16_t)constrain(-in->linear_acceleration_xyz[1] * LOCAL_ACC_SCALE, -32767, 32767);
+    int16_t az = (int16_t)constrain(-in->linear_acceleration_xyz[2] * LOCAL_ACC_SCALE, -32767, 32767);
+    const int32_t accMagSq = (int32_t)ax * ax + (int32_t)ay * ay + (int32_t)az * az;
+    const int32_t healthyMin = (int32_t)(0.9f * 256.0f);
+    const int32_t healthyMax = (int32_t)(1.1f * 256.0f);
+    if (accMagSq < healthyMin * healthyMin || accMagSq > healthyMax * healthyMax) {
+        ax = (int16_t)lrintf(r20 * 256.0f);
+        ay = (int16_t)lrintf(r21 * 256.0f);
+        az = (int16_t)lrintf(r22 * 256.0f);
+    }
+    virtualAccSet(virtualAccDev, ax, ay, az);
+
     // --- synthetic magnetometer feed (same earth field as sitl.c) ---
     {
         static const float fieldN = 2046.8f;
         static const float fieldW = -71.5f;
         static const float fieldU = -3547.2f;
-        const float r00 = 1.0f - 2.0f * (attQy * attQy + attQz * attQz);
-        const float r01 = 2.0f * (attQx * attQy - attQw * attQz);
-        const float r02 = 2.0f * (attQx * attQz + attQw * attQy);
-        const float r10 = 2.0f * (attQx * attQy + attQw * attQz);
-        const float r11 = 1.0f - 2.0f * (attQx * attQx + attQz * attQz);
-        const float r12 = 2.0f * (attQy * attQz - attQw * attQx);
-        const float r20 = 2.0f * (attQx * attQz - attQw * attQy);
-        const float r21 = 2.0f * (attQy * attQz + attQw * attQx);
-        const float r22 = 1.0f - 2.0f * (attQx * attQx + attQy * attQy);
         const float magX = r00 * fieldN + r10 * fieldW + r20 * fieldU;
         const float magY = r01 * fieldN + r11 * fieldW + r21 * fieldU;
         const float magZ = r02 * fieldN + r12 * fieldW + r22 * fieldU;

@@ -245,6 +245,12 @@ into the firmware's DSHOT-telemetry consumers (`getDshotRpm`,
 LOCAL builds), dynamic idle, OSD and the configurator's motor telemetry all
 see the simulated RPM. 4 motors are supported.
 
+The virtual accelerometer feeds `in.linear_acceleration_xyz` (FRD specific
+force, m/s²). If the host's feed is missing or not gravity-compensated
+(magnitude outside 0.9..1.1 g), the DLL derives a healthy 1 g specific force
+from the FDM attitude quaternion instead - otherwise Betaflight's Mahony
+estimator disables accel correction and roll/pitch never converge.
+
 The virtual EEPROM is stored at a fixed, writable location in LOCAL mode:
 `%LOCALAPPDATA%\Betaflight-SITL\eeprom.bin` (override with `BF_SITL_EEPROM`).
 This keeps configuration persistent no matter where the host process (UE) is
