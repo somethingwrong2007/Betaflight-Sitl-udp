@@ -556,6 +556,15 @@ if(SITL_LINK_MODE STREQUAL "LOCAL")
   set_source_files_properties("${BF_ROOT}/src/main/drivers/dshot.c" PROPERTIES COMPILE_OPTIONS
     "-DgetDshotRpm=sitlDshotRpmReal;-DgetDshotRpmAverage=sitlDshotRpmAverageReal;-DgetDshotErpm=sitlDshotErpmReal;-DgetMotorFrequencyHz=sitlMotorFrequencyHzReal;-DgetMinMotorFrequencyHz=sitlMinMotorFrequencyHzReal;-DisDshotTelemetryActive=sitlIsDshotTelemetryActiveReal")
 
+  # mspSerialProcess() runs from two threads in LOCAL mode (the scheduler's
+  # TASK_SERIAL inside sitl_local_step and the 1 ms background MSP thread).
+  # The shared msp_serial parser (and CLI state machine) is not reentrant, so
+  # serialize both callers through a mutex wrapper in sitl_local.c - without
+  # this, entering the CLI panel and leaving it can leave the port wedged in
+  # CLI mode.
+  set_source_files_properties("${BF_ROOT}/src/main/msp/msp_serial.c" PROPERTIES COMPILE_OPTIONS
+    "-DmspSerialProcess=sitlMspSerialProcessReal")
+
   # Prepend wincompat so the x86 build/atomic.h shadow wins over the
   # ARM-only submodule header (required once USE_DSHOT is enabled).
   target_include_directories(betaflight_SITL PRIVATE

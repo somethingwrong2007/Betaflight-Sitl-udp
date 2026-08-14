@@ -303,6 +303,10 @@ void systemReset(void)
     // caller already ran writeEEPROM via sitlSystemReset) and leave the FC
     // running.
     writeEEPROM();
+    // cliEnter() sets ARMING_DISABLED_CLI and nothing ever clears it (real
+    // FCs clear it on reboot, which LOCAL mode does not do). Clear it so the
+    // craft can arm again after the CLI panel is closed.
+    unsetArmingDisabled(ARMING_DISABLED_CLI);
 #else
     sitlRelaunchSelf();
     sitlSystemResetNative();

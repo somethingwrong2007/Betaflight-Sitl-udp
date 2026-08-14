@@ -68,6 +68,7 @@ extern void scheduler(void);
 extern void rxInit(void);
 extern void sitlAuditLog(const char *fmt, ...);
 extern bool useDshotTelemetry;
+extern bool cliMode;
 
 // msp_serial.h pulls in io/serial.h, which collides with the MinGW windows.h
 // include chain; declare just what the background MSP keep-alive needs (the
@@ -76,13 +77,25 @@ typedef enum {
     LOCAL_MSP_EVALUATE_NON_MSP_DATA = 0,
     LOCAL_MSP_SKIP_NON_MSP_DATA
 } localMspEvaluateNonMspData_e;
-// mspSerialProcess is invoked from the scheduler's TASK_SERIAL (inside
-// sitl_local_step) and from the background thread below. The firmware's
-// parser is not reentrant, but the scheduler path only runs while the host
-// is stepping, so the calls are effectively serialized in practice.
-extern void mspSerialProcess(localMspEvaluateNonMspData_e evaluateNonMspData,
-                             mspProcessCommandFnPtr mspProcessCommandFn,
-                             mspProcessReplyFnPtr mspProcessReplyFn);
+// mspSerialProcess is invoked from two threads (scheduler TASK_SERIAL inside
+// sitl_local_step and the background thread below). The shared MSP/CLI parser
+// in msp_serial.c is not reentrant - concurrent calls can leave the port
+// wedged in CLI mode - so the real implementation is renamed and both callers
+// go through this mutex-serialized wrapper.
+extern void sitlMspSerialProcessReal(localMspEvaluateNonMspData_e evaluateNonMspData,
+                                     mspProcessCommandFnPtr mspProcessCommandFn,
+                                     mspProcessReplyFnPtr mspProcessReplyFn);
+
+static CRITICAL_SECTION gMspCrit;
+
+void mspSerialProcess(localMspEvaluateNonMspData_e evaluateNonMspData,
+                      mspProcessCommandFnPtr mspProcessCommandFn,
+                      mspProcessReplyFnPtr mspProcessReplyFn)
+{
+    EnterCriticalSection(&gMspCrit);
+    sitlMspSerialProcessReal(evaluateNonMspData, mspProcessCommandFn, mspProcessReplyFn);
+    LeaveCriticalSection(&gMspCrit);
+}
 
 // udplink_windows.c captures the motor packets pwmCompleteMotorUpdate()
 // produces so the DLL can return them without any network I/O.
@@ -195,7 +208,18 @@ gpsLapTimerConfig_t gpsLapTimerConfig_System;
 static DWORD WINAPI localMspThreadProc(LPVOID arg)
 {
     (void)arg;
+    static bool cliWasActive = false;
     while (!gMspThreadStop) {
+        // cliEnter() sets ARMING_DISABLED_CLI and nothing in the firmware
+        // clears it (real FCs reboot to reset it). Watch cliMode transitions
+        // so "exit noreboot" (e.g. configurator closes the panel / disconnect
+        // injection) also unblocks arming.
+        if (cliWasActive && !cliMode) {
+            sitlAuditLog("cliMode cleared by watcher");
+            unsetArmingDisabled(ARMING_DISABLED_CLI);
+        }
+        cliWasActive = cliMode;
+
         mspSerialProcess(LOCAL_MSP_EVALUATE_NON_MSP_DATA,
                          mspFcProcessCommand, mspFcProcessReply);
         // 1 ms poll: keeps the configurator responsive when the host is not
@@ -269,6 +293,7 @@ int sitl_local_init(void)
 
     gLocalRunning = true;
     gMspThreadStop = 0;
+    InitializeCriticalSection(&gMspCrit);
     gMspThread = CreateThread(NULL, 0, localMspThreadProc, NULL, 0, NULL);
     if (gMspThread == NULL) {
         gLocalRunning = false;
