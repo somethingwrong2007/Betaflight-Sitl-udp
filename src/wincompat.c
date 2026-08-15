@@ -148,6 +148,18 @@ bool isDshotTelemetryActive(void)
     // FC blocks arming with ARMING_DISABLED_DSHOT_TELEM (core.c).
     return true;
 }
+
+// motor.c's motorShutdown() is called by every reboot path (CLI exit, MSP
+// reboot, CMS/mavlink reboot) to stop the ESC outputs before the MCU resets.
+// LOCAL mode never actually resets the FC - systemReset() defers the EEPROM
+// persist and the FC keeps running - so the real shutdown would set
+// motorDevice.initialized = false and motorEnable() would never re-enable the
+// outputs after the next arming (the FC shows armed, but PWM stops forever).
+// A no-op keeps the virtual motor output alive across configurator reboots.
+void motorShutdown(void)
+{
+}
+
 #endif // SITL_LOCAL
 
 // sitl.c's fopen() calls are renamed to sitlFopen() by CMakeLists.txt so the

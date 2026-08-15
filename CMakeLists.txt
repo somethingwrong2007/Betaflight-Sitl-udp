@@ -451,6 +451,14 @@ if(WIN32)
   if(SITL_LINK_MODE STREQUAL "LOCAL")
     set_source_files_properties("${BF_ROOT}/src/main/msp/msp.c" PROPERTIES COMPILE_OPTIONS
       "-DsystemReset=sitlSystemReset;-DwriteEEPROM=sitlMspWriteEEPROM")
+    # Every reboot path (CLI exit, MSP reboot) calls motorShutdown() to stop
+    # the ESC outputs before the MCU resets. LOCAL mode never actually resets:
+    # systemReset() defers the EEPROM persist and the FC keeps running, so the
+    # real shutdown (initialized=false) would make motorEnable() fail forever
+    # after the next arming - the FC shows armed but PWM never comes back.
+    # wincompat.c provides a no-op motorShutdown for LOCAL mode.
+    set_source_files_properties("${BF_ROOT}/src/main/drivers/motor.c" PROPERTIES COMPILE_OPTIONS
+      "-DmotorShutdown=sitlMotorShutdownReal")
   else()
     set_source_files_properties("${BF_ROOT}/src/main/msp/msp.c" PROPERTIES COMPILE_OPTIONS
       "-DsystemReset=sitlSystemReset")
