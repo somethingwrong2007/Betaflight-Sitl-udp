@@ -19,6 +19,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdlib.h>
+#include <setjmp.h>
 
 #include "platform.h"
 
@@ -114,6 +115,34 @@ extern bool sitlLocalTakeMotorPacket(void *out, size_t size);
 static bool gLocalRunning = false;
 static HANDLE gMspThread = NULL;
 static volatile LONG gMspThreadStop = 0;
+
+// Reboot recovery for the in-process build. msp.c's mspRebootFn (MSP_SET_REBOOT
+// post-processing) ends with `while (true);` because a real reboot never
+// returns; LOCAL mode's systemReset() defers the EEPROM persist and returns, so
+// the stock function would spin forever on the background MSP thread and every
+// later configurator connection would time out. sitlSystemReset() longjmps back
+// to this loop instead (the parser is already back in PORT_IDLE when the
+// reboot handler runs), keeping the MSP/CLI thread alive across the reboot.
+static jmp_buf gMspLoopJmp;
+static volatile LONG gMspJmpReady = 0;
+
+void sitlLocalRequestReset(void);
+
+void sitlLocalRebootJump(void)
+{
+    if (!InterlockedCompareExchange(&gMspJmpReady, 0, 0)) {
+        // MSP loop not armed yet (boot-time reboot before the thread started):
+        // fall back to the deferred-persist path and return.
+        sitlLocalRequestReset();
+        return;
+    }
+    // The MSP wrapper's critical section is held by this thread across the
+    // whole MSP/CLI processing call; release it so the loop can re-enter it
+    // cleanly on the next iteration (the wrapper's own Leave is skipped by the
+    // jump).
+    LeaveCriticalSection(&gMspCrit);
+    longjmp(gMspLoopJmp, 1);
+}
 
 static double gGpsOriginLat = 0.0;
 static double gGpsOriginLon = 0.0;
@@ -230,6 +259,10 @@ static DWORD WINAPI localMspThreadProc(LPVOID arg)
     gMspThreadId = GetCurrentThreadId();
     static bool cliWasActive = false;
     while (!gMspThreadStop) {
+        if (setjmp(gMspLoopJmp) != 0) {
+            sitlAuditLog("MSP thread recovered from reboot jump");
+        }
+        InterlockedExchange(&gMspJmpReady, 1);
         // cliEnter() sets ARMING_DISABLED_CLI and nothing in the firmware
         // clears it (real FCs reboot to reset it). Watch cliMode transitions
         // so "exit noreboot" (e.g. configurator closes the panel / disconnect
@@ -251,6 +284,7 @@ static DWORD WINAPI localMspThreadProc(LPVOID arg)
         // stepping (no scheduler TASK_SERIAL) without adding meaningful CPU.
         Sleep(1);
     }
+    InterlockedExchange(&gMspJmpReady, 0);
     return 0;
 }
 

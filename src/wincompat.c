@@ -28,6 +28,7 @@ extern uint64_t micros64_real(void);
 extern void sitlDelayMicroseconds(uint32_t us);
 extern void writeEEPROM(void);
 extern void sitlSystemResetNative(void);
+extern void sitlLocalRebootJump(void);
 void systemReset(void);
 #ifdef USE_BLACKBOX
 extern void blackboxFinish(void);
@@ -236,7 +237,21 @@ int sitlMutexUnlock(pthread_mutex_t *mutex)
 void sitlSystemReset(void)
 {
     writeEEPROM();
+#ifdef SITL_LOCAL
+    // msp.c's mspRebootFn (MSP_SET_REBOOT post-processing) spins in a
+    // `while (true);` loop after systemReset() returns, because a real reboot
+    // never returns. LOCAL mode's systemReset() defers the persist and returns,
+    // so the stock function would hang the background MSP thread forever and
+    // every later configurator connection would time out (the configurator
+    // sends MSP_SET_REBOOT right after a CLI "exit"). Jump back to the MSP
+    // thread loop instead; the parser is already back in PORT_IDLE when the
+    // reboot handler runs, so the next MSP request is processed normally.
+    blackboxFinish();
+    unsetArmingDisabled(ARMING_DISABLED_CLI);
+    sitlLocalRebootJump();
+#else
     systemReset();
+#endif
 }
 
 #ifndef SITL_LOCAL

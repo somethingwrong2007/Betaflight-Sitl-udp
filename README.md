@@ -275,6 +275,11 @@ The web configurator still works: boot keeps the TCP/WebSocket proxy on
 - "Save and Reboot" persists the configuration but does not restart the
   in-process FC (there is no process to relaunch); restart the host session
   for a full reboot.
+- Rebooting via the configurator (CLI `exit`, "Save and Reboot") keeps the
+  MSP/CLI background thread alive: the LOCAL reboot handler persists the
+  config and returns control to the thread instead of letting the stock
+  `mspRebootFn` spin in its `while (true);` reset loop, so the configurator
+  can reconnect immediately afterwards.
 - The MSP thread runs concurrently with the scheduler; configurator operations
   are infrequent, but they are not synchronized against the flight loop.
 
