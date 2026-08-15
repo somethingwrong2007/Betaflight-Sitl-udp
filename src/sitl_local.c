@@ -88,11 +88,19 @@ extern void sitlMspSerialProcessReal(localMspEvaluateNonMspData_e evaluateNonMsp
                                      mspProcessReplyFnPtr mspProcessReplyFn);
 
 static CRITICAL_SECTION gMspCrit;
+static volatile LONG gMspThreadId = 0;
 
 void mspSerialProcess(localMspEvaluateNonMspData_e evaluateNonMspData,
                       mspProcessCommandFnPtr mspProcessCommandFn,
                       mspProcessReplyFnPtr mspProcessReplyFn)
 {
+    // Only the dedicated background thread processes MSP/CLI. The scheduler's
+    // TASK_SERIAL also calls this (inside the UE thread when the host steps);
+    // returning immediately here guarantees the UE thread can never block on
+    // the parser, the mutex, CLI processing or serial I/O.
+    if (GetCurrentThreadId() != (DWORD)gMspThreadId) {
+        return;
+    }
     EnterCriticalSection(&gMspCrit);
     sitlMspSerialProcessReal(evaluateNonMspData, mspProcessCommandFn, mspProcessReplyFn);
     LeaveCriticalSection(&gMspCrit);
@@ -219,6 +227,7 @@ gpsLapTimerConfig_t gpsLapTimerConfig_System;
 static DWORD WINAPI localMspThreadProc(LPVOID arg)
 {
     (void)arg;
+    gMspThreadId = GetCurrentThreadId();
     static bool cliWasActive = false;
     while (!gMspThreadStop) {
         // cliEnter() sets ARMING_DISABLED_CLI and nothing in the firmware

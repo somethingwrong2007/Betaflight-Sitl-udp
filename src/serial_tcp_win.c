@@ -98,6 +98,16 @@ static void *tcpClientThread(void *arg)
     uint8_t buf[2048];
 
     for (;;) {
+        fd_set rfds;
+        struct timeval tv;
+        FD_ZERO(&rfds);
+        FD_SET(a->sock, &rfds);
+        tv.tv_sec = 0;
+        tv.tv_usec = 50000; // 50 ms poll; sockets are non-blocking
+        const int ready = select(0, &rfds, NULL, NULL, &tv);
+        if (ready <= 0) {
+            continue;
+        }
         const int n = recv(a->sock, (char *)buf, sizeof(buf), 0);
         if (n <= 0) {
             break;
@@ -122,6 +132,12 @@ static void *tcpServerThread(void *arg)
             continue;
         }
         socketNoInherit(client);
+        // Non-blocking: a peer that stops reading must never stall the FC
+        // thread inside send() (see tcpDataOut WSAEWOULDBLOCK handling).
+        {
+            u_long nonblocking = 1;
+            ioctlsocket(client, FIONBIO, &nonblocking);
+        }
         // Disable Nagle: replies are small and should go out immediately
         // instead of waiting for the delayed-ACK timer.
         {
@@ -377,8 +393,17 @@ void tcpDataOut(tcpPort_t *instance)
         bool failed = false;
         while (sentTotal < (int)len) {
             const int sent = send(sock, (const char *)data + sentTotal, (int)len - sentTotal, 0);
-            if (sent == SOCKET_ERROR || sent <= 0) {
+            if (sent == SOCKET_ERROR) {
+                // Non-blocking socket: if the peer is not reading, drop the
+                // remainder instead of blocking forever (a stalled peer must
+                // never freeze the FC thread that owns the MSP/CLI mutex).
+                if (WSAGetLastError() == WSAEWOULDBLOCK) {
+                    break;
+                }
                 failed = true;
+                break;
+            }
+            if (sent <= 0) {
                 break;
             }
             sentTotal += sent;
