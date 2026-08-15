@@ -13,6 +13,7 @@
 #include "platform.h"
 #include "drivers/io.h"
 #include "drivers/serial.h"
+#include "drivers/system.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -158,6 +159,19 @@ bool isDshotTelemetryActive(void)
 // A no-op keeps the virtual motor output alive across configurator reboots.
 void motorShutdown(void)
 {
+}
+
+// sitl.c's systemResetToBootloader() calls exit(0), which would terminate the
+// host process from a DLL. "Enter bootloader / DFU" has no meaning for the
+// in-process FC, so treat it like the firmware reboot: persist and jump back
+// to the MSP thread loop instead (mspRebootFn's bootloader branch spins in a
+// `while (true);` after this returns, exactly like the firmware case).
+void systemResetToBootloader(bootloaderRequestType_e requestType)
+{
+    UNUSED(requestType);
+    writeEEPROM();
+    unsetArmingDisabled(ARMING_DISABLED_CLI);
+    sitlLocalRebootJump();
 }
 
 #endif // SITL_LOCAL

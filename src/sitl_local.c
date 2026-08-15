@@ -130,8 +130,11 @@ void sitlLocalRequestReset(void);
 
 void sitlLocalRebootJump(void)
 {
-    if (!InterlockedCompareExchange(&gMspJmpReady, 0, 0)) {
+    if (!InterlockedCompareExchange(&gMspJmpReady, 0, 0)
+        || GetCurrentThreadId() != (DWORD)gMspThreadId) {
         // MSP loop not armed yet (boot-time reboot before the thread started):
+        // or the reboot came from a non-MSP thread (e.g. mavlink/CMS on the
+        // host thread). longjmp can only unwind the MSP thread's own stack, so
         // fall back to the deferred-persist path and return.
         sitlLocalRequestReset();
         return;

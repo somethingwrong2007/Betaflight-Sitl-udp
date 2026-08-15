@@ -436,8 +436,15 @@ if(WIN32)
   # a few fixed steps instead of spinning in real time.
   # systemReset is renamed so wincompat.c can install a custom firmware reboot
   # that relaunches the SITL process automatically instead of just exiting.
-  set_source_files_properties("${BF_ROOT}/src/platform/SIMULATOR/sitl.c" PROPERTIES COMPILE_OPTIONS
-    "-Dmicros64=sitlMicros64;-Dmillis64=sitlMillis64;-Dmicros=sitlMicros;-Dmillis=sitlMillis;-DdelayMicroseconds=sitlDelayMicroseconds;-DgetCycleCounter=sitlGetCycleCounter;-Dfopen=sitlFopen;-Dpthread_mutex_trylock=sitlMutexTrylock;-Dpthread_mutex_unlock=sitlMutexUnlock;-DsystemReset=sitlSystemResetNative")
+  set(SITL_SITL_C_OPTS "-Dmicros64=sitlMicros64;-Dmillis64=sitlMillis64;-Dmicros=sitlMicros;-Dmillis=sitlMillis;-DdelayMicroseconds=sitlDelayMicroseconds;-DgetCycleCounter=sitlGetCycleCounter;-Dfopen=sitlFopen;-Dpthread_mutex_trylock=sitlMutexTrylock;-Dpthread_mutex_unlock=sitlMutexUnlock;-DsystemReset=sitlSystemResetNative")
+  if(SITL_LINK_MODE STREQUAL "LOCAL")
+    # sitl.c's systemResetToBootloader() calls exit(0), which would kill the
+    # host process from a DLL ("Enter DFU/bootloader" in the configurator).
+    # wincompat.c provides a LOCAL replacement that persists and jumps back to
+    # the MSP thread loop, like the firmware reboot path.
+    set(SITL_SITL_C_OPTS "${SITL_SITL_C_OPTS};-DsystemResetToBootloader=sitlSystemResetToBootloaderNative")
+  endif()
+  set_source_files_properties("${BF_ROOT}/src/platform/SIMULATOR/sitl.c" PROPERTIES COMPILE_OPTIONS "${SITL_SITL_C_OPTS}")
   # msp_serial.c's millis() calls (CLI entry guard, configurator-activity
   # timeout) must track real time even while the UDP-driven virtual clock is
   # frozen during idle, otherwise the CLI can never be entered and the

@@ -1,11 +1,14 @@
 # BF-SITL-UDP
 
-Standalone Betaflight SITL compiled as a UDP server for Windows and Linux.
-It keeps the official Betaflight SITL target intact (the `extern/betaflight`
-submodule is pinned and never modified) and layers all simulator plumbing on
-top: a Winsock UDP/TCP layer, an optional FDM-packet-driven virtual clock, a
-WebSocket bridge for the web configurator, config persistence, automatic
-process restart on firmware reboots, and virtual blackbox logging.
+Betaflight SITL for Windows and Linux, with two build flavors sharing one
+codebase: a standalone UDP server (`SITL_LINK_MODE=UDP`) and an in-process
+DLL for engines that want the flight controller inside their own process
+(`SITL_LINK_MODE=LOCAL`). It keeps the official Betaflight SITL target intact
+(the `extern/betaflight` submodule is pinned and never modified) and layers
+all simulator plumbing on top: a Winsock UDP/TCP layer, an optional
+FDM-packet-driven virtual clock, a WebSocket bridge for the web configurator,
+config persistence, automatic process restart on firmware reboots (standalone)
+or in-process reboot recovery (DLL), and virtual blackbox logging.
 
 The main use case is coupling Betaflight to an external physics simulator
 (e.g. an Unreal Engine project) over UDP, while still using the stock
@@ -106,7 +109,7 @@ DLLs are statically linked; GitHub Actions collects everything into the
 | `SITL_TIME_MODE` | `REALTIME` / `UDP` | `REALTIME` | Scheduler time base |
 | `SITL_LINK_MODE` | `UDP` / `LOCAL` | `UDP` | `UDP` builds the standalone server; `LOCAL` builds an in-process DLL (`betaflight_SITL.dll`) with a synchronous step API |
 | `SITL_GYRO_HZ` | 100-10000 | `1000` | Gyro/filter/PID frequency |
-| `SITL_ATTITUDE_DIRECT` | defined / not defined | not defined | When defined, the virtual gyro is fed straight from the FDM angular velocity and the FDM quaternion is injected as attitude (no onboard estimator). The default build keeps `USE_IMU_CALC` on: attitude is estimated by the firmware's Mahony filter from the virtual accelerometer/gyroscope/magnetometer feeds. |
+| `SITL_ATTITUDE_DIRECT` | defined / not defined | not defined | When defined manually (compile flag), the FDM quaternion is injected as attitude and the onboard estimator is bypassed. The default keeps `USE_IMU_CALC` on: attitude is estimated by the firmware's Mahony filter from the virtual accelerometer/gyroscope/magnetometer feeds. |
 | `DEFAULT_BLACKBOX_DEVICE` | (defined) | `BLACKBOX_DEVICE_VIRTUAL` | Fresh EEPROMs log blackbox to files by default |
 | `SITL_BRUSHLESS_PWM_RATE` | Hz | `20000` | Virtual brushless PWM rate used by config validation; raised so "sync PWM with PID" mode does not force `pid_process_denom` up |
 
@@ -230,13 +233,15 @@ tasks, including RX and failsafe, get scheduler time before each gyro
 deadline), runs the scheduler and returns the motor outputs for that exact
 state in the same call. RC channels are taken from
 `in.rc_channels` (AETR + aux, 1000..2000). RC uses the AJ92/SimITL "latest
-value cache" model: the frame status is always COMPLETE (RXLOSS is impossible
-by construction) and the channel cache plus `lastRcFrameTimeUs` are updated
-only when the host data actually changes, so Betaflight's measured RC rate
-tracks the real controller update rate (e.g. ~125 Hz for XInput) and
-feedforward sees mathematically consistent deltas. `sitl_local_init()` also
-forces the UDP RX provider and the ADC battery/current meters so RC and
-voltage work regardless of the EEPROM configuration.
+value cache" model plus a fixed 125 Hz frame cadence: the channel cache is
+refreshed whenever the host data changes, and the frame status reports one
+COMPLETE frame every 8 ms of virtual time (PENDING in between, stamped on
+`lastRcFrameTimeUs`). RXLOSS is impossible by construction, and
+feedforward/smoothing see the same ~125 Hz frame stream as a real receiver
+instead of a 1 kHz duplicate-frame flood (which inflated setpoint-speed
+impulses on stick snaps). `sitl_local_init()` also forces the UDP RX provider
+and the ADC battery/current meters so RC and voltage work regardless of the
+EEPROM configuration.
 
 Motor RPM from `in.motor_rpm[0..3]` (and the UDP extended tail) is bridged
 into the firmware's DSHOT-telemetry consumers (`getDshotRpm`,
@@ -279,7 +284,18 @@ The web configurator still works: boot keeps the TCP/WebSocket proxy on
   MSP/CLI background thread alive: the LOCAL reboot handler persists the
   config and returns control to the thread instead of letting the stock
   `mspRebootFn` spin in its `while (true);` reset loop, so the configurator
-  can reconnect immediately afterwards.
+  can reconnect immediately afterwards. Motor outputs also survive the
+  reboot (`motorShutdown()` is a no-op in LOCAL mode - there is no MCU reset
+  to stop the ESCs for), so arming still produces PWM after a CLI exit.
+- "Enter bootloader / DFU" from the configurator does not kill the host:
+  the stock `systemResetToBootloader()` calls `exit(0)`, which would
+  terminate the process from a DLL. LOCAL mode treats it like the firmware
+  reboot (persist + keep running) - there is no bootloader to enter.
+- Leaving the CLI tab drops the configurator link by design: the
+  configurator's own reboot flow (CLI `exit` + `MSP_REBOOT`) tears the
+  "manual/WebSocket" connection down after a short flush delay, then waits
+  for the user to reconnect (reconnection is instant with this build).
+  Enabling Auto-Connect in the configurator makes it reconnect on its own.
 - The MSP thread runs concurrently with the scheduler; configurator operations
   are infrequent, but they are not synchronized against the flight loop.
 
@@ -389,6 +405,10 @@ $env:BF_SITL_EEPROM = "E:\sim\flight.bin"
 ```
 
 ### Automatic restart on firmware reboot (Windows)
+
+This applies to the standalone UDP build. The LOCAL (DLL) build never
+restarts the process: its reboot handler persists the config and keeps the
+FC running in-process (see the LOCAL caveats above).
 
 Any firmware reboot (`MSP_REBOOT`, CLI `save`, CLI `exit`, CMS save-exit)
 no longer leaves the simulator dead:
