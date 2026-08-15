@@ -299,10 +299,12 @@ void systemReset(void)
 #endif
 #ifdef SITL_LOCAL
     // In-process library mode: there is no standalone process to relaunch and
-    // exiting would kill the host engine. Persist the configuration (the MSP
-    // caller already ran writeEEPROM via sitlSystemReset) and leave the FC
-    // running.
-    writeEEPROM();
+    // exiting would kill the host engine. Defer the (potentially slow)
+    // EEPROM persist to the background thread so systemReset() never blocks
+    // the UE thread that may be executing it via the scheduler's TASK_SERIAL
+    // (the MSP caller already persisted via sitlSystemReset when applicable).
+    extern void sitlLocalRequestReset(void);
+    sitlLocalRequestReset();
     // cliEnter() sets ARMING_DISABLED_CLI and nothing ever clears it (real
     // FCs clear it on reboot, which LOCAL mode does not do). Clear it so the
     // craft can arm again after the CLI panel is closed.

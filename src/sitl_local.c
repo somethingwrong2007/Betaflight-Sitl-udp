@@ -69,6 +69,7 @@ extern void rxInit(void);
 extern void sitlAuditLog(const char *fmt, ...);
 extern bool useDshotTelemetry;
 extern bool cliMode;
+extern void writeEEPROM(void);
 
 // msp_serial.h pulls in io/serial.h, which collides with the MinGW windows.h
 // include chain; declare just what the background MSP keep-alive needs (the
@@ -150,6 +151,16 @@ void sitlLocalPreMotorInit(void)
     motorConfigMutable()->dev.motorProtocol = MOTOR_PROTOCOL_PWM;
 }
 
+// systemReset() defers the EEPROM persist here so it never runs on the UE
+// thread (the scheduler may execute systemReset via TASK_SERIAL while the
+// configurator exits the CLI panel). The background thread picks it up.
+static volatile LONG gLocalPendingReset = 0;
+
+void sitlLocalRequestReset(void)
+{
+    InterlockedExchange(&gLocalPendingReset, 1);
+}
+
 // --- LOCAL-mode link stubs ---
 // The DLL keeps a few firmware paths alive that the executable build
 // garbage-collects (PE export/import bookkeeping). Their implementations are
@@ -222,6 +233,11 @@ static DWORD WINAPI localMspThreadProc(LPVOID arg)
 
         mspSerialProcess(LOCAL_MSP_EVALUATE_NON_MSP_DATA,
                          mspFcProcessCommand, mspFcProcessReply);
+        if (InterlockedExchange(&gLocalPendingReset, 0) != 0) {
+            sitlAuditLog("deferred reset: persisting config");
+            writeEEPROM();
+            unsetArmingDisabled(ARMING_DISABLED_CLI);
+        }
         // 1 ms poll: keeps the configurator responsive when the host is not
         // stepping (no scheduler TASK_SERIAL) without adding meaningful CPU.
         Sleep(1);

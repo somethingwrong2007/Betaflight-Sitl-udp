@@ -221,6 +221,14 @@ void sitlBoot(int argc, char *argv[])
     setvbuf(stdout, NULL, _IOFBF, 64 * 1024);
     setvbuf(stderr, NULL, _IONBF, 0);
 
+#ifdef SITL_LOCAL
+    // The DLL runs inside a GUI host (Unreal); stdout may be an unread pipe,
+    // and the virtual EEPROM's per-word printf would block forever once the
+    // buffer fills, freezing the host while it saves config. Discard stdout.
+    freopen("NUL", "w", stdout);
+    setvbuf(stdout, NULL, _IOFBF, 64 * 1024);
+#endif
+
     // eeprom.bin is binary data; without this, fopen() uses text mode on
     // Windows and 0x0A bytes are mangled by CRLF translation.
     _fmode = _O_BINARY;
