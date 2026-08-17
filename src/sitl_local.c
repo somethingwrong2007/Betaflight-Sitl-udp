@@ -24,6 +24,7 @@
 #include "platform.h"
 
 #include "common/maths.h"
+#include "common/axis.h"
 
 #include "drivers/accgyro/accgyro_virtual.h"
 #include "drivers/barometer/barometer_virtual.h"
@@ -31,7 +32,9 @@
 #include "drivers/dma.h"
 #include "drivers/dshot.h"
 #include "io/gps_virtual.h"
+#include "fc/controlrate_profile.h"
 #include "flight/imu.h"
+#include "fc/rc_modes.h"
 #include "sitl_gyro.h"
 #include "fc/runtime_config.h"
 #include "config/feature.h"
@@ -201,6 +204,16 @@ void sitlLocalRequestReset(void)
     InterlockedExchange(&gLocalPendingReset, 1);
 }
 
+// sitl_local_set_rate() writes the RAM profile immediately and defers the
+// EEPROM persist to the background thread, so a host-side rate change never
+// does file I/O (or config reads) on the UE thread.
+static volatile LONG gLocalPendingEepromWrite = 0;
+
+void sitlLocalRequestEepromWrite(void)
+{
+    InterlockedExchange(&gLocalPendingEepromWrite, 1);
+}
+
 // --- LOCAL-mode link stubs ---
 // The DLL keeps a few firmware paths alive that the executable build
 // garbage-collects (PE export/import bookkeeping). Their implementations are
@@ -283,6 +296,10 @@ static DWORD WINAPI localMspThreadProc(LPVOID arg)
             writeEEPROM();
             unsetArmingDisabled(ARMING_DISABLED_CLI);
         }
+        if (InterlockedExchange(&gLocalPendingEepromWrite, 0) != 0) {
+            sitlAuditLog("local setter: persisting config");
+            writeEEPROM();
+        }
         // 1 ms poll: keeps the configurator responsive when the host is not
         // stepping (no scheduler TASK_SERIAL) without adding meaningful CPU.
         Sleep(1);
@@ -362,6 +379,108 @@ int sitl_local_init(void)
         return -1;
     }
     return 0;
+}
+
+// --- synchronous state access (shared with the configurator via MSP) ---
+// These read/write the exact same globals the MSP handlers use, so a value
+// changed from the configurator is immediately visible here and vice versa.
+// Reads are plain global reads (fine from the UE tick); the only write,
+// sitl_local_set_rate(), writes uint8_t fields and defers the EEPROM persist
+// to the background MSP thread.
+
+uint32_t sitl_local_get_arming_flags(void)
+{
+    return gLocalRunning ? (uint32_t)getArmingDisableFlags() : 0;
+}
+
+bool sitl_local_get_armed(void)
+{
+    return gLocalRunning && ARMING_FLAG(ARMED);
+}
+
+uint32_t sitl_local_get_flight_modes(void)
+{
+    return gLocalRunning ? (uint32_t)flightModeFlags : 0;
+}
+
+void sitl_local_get_rate(int index, float *rcRate, float *rcExpo,
+                         float *superRate, float *yawRate)
+{
+    if (rcRate)    *rcRate    = 0.0f;
+    if (rcExpo)    *rcExpo    = 0.0f;
+    if (superRate) *superRate = 0.0f;
+    if (yawRate)   *yawRate   = 0.0f;
+    if (!gLocalRunning) {
+        return;
+    }
+
+    const controlRateConfig_t *profile =
+        (index >= 0 && index < CONTROL_RATE_PROFILE_COUNT)
+            ? controlRateProfiles(index)
+            : currentControlRateProfile;
+
+    if (rcRate)    *rcRate    = profile->rcRates[FD_ROLL] / 100.0f;
+    if (rcExpo)    *rcExpo    = profile->rcExpo[FD_ROLL] / 100.0f;
+    if (superRate) *superRate = profile->rates[FD_ROLL] / 100.0f;
+    if (yawRate)   *yawRate   = profile->rcRates[FD_YAW] / 100.0f;
+}
+
+void sitl_local_set_rate(float rcRate, float rcExpo,
+                         float superRate, float yawRate)
+{
+    if (!gLocalRunning) {
+        return;
+    }
+
+    controlRateConfig_t *profile = currentControlRateProfile;
+    const uint8_t rcRate8   = (uint8_t)constrain(lrintf(rcRate * 100.0f), 0, 250);
+    const uint8_t expo8     = (uint8_t)constrain(lrintf(rcExpo * 100.0f), 0, 100);
+    const uint8_t super8    = (uint8_t)constrain(lrintf(superRate * 100.0f), 0, 100);
+    const uint8_t yawRate8  = (uint8_t)constrain(lrintf(yawRate * 100.0f), 0, 250);
+
+    // Mirror MSP_SET_RC_TUNING: when roll and pitch were equal, keep them
+    // symmetric; otherwise only roll is touched by the single rcRate/expo.
+    if (profile->rcRates[FD_PITCH] == profile->rcRates[FD_ROLL]) {
+        profile->rcRates[FD_PITCH] = rcRate8;
+    }
+    profile->rcRates[FD_ROLL] = rcRate8;
+
+    if (profile->rcExpo[FD_PITCH] == profile->rcExpo[FD_ROLL]) {
+        profile->rcExpo[FD_PITCH] = expo8;
+    }
+    profile->rcExpo[FD_ROLL] = expo8;
+
+    profile->rates[FD_ROLL] = super8;
+    profile->rates[FD_PITCH] = super8;
+    profile->rcRates[FD_YAW] = yawRate8;
+
+    sitlLocalRequestEepromWrite();
+}
+
+void sitl_local_get_arm_switch(uint8_t *auxChannel, uint8_t *startStep,
+                               uint8_t *endStep)
+{
+    if (auxChannel) *auxChannel = 0xFF;
+    if (startStep)  *startStep  = 0;
+    if (endStep)    *endStep    = 0;
+    if (!gLocalRunning) {
+        return;
+    }
+
+    modeActivationCondition_t emptyMac;
+    memset(&emptyMac, 0, sizeof(emptyMac));
+    for (int i = 0; i < MAX_MODE_ACTIVATION_CONDITION_COUNT; i++) {
+        const modeActivationCondition_t *mac = modeActivationConditions(i);
+        // Skip unconfigured (all-zero) slots: modeId == 0 is BOXARM, so a
+        // fresh EEPROM's empty conditions would otherwise look like an arm
+        // switch on AUX1 at 900us.
+        if (isModeActivationConditionConfigured(mac, &emptyMac) && mac->modeId == BOXARM) {
+            if (auxChannel) *auxChannel = mac->auxChannelIndex;
+            if (startStep)  *startStep  = mac->range.startStep;
+            if (endStep)    *endStep    = mac->range.endStep;
+            return;
+        }
+    }
 }
 
 void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
