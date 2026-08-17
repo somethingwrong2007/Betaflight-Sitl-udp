@@ -408,6 +408,36 @@ uint32_t sitl_local_get_flight_modes(void)
     return gLocalRunning ? (uint32_t)flightModeFlags : 0;
 }
 
+// Display scaling for the Rates tab, mirroring the configurator exactly.
+// The profile stores rcRates/rcExpo/rates as uint8 in hundredths; how the
+// user-facing number is derived depends on the rate mode:
+//   RC Rate column:      RACEFLIGHT/ACTUAL -> stored/100*1000, else stored/100
+//   Super Rate / rate:   RACEFLIGHT -> stored/100*100,
+//                        ACTUAL/QUICK -> stored/100*1000, else stored/100
+//   Expo:                RACEFLIGHT -> stored/100*100, else stored/100
+static float sitlRateScaleFactor(uint8_t ratesType)
+{
+    return (ratesType == RATES_TYPE_RACEFLIGHT || ratesType == RATES_TYPE_ACTUAL) ? 1000.0f : 1.0f;
+}
+
+static float sitlRateRateScaleFactor(uint8_t ratesType)
+{
+    switch (ratesType) {
+    case RATES_TYPE_RACEFLIGHT:
+        return 100.0f;
+    case RATES_TYPE_ACTUAL:
+    case RATES_TYPE_QUICK:
+        return 1000.0f;
+    default:
+        return 1.0f;
+    }
+}
+
+static float sitlRateExpoScaleFactor(uint8_t ratesType)
+{
+    return (ratesType == RATES_TYPE_RACEFLIGHT) ? 100.0f : 1.0f;
+}
+
 void sitl_local_get_rate(int index, float *rcRate, float *rcExpo,
                          float *superRate, float *yawRate)
 {
@@ -424,10 +454,14 @@ void sitl_local_get_rate(int index, float *rcRate, float *rcExpo,
             ? controlRateProfiles(index)
             : currentControlRateProfile;
 
-    if (rcRate)    *rcRate    = profile->rcRates[FD_ROLL] / 100.0f;
-    if (rcExpo)    *rcExpo    = profile->rcExpo[FD_ROLL] / 100.0f;
-    if (superRate) *superRate = profile->rates[FD_ROLL] / 100.0f;
-    if (yawRate)   *yawRate   = profile->rcRates[FD_YAW] / 100.0f;
+    const float sf  = sitlRateScaleFactor(profile->rates_type);
+    const float rsf = sitlRateRateScaleFactor(profile->rates_type);
+    const float esf = sitlRateExpoScaleFactor(profile->rates_type);
+
+    if (rcRate)    *rcRate    = profile->rcRates[FD_ROLL] / 100.0f * sf;
+    if (rcExpo)    *rcExpo    = profile->rcExpo[FD_ROLL] / 100.0f * esf;
+    if (superRate) *superRate = profile->rates[FD_ROLL] / 100.0f * rsf;
+    if (yawRate)   *yawRate   = profile->rcRates[FD_YAW] / 100.0f * sf;
 }
 
 void sitl_local_set_rate(float rcRate, float rcExpo,
@@ -438,10 +472,19 @@ void sitl_local_set_rate(float rcRate, float rcExpo,
     }
 
     controlRateConfig_t *profile = currentControlRateProfile;
-    const uint8_t rcRate8   = (uint8_t)constrain(lrintf(rcRate * 100.0f), 0, 250);
-    const uint8_t expo8     = (uint8_t)constrain(lrintf(rcExpo * 100.0f), 0, 100);
-    const uint8_t super8    = (uint8_t)constrain(lrintf(superRate * 100.0f), 0, 100);
-    const uint8_t yawRate8  = (uint8_t)constrain(lrintf(yawRate * 100.0f), 0, 250);
+    const uint8_t mode = profile->rates_type;
+    const float sf  = sitlRateScaleFactor(mode);
+    const float rsf = sitlRateRateScaleFactor(mode);
+    const float esf = sitlRateExpoScaleFactor(mode);
+    const ratesSettingsLimits_t *limits = &ratesSettingLimits[mode];
+
+    // Inputs are in the same units the Rates tab displays for the current
+    // mode; convert back to the stored hundredths and clamp to the mode's
+    // limits (the same bounds the configurator applies).
+    const uint8_t rcRate8   = (uint8_t)constrain(lrintf(rcRate   / sf  * 100.0f), 0, limits->rc_rate_limit);
+    const uint8_t expo8     = (uint8_t)constrain(lrintf(rcExpo   / esf * 100.0f), 0, limits->expo_limit);
+    const uint8_t super8    = (uint8_t)constrain(lrintf(superRate/ rsf * 100.0f), 0, limits->srate_limit);
+    const uint8_t yawRate8  = (uint8_t)constrain(lrintf(yawRate  / sf  * 100.0f), 0, limits->rc_rate_limit);
 
     // Mirror MSP_SET_RC_TUNING: when roll and pitch were equal, keep them
     // symmetric; otherwise only roll is touched by the single rcRate/expo.
