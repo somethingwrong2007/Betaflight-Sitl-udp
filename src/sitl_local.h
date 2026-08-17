@@ -77,6 +77,9 @@ SITL_LOCAL_API uint64_t sitl_local_time_us(void);
 /** Bitmask of arming-disable reasons; same value as MSP_STATUS_EX. 0 = may arm. */
 SITL_LOCAL_API uint32_t sitl_local_get_arming_flags(void);
 
+/** True while arming is currently blocked by any arming-disable reason. */
+SITL_LOCAL_API bool sitl_local_is_arming_disabled(void);
+
 /** True when the FC is armed (same flag as the configurator's status icon). */
 SITL_LOCAL_API bool sitl_local_get_armed(void);
 
@@ -99,6 +102,20 @@ SITL_LOCAL_API void sitl_local_get_rate(int index, float *rcRate, float *rcExpo,
  */
 SITL_LOCAL_API void sitl_local_set_rate(float rcRate, float rcExpo,
                                         float superRate, float yawRate);
+
+/**
+ * Rate mode of the current profile (rates_type): 0 = BETAFLIGHT,
+ * 1 = RACEFLIGHT, 2 = KISS, 3 = ACTUAL, 4 = QUICK - the same values the
+ * configurator's Rates tab stores. Returns -1 before sitl_local_init().
+ */
+SITL_LOCAL_API int sitl_local_get_rate_mode(void);
+
+/**
+ * Set the rate mode of the current profile and persist it. Accepts the same
+ * values as get_rate_mode (0..RATES_TYPE_COUNT-1). Returns 0 on success,
+ * -1 for an invalid mode.
+ */
+SITL_LOCAL_API int sitl_local_set_rate_mode(int mode);
 
 /**
  * Locate the ARM switch in the mode-activation conditions. On success

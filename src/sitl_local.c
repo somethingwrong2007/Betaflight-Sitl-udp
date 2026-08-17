@@ -393,6 +393,11 @@ uint32_t sitl_local_get_arming_flags(void)
     return gLocalRunning ? (uint32_t)getArmingDisableFlags() : 0;
 }
 
+bool sitl_local_is_arming_disabled(void)
+{
+    return gLocalRunning && isArmingDisabled();
+}
+
 bool sitl_local_get_armed(void)
 {
     return gLocalRunning && ARMING_FLAG(ARMED);
@@ -455,6 +460,24 @@ void sitl_local_set_rate(float rcRate, float rcExpo,
     profile->rcRates[FD_YAW] = yawRate8;
 
     sitlLocalRequestEepromWrite();
+}
+
+int sitl_local_get_rate_mode(void)
+{
+    return gLocalRunning ? (int)currentControlRateProfile->rates_type : -1;
+}
+
+int sitl_local_set_rate_mode(int mode)
+{
+    if (!gLocalRunning) {
+        return -1;
+    }
+    if (mode < 0 || mode >= RATES_TYPE_COUNT) {
+        return -1;
+    }
+    currentControlRateProfile->rates_type = (uint8_t)mode;
+    sitlLocalRequestEepromWrite();
+    return 0;
 }
 
 void sitl_local_get_arm_switch(uint8_t *auxChannel, uint8_t *startStep,
