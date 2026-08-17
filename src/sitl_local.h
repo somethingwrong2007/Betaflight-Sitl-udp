@@ -88,20 +88,26 @@ SITL_LOCAL_API uint32_t sitl_local_get_flight_modes(void);
 
 /**
  * Read a rate profile. index in [0, CONTROL_RATE_PROFILE_COUNT) selects that
- * profile; any other value reads the current profile.
- * Units match the configurator's Rates tab: rcRate/yawRate in 0..2.5,
- * rcExpo/superRate in 0..1.0.
+ * profile; any other value reads the current profile. Each output is a
+ * 3-element array in axis order ROLL, PITCH, YAW (same columns as the
+ * configurator's Rates tab). Units always match the Rates tab for the current
+ * rate mode: rcRate is the RC Rate column, rcExpo the Expo column and
+ * superRate the Super Rate / max-velocity column (e.g. deg/s in ACTUAL mode).
+ * Any output pointer may be NULL to skip that group.
  */
-SITL_LOCAL_API void sitl_local_get_rate(int index, float *rcRate, float *rcExpo,
-                                        float *superRate, float *yawRate);
+SITL_LOCAL_API void sitl_local_get_rate(int index,
+                                        float rcRate[3], float rcExpo[3],
+                                        float superRate[3]);
 
 /**
- * Write the current rate profile (same fields as MSP_SET_RC_TUNING) and
- * persist it to the virtual EEPROM via the background thread. Roll/pitch
- * stay symmetric when they were equal, mirroring the MSP setter.
+ * Write the current rate profile per axis (arrays in ROLL, PITCH, YAW order,
+ * same display units as get_rate) and persist it to the virtual EEPROM via
+ * the background thread. Each pointer may be NULL to leave that axis group
+ * unchanged.
  */
-SITL_LOCAL_API void sitl_local_set_rate(float rcRate, float rcExpo,
-                                        float superRate, float yawRate);
+SITL_LOCAL_API void sitl_local_set_rate(const float rcRate[3],
+                                        const float rcExpo[3],
+                                        const float superRate[3]);
 
 /**
  * Rate mode of the current profile (rates_type): 0 = BETAFLIGHT,

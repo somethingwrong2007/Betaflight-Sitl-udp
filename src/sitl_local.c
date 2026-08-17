@@ -438,13 +438,12 @@ static float sitlRateExpoScaleFactor(uint8_t ratesType)
     return (ratesType == RATES_TYPE_RACEFLIGHT) ? 100.0f : 1.0f;
 }
 
-void sitl_local_get_rate(int index, float *rcRate, float *rcExpo,
-                         float *superRate, float *yawRate)
+void sitl_local_get_rate(int index, float rcRate[3], float rcExpo[3],
+                         float superRate[3])
 {
-    if (rcRate)    *rcRate    = 0.0f;
-    if (rcExpo)    *rcExpo    = 0.0f;
-    if (superRate) *superRate = 0.0f;
-    if (yawRate)   *yawRate   = 0.0f;
+    if (rcRate)    { rcRate[0] = rcRate[1] = rcRate[2] = 0.0f; }
+    if (rcExpo)    { rcExpo[0] = rcExpo[1] = rcExpo[2] = 0.0f; }
+    if (superRate) { superRate[0] = superRate[1] = superRate[2] = 0.0f; }
     if (!gLocalRunning) {
         return;
     }
@@ -458,14 +457,15 @@ void sitl_local_get_rate(int index, float *rcRate, float *rcExpo,
     const float rsf = sitlRateRateScaleFactor(profile->rates_type);
     const float esf = sitlRateExpoScaleFactor(profile->rates_type);
 
-    if (rcRate)    *rcRate    = profile->rcRates[FD_ROLL] / 100.0f * sf;
-    if (rcExpo)    *rcExpo    = profile->rcExpo[FD_ROLL] / 100.0f * esf;
-    if (superRate) *superRate = profile->rates[FD_ROLL] / 100.0f * rsf;
-    if (yawRate)   *yawRate   = profile->rcRates[FD_YAW] / 100.0f * sf;
+    for (int axis = 0; axis < 3; axis++) {
+        if (rcRate)    rcRate[axis]    = profile->rcRates[axis] / 100.0f * sf;
+        if (rcExpo)    rcExpo[axis]    = profile->rcExpo[axis] / 100.0f * esf;
+        if (superRate) superRate[axis] = profile->rates[axis] / 100.0f * rsf;
+    }
 }
 
-void sitl_local_set_rate(float rcRate, float rcExpo,
-                         float superRate, float yawRate)
+void sitl_local_set_rate(const float rcRate[3], const float rcExpo[3],
+                         const float superRate[3])
 {
     if (!gLocalRunning) {
         return;
@@ -481,26 +481,11 @@ void sitl_local_set_rate(float rcRate, float rcExpo,
     // Inputs are in the same units the Rates tab displays for the current
     // mode; convert back to the stored hundredths and clamp to the mode's
     // limits (the same bounds the configurator applies).
-    const uint8_t rcRate8   = (uint8_t)constrain(lrintf(rcRate   / sf  * 100.0f), 0, limits->rc_rate_limit);
-    const uint8_t expo8     = (uint8_t)constrain(lrintf(rcExpo   / esf * 100.0f), 0, limits->expo_limit);
-    const uint8_t super8    = (uint8_t)constrain(lrintf(superRate/ rsf * 100.0f), 0, limits->srate_limit);
-    const uint8_t yawRate8  = (uint8_t)constrain(lrintf(yawRate  / sf  * 100.0f), 0, limits->rc_rate_limit);
-
-    // Mirror MSP_SET_RC_TUNING: when roll and pitch were equal, keep them
-    // symmetric; otherwise only roll is touched by the single rcRate/expo.
-    if (profile->rcRates[FD_PITCH] == profile->rcRates[FD_ROLL]) {
-        profile->rcRates[FD_PITCH] = rcRate8;
+    for (int axis = 0; axis < 3; axis++) {
+        if (rcRate)    profile->rcRates[axis] = (uint8_t)constrain(lrintf(rcRate[axis]    / sf  * 100.0f), 0, limits->rc_rate_limit);
+        if (rcExpo)    profile->rcExpo[axis] = (uint8_t)constrain(lrintf(rcExpo[axis]    / esf * 100.0f), 0, limits->expo_limit);
+        if (superRate) profile->rates[axis] = (uint8_t)constrain(lrintf(superRate[axis] / rsf * 100.0f), 0, limits->srate_limit);
     }
-    profile->rcRates[FD_ROLL] = rcRate8;
-
-    if (profile->rcExpo[FD_PITCH] == profile->rcExpo[FD_ROLL]) {
-        profile->rcExpo[FD_PITCH] = expo8;
-    }
-    profile->rcExpo[FD_ROLL] = expo8;
-
-    profile->rates[FD_ROLL] = super8;
-    profile->rates[FD_PITCH] = super8;
-    profile->rcRates[FD_YAW] = yawRate8;
 
     sitlLocalRequestEepromWrite();
 }

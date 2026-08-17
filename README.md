@@ -256,8 +256,8 @@ handlers use, so both sides always agree:
 | `sitl_local_is_arming_disabled()` | `true` while any arming-disable reason is blocking arming |
 | `sitl_local_get_armed()` | `true` when armed |
 | `sitl_local_get_flight_modes()` | `flightModeFlags` bitmask (ANGLE/HORIZON/MAG/...) |
-| `sitl_local_get_rate(index, &rcRate, &rcExpo, &superRate, &yawRate)` | rate profile `index` (any out-of-range index = current profile); units always match the Rates tab for the current rate mode (RC Rate and Expo apply to roll+pitch, yawRate to yaw) |
-| `sitl_local_set_rate(rcRate, rcExpo, superRate, yawRate)` | writes the current profile in the same display units (converted per rate mode like the Rates tab, clamped to the mode's limits; roll/pitch kept symmetric when they were equal) and persists it via the background thread |
+| `sitl_local_get_rate(index, rcRate[3], rcExpo[3], superRate[3])` | rate profile `index` (any out-of-range index = current profile); each array is per-axis in ROLL, PITCH, YAW order and in the same display units as the Rates tab for the current rate mode; pass NULL to skip a group |
+| `sitl_local_set_rate(rcRate[3], rcExpo[3], superRate[3])` | writes the current profile per axis (same display units, converted and clamped per rate mode like the Rates tab) and persists it via the background thread; pass NULL to leave a group unchanged |
 | `sitl_local_get_rate_mode()` | rate mode of the current profile: 0 = BETAFLIGHT, 1 = RACEFLIGHT, 2 = KISS, 3 = ACTUAL, 4 = QUICK; -1 before init |
 | `sitl_local_set_rate_mode(mode)` | sets the rate mode (same values) and persists it; returns 0, or -1 for an invalid mode |
 | `sitl_local_get_arm_switch(&auxChannel, &startStep, &endStep)` | ARM mode condition: RC channel index (4 = AUX1) and the 25 us-step range; `auxChannel` is `0xFF` when no ARM switch is configured |
