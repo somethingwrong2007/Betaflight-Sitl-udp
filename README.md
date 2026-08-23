@@ -470,7 +470,11 @@ standard `.BFL` logs to the working directory:
 - Fresh EEPROMs default to `blackbox_device = VIRTUAL` (compile-time default).
 - Existing EEPROMs keep their saved value; set it once with
   `set blackbox_device = VIRTUAL` + `save`.
-- Logs are named `LOG00001.BFL`, `LOG00002.BFL`, ... (auto-incrementing).
+- Logs are named `LOG00001.BFL`, `LOG00002.BFL`, ... (auto-incrementing). In
+  the standalone build they land in the process working directory; in the
+  LOCAL DLL build they are redirected to the same stable folder as the
+  virtual EEPROM (`%LOCALAPPDATA%\Betaflight-SITL\LOG00001.BFL`), because the
+  host engine's working directory is not under your control.
 - `blackbox_mode = NORMAL` (default) records while armed; `ALWAYS` records
   from boot without arming; `MOTOR_TEST` records during motor tests.
 - `blackbox_sample_rate` selects 1/1, 1/2, 1/4, 1/8 or 1/16 of the PID rate
@@ -481,7 +485,8 @@ Workflow:
 1. Fly (or set `blackbox_mode = ALWAYS` for bench recordings).
 2. Disarm / stop - the log is flushed and closed.
 3. Open the Betaflight Configurator's Blackbox tab and load
-   `build-win-cmake\LOG00001.BFL` (or wherever the working directory is).
+   `build-win-cmake\LOG00001.BFL` (standalone), or
+   `%LOCALAPPDATA%\Betaflight-SITL\LOG00001.BFL` (LOCAL DLL).
 
 Recorded fields include loop iteration, gyro (filtered and unfiltered), PID
 terms (P/I/D/F per axis), RC commands, setpoints, battery, motors, and the

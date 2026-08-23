@@ -466,6 +466,12 @@ if(WIN32)
     # wincompat.c provides a no-op motorShutdown for LOCAL mode.
     set_source_files_properties("${BF_ROOT}/src/main/drivers/motor.c" PROPERTIES COMPILE_OPTIONS
       "-DmotorShutdown=sitlMotorShutdownReal")
+    # The virtual blackbox writes LOG*.BFL into the process working directory,
+    # which for a DLL is the host engine's unpredictable CWD. Redirect the file
+    # open and the log-numbering directory scan to the stable
+    # %LOCALAPPDATA%\Betaflight-SITL folder (same as the virtual EEPROM).
+    set_source_files_properties("${BF_ROOT}/src/main/blackbox/blackbox_virtual.c" PROPERTIES COMPILE_OPTIONS
+      "-Dfopen=sitlBlackboxFopen;-Dopendir=sitlBlackboxOpendir")
   else()
     set_source_files_properties("${BF_ROOT}/src/main/msp/msp.c" PROPERTIES COMPILE_OPTIONS
       "-DsystemReset=sitlSystemReset")

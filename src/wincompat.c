@@ -18,6 +18,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <pthread.h>
+#include <dirent.h>
 
 #include "common/time.h"
 #include "sensors/voltage.h"
@@ -159,6 +160,42 @@ bool isDshotTelemetryActive(void)
 // A no-op keeps the virtual motor output alive across configurator reboots.
 void motorShutdown(void)
 {
+}
+
+// The virtual blackbox writes LOG*.BFL and scans for the next log number in
+// the process working directory. Inside a DLL that is the host engine's CWD,
+// which is unpredictable, so redirect both to the same stable folder as the
+// virtual EEPROM (%LOCALAPPDATA%\Betaflight-SITL). Falls back to the CWD when
+// LOCALAPPDATA is unavailable.
+static const char *sitlBlackboxDir(char *buf, size_t size)
+{
+    if (GetEnvironmentVariableA("LOCALAPPDATA", buf, (DWORD)size) > 0) {
+        _snprintf(buf + strlen(buf), size - strlen(buf), "\\Betaflight-SITL");
+        CreateDirectoryA(buf, NULL);
+        return buf;
+    }
+    return NULL;
+}
+
+FILE *sitlBlackboxFopen(const char *filename, const char *mode)
+{
+    char dir[MAX_PATH];
+    if (sitlBlackboxDir(dir, sizeof(dir)) != NULL) {
+        char path[MAX_PATH];
+        _snprintf(path, sizeof(path), "%s\\%s", dir, filename);
+        return fopen(path, mode);
+    }
+    return fopen(filename, mode);
+}
+
+DIR *sitlBlackboxOpendir(const char *path)
+{
+    (void)path;
+    char dir[MAX_PATH];
+    if (sitlBlackboxDir(dir, sizeof(dir)) != NULL) {
+        return opendir(dir);
+    }
+    return opendir(".");
 }
 
 // sitl.c's systemResetToBootloader() calls exit(0), which would terminate the
