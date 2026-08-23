@@ -518,6 +518,13 @@ identification / auto-tuning from blackbox logs:
    active axis, instantaneous frequency, raw excitation) for the analysis
    tool.
 
+Note for the LOCAL DLL build: the firmware only copies `debug_mode` into the
+runtime global at boot, and the LOCAL "reboot" does not re-run the boot
+sequence. The DLL re-syncs `debug_mode` on every config save / reboot, so a
+`set debug_mode = CHIRP` + `save` takes effect for blackbox recording even
+without reloading the DLL (a fresh DLL load also picks it up from the
+EEPROM).
+
 ## Environment variables
 
 | Variable | Purpose |

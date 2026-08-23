@@ -15,6 +15,8 @@
 #include "drivers/serial.h"
 #include "drivers/system.h"
 #include "sitl_local.h"
+#include "config/config.h"
+#include "build/debug.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -61,6 +63,18 @@ void sitlAuditLog(const char *fmt, ...)
     fclose(log);
 }
 
+// The firmware only syncs the debugMode global from systemConfig()->debug_mode
+// at boot (fc/init.c). Real hardware re-runs init on every reboot, but the
+// LOCAL reboot keeps the process alive, so a debug_mode change (e.g. CHIRP for
+// blackbox auto-tuning) would never reach the blackbox/DEBUG_SET path. Re-sync
+// whenever a config write or reboot happens. No-op outside LOCAL mode.
+void sitlLocalSyncDebugMode(void)
+{
+#ifdef SITL_LOCAL
+    debugMode = systemConfig()->debug_mode;
+#endif
+}
+
 // msp.c's writeEEPROM() calls are renamed to this in LOCAL mode so a save
 // attempt is visible in the audit log (including whether the FC was armed,
 // which makes MSP_EEPROM_WRITE get rejected before writeEEPROM is reached).
@@ -68,6 +82,7 @@ void sitlMspWriteEEPROM(void)
 {
     sitlAuditLog("MSP writeEEPROM reached (armed=%u)", (unsigned)(ARMING_FLAG(ARMED) != 0));
     writeEEPROM();
+    sitlLocalSyncDebugMode();
 }
 
 #ifdef SITL_LOCAL
@@ -243,6 +258,7 @@ void systemResetToBootloader(bootloaderRequestType_e requestType)
     UNUSED(requestType);
     writeEEPROM();
     unsetArmingDisabled(ARMING_DISABLED_CLI);
+    sitlLocalSyncDebugMode();
     sitlLocalRebootJump();
 }
 
@@ -346,6 +362,7 @@ void sitlSystemReset(void)
     // reboot handler runs, so the next MSP request is processed normally.
     blackboxFinish();
     unsetArmingDisabled(ARMING_DISABLED_CLI);
+    sitlLocalSyncDebugMode();
     sitlLocalRebootJump();
 #else
     systemReset();
@@ -422,6 +439,7 @@ void systemReset(void)
     // FCs clear it on reboot, which LOCAL mode does not do). Clear it so the
     // craft can arm again after the CLI panel is closed.
     unsetArmingDisabled(ARMING_DISABLED_CLI);
+    sitlLocalSyncDebugMode();
 #else
     sitlRelaunchSelf();
     sitlSystemResetNative();
