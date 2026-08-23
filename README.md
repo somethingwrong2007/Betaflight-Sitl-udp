@@ -518,12 +518,17 @@ identification / auto-tuning from blackbox logs:
    active axis, instantaneous frequency, raw excitation) for the analysis
    tool.
 
-Note for the LOCAL DLL build: the firmware only copies `debug_mode` into the
-runtime global at boot, and the LOCAL "reboot" does not re-run the boot
-sequence. The DLL re-syncs `debug_mode` on every config save / reboot, so a
-`set debug_mode = CHIRP` + `save` takes effect for blackbox recording even
-without reloading the DLL (a fresh DLL load also picks it up from the
-EEPROM).
+Note for the LOCAL DLL build: the firmware applies several settings (debug
+mode, gyro/dterm filters) only at boot, and the LOCAL "reboot" does not re-run
+the boot sequence. The DLL re-applies this boot-time config on every config
+save / reboot: `debug_mode` is re-synced (so `set debug_mode = CHIRP` +
+`save` works for blackbox recording without reloading the DLL) and the
+gyro/dterm filter chains are rebuilt from the saved settings (Filter tab).
+Filter re-init is skipped while armed so it never races the flight loop; a
+later save/reboot while disarmed applies it. Settings that still need a full
+host-session restart are the hardware-class ones (sensor selection, motor
+protocol/rate, serial port roles) - changing those is not expected in the
+sim workflow.
 
 ## Environment variables
 

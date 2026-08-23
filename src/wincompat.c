@@ -17,6 +17,9 @@
 #include "sitl_local.h"
 #include "config/config.h"
 #include "build/debug.h"
+#include "flight/pid.h"
+#include "flight/pid_init.h"
+#include "sensors/gyro_init.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -72,6 +75,23 @@ void sitlLocalSyncDebugMode(void)
 {
 #ifdef SITL_LOCAL
     debugMode = systemConfig()->debug_mode;
+#endif
+}
+
+// Real firmware re-runs init on every reboot, which applies boot-time config
+// (filters, debug mode, ...) to runtime state. The LOCAL reboot keeps the
+// process alive, so re-apply the same config here: the gyro/dterm filter
+// chains are rebuilt from the saved settings (Filter tab) and debugMode is
+// re-synced (CHIRP blackbox). Filter re-init is skipped while armed so it
+// never races the flight loop; a later save/reboot while disarmed applies it.
+void sitlLocalReapplyBootConfig(void)
+{
+#ifdef SITL_LOCAL
+    sitlLocalSyncDebugMode();
+    if (!ARMING_FLAG(ARMED)) {
+        gyroInitFilters();
+        pidInit(currentPidProfile);
+    }
 #endif
 }
 
@@ -258,7 +278,7 @@ void systemResetToBootloader(bootloaderRequestType_e requestType)
     UNUSED(requestType);
     writeEEPROM();
     unsetArmingDisabled(ARMING_DISABLED_CLI);
-    sitlLocalSyncDebugMode();
+    sitlLocalReapplyBootConfig();
     sitlLocalRebootJump();
 }
 
@@ -362,7 +382,7 @@ void sitlSystemReset(void)
     // reboot handler runs, so the next MSP request is processed normally.
     blackboxFinish();
     unsetArmingDisabled(ARMING_DISABLED_CLI);
-    sitlLocalSyncDebugMode();
+    sitlLocalReapplyBootConfig();
     sitlLocalRebootJump();
 #else
     systemReset();
@@ -439,7 +459,7 @@ void systemReset(void)
     // FCs clear it on reboot, which LOCAL mode does not do). Clear it so the
     // craft can arm again after the CLI panel is closed.
     unsetArmingDisabled(ARMING_DISABLED_CLI);
-    sitlLocalSyncDebugMode();
+    sitlLocalReapplyBootConfig();
 #else
     sitlRelaunchSelf();
     sitlSystemResetNative();
