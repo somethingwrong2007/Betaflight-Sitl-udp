@@ -261,6 +261,7 @@ handlers use, so both sides always agree:
 | `sitl_local_get_rate_mode()` | rate mode of the current profile: 0 = BETAFLIGHT, 1 = RACEFLIGHT, 2 = KISS, 3 = ACTUAL, 4 = QUICK; -1 before init |
 | `sitl_local_set_rate_mode(mode)` | sets the rate mode (same values) and persists it; returns 0, or -1 for an invalid mode |
 | `sitl_local_get_arm_switch(&auxChannel, &startStep, &endStep)` | ARM mode condition: RC channel index (4 = AUX1) and the 25 us-step range; `auxChannel` is `0xFF` when no ARM switch is configured |
+| `sitl_local_set_blackbox_dir(path)` | redirect the blackbox log folder (e.g. one folder per aircraft); creates the directory and re-scans for correct log numbering; returns 0, or -1 for a NULL/empty/too-long path |
 
 All accessors are plain memory reads (safe from the UE tick); the only
 write, `sitl_local_set_rate()`, writes the RAM profile immediately and defers
@@ -474,7 +475,11 @@ standard `.BFL` logs to the working directory:
   the standalone build they land in the process working directory; in the
   LOCAL DLL build they are redirected to the same stable folder as the
   virtual EEPROM (`%LOCALAPPDATA%\Betaflight-SITL\LOG00001.BFL`), because the
-  host engine's working directory is not under your control.
+  host engine's working directory is not under your control. The host can
+  override the folder at runtime per aircraft with
+  `sitl_local_set_blackbox_dir("E:\\MySim\\Aircraft1")` - the directory is
+  created if missing and the log numbering is re-scanned, so existing logs in
+  that folder are never overwritten (call it before arming / logging starts).
 - `blackbox_mode = NORMAL` (default) records while armed; `ALWAYS` records
   from boot without arming; `MOTOR_TEST` records during motor tests.
 - `blackbox_sample_rate` selects 1/1, 1/2, 1/4, 1/8 or 1/16 of the PID rate

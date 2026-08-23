@@ -14,6 +14,7 @@
 #include "drivers/io.h"
 #include "drivers/serial.h"
 #include "drivers/system.h"
+#include "sitl_local.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -164,11 +165,21 @@ void motorShutdown(void)
 
 // The virtual blackbox writes LOG*.BFL and scans for the next log number in
 // the process working directory. Inside a DLL that is the host engine's CWD,
-// which is unpredictable, so redirect both to the same stable folder as the
-// virtual EEPROM (%LOCALAPPDATA%\Betaflight-SITL). Falls back to the CWD when
-// LOCALAPPDATA is unavailable.
+// which is unpredictable, so redirect both to a stable folder: the default is
+// the same %LOCALAPPDATA%\Betaflight-SITL as the virtual EEPROM, and the host
+// can override it per aircraft at runtime with sitl_local_set_blackbox_dir().
+static char gBlackboxDir[MAX_PATH] = "";
+
 static const char *sitlBlackboxDir(char *buf, size_t size)
 {
+    if (gBlackboxDir[0] != '\0') {
+        if (strlen(gBlackboxDir) + 1 > size) {
+            return NULL;
+        }
+        memcpy(buf, gBlackboxDir, strlen(gBlackboxDir) + 1);
+        CreateDirectoryA(buf, NULL);
+        return buf;
+    }
     if (GetEnvironmentVariableA("LOCALAPPDATA", buf, (DWORD)size) > 0) {
         _snprintf(buf + strlen(buf), size - strlen(buf), "\\Betaflight-SITL");
         CreateDirectoryA(buf, NULL);
@@ -196,6 +207,30 @@ DIR *sitlBlackboxOpendir(const char *path)
         return opendir(dir);
     }
     return opendir(".");
+}
+
+// blackbox_virtual.c's blackboxVirtualOpen() is renamed to
+// sitlBlackboxVirtualOpenReal() in LOCAL builds; this forwarding version keeps
+// the boot-time behavior (scan the current blackbox directory for the largest
+// log number) and lets sitl_local_set_blackbox_dir() re-run the scan after a
+// directory change so per-folder numbering never overwrites existing logs.
+extern bool sitlBlackboxVirtualOpenReal(void);
+
+bool blackboxVirtualOpen(void)
+{
+    return sitlBlackboxVirtualOpenReal();
+}
+
+int sitl_local_set_blackbox_dir(const char *path)
+{
+    if (path == NULL || path[0] == '\0' || strlen(path) >= MAX_PATH) {
+        return -1;
+    }
+    strncpy(gBlackboxDir, path, sizeof(gBlackboxDir) - 1);
+    gBlackboxDir[sizeof(gBlackboxDir) - 1] = '\0';
+    CreateDirectoryA(gBlackboxDir, NULL);
+    blackboxVirtualOpen(); // re-scan for correct numbering in the new folder
+    return 0;
 }
 
 // sitl.c's systemResetToBootloader() calls exit(0), which would terminate the

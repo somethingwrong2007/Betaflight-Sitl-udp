@@ -133,6 +133,16 @@ SITL_LOCAL_API void sitl_local_get_arm_switch(uint8_t *auxChannel,
                                               uint8_t *startStep,
                                               uint8_t *endStep);
 
+/**
+ * Redirect the blackbox log directory at runtime (e.g. one folder per
+ * aircraft in UE). The directory is created if missing, and the log-number
+ * scan is re-run for that folder so LOG00001.BFL numbering is correct and
+ * existing logs are never overwritten. Returns 0 on success, -1 for a NULL,
+ * empty or too-long path. Call it before arming / logging starts; a log that
+ * is already in progress keeps writing to its original file.
+ */
+SITL_LOCAL_API int sitl_local_set_blackbox_dir(const char *path);
+
 /** Stop the background MSP thread. Does not exit the host process. */
 SITL_LOCAL_API void sitl_local_shutdown(void);
 

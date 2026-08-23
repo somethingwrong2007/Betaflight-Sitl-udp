@@ -471,7 +471,7 @@ if(WIN32)
     # open and the log-numbering directory scan to the stable
     # %LOCALAPPDATA%\Betaflight-SITL folder (same as the virtual EEPROM).
     set_source_files_properties("${BF_ROOT}/src/main/blackbox/blackbox_virtual.c" PROPERTIES COMPILE_OPTIONS
-      "-Dfopen=sitlBlackboxFopen;-Dopendir=sitlBlackboxOpendir")
+      "-Dfopen=sitlBlackboxFopen;-Dopendir=sitlBlackboxOpendir;-DblackboxVirtualOpen=sitlBlackboxVirtualOpenReal")
   else()
     set_source_files_properties("${BF_ROOT}/src/main/msp/msp.c" PROPERTIES COMPILE_OPTIONS
       "-DsystemReset=sitlSystemReset")
