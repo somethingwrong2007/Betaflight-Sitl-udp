@@ -35,6 +35,8 @@
 #include "fc/controlrate_profile.h"
 #include "flight/imu.h"
 #include "fc/rc_modes.h"
+#include "flight/mixer.h"
+#include "flight/servos.h"
 #include "sitl_gyro.h"
 #include "fc/runtime_config.h"
 #include "config/feature.h"
@@ -534,6 +536,37 @@ void sitl_local_get_arm_switch(uint8_t *auxChannel, uint8_t *startStep,
     }
 }
 
+// Number of servo outputs the current mixer writes, mirroring writeServos()
+// in servos.c (without the channel-forwarding extras). 0 for multicopters.
+static uint8_t sitlLocalServoCount(void)
+{
+    switch (getMixerMode()) {
+    case MIXER_TRI:
+    case MIXER_CUSTOM_TRI:
+        return 1;
+    case MIXER_FLYING_WING:
+        return 2;
+    case MIXER_CUSTOM_AIRPLANE:
+    case MIXER_AIRPLANE:
+        return SERVO_PLANE_INDEX_MAX - SERVO_PLANE_INDEX_MIN + 1; // 6
+#ifdef USE_UNCOMMON_MIXERS
+    case MIXER_BICOPTER:
+    case MIXER_DUALCOPTER:
+        return 2;
+    case MIXER_HELI_120_CCPM:
+        return 4;
+    case MIXER_SINGLECOPTER:
+        return 4;
+#endif
+    default:
+        break;
+    }
+    if (featureIsEnabled(FEATURE_SERVO_TILT) || getMixerMode() == MIXER_GIMBAL) {
+        return 2;
+    }
+    return 0;
+}
+
 void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
                      sitl_local_output_t *out)
 {
@@ -542,6 +575,23 @@ void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
     }
     if (!gLocalRunning || !in) {
         return;
+    }
+
+    // A reboot requested a boot-config re-apply (mixer change, filters, ...).
+    // Run it here, on the same thread as the scheduler and between steps, so
+    // it cannot race the flight loop. Skip while armed and retry on a later
+    // step so a save/reboot never yanks the mixer out from under a flying
+    // craft.
+    extern bool sitlLocalReapplyPending(void);
+    extern void sitlLocalRunBootReapply(void);
+    if (sitlLocalReapplyPending()) {
+        if (!ARMING_FLAG(ARMED)) {
+            sitlLocalRunBootReapply();
+        } else {
+            // Leave the request pending; the next step while disarmed applies it.
+            extern void sitlLocalRestoreReapplyPending(void);
+            sitlLocalRestoreReapplyPending();
+        }
     }
 
     // --- virtual gyro (Gazebo bridge axis mapping) ---
@@ -679,6 +729,10 @@ void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
             out->motor_count = raw.motorCount;
             for (int i = 0; i < raw.motorCount && i < SITL_LOCAL_MAX_MOTORS; i++) {
                 out->pwm_output_raw[i] = raw.pwm_output_raw[i];
+            }
+            out->servo_count = sitlLocalServoCount();
+            for (int i = 0; i < out->servo_count && i < SITL_LOCAL_MAX_SERVOS; i++) {
+                out->servo_output_raw[i] = raw.pwm_output_raw[raw.motorCount + i];
             }
         }
         out->armed = (armingFlags & ARMED) != 0;

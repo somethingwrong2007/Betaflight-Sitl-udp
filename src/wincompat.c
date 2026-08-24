@@ -17,8 +17,12 @@
 #include "sitl_local.h"
 #include "config/config.h"
 #include "build/debug.h"
+#include "drivers/motor.h"
+#include "drivers/servo_impl.h"
 #include "flight/pid.h"
 #include "flight/pid_init.h"
+#include "flight/mixer.h"
+#include "flight/servos.h"
 #include "sensors/gyro_init.h"
 
 #ifdef _WIN32
@@ -79,19 +83,62 @@ void sitlLocalSyncDebugMode(void)
 }
 
 // Real firmware re-runs init on every reboot, which applies boot-time config
-// (filters, debug mode, ...) to runtime state. The LOCAL reboot keeps the
-// process alive, so re-apply the same config here: the gyro/dterm filter
-// chains are rebuilt from the saved settings (Filter tab) and debugMode is
-// re-synced (CHIRP blackbox). Filter re-init is skipped while armed so it
-// never races the flight loop; a later save/reboot while disarmed applies it.
+// (filters, mixer, debug mode, ...) to runtime state. The LOCAL reboot keeps
+// the process alive, so this requests a re-apply: debugMode is re-synced
+// immediately (a trivial global write, safe from the MSP thread), and the
+// heavier filter/mixer/motor/servo re-init is deferred to the next
+// sitl_local_step() call - it runs on the same thread as the scheduler,
+// between steps, so it can never race the flight loop (running it on the MSP
+// thread while the UE thread steps crashes the host).
+static volatile LONG gLocalReapplyPending = 0;
+
 void sitlLocalReapplyBootConfig(void)
 {
 #ifdef SITL_LOCAL
     sitlLocalSyncDebugMode();
-    if (!ARMING_FLAG(ARMED)) {
-        gyroInitFilters();
-        pidInit(currentPidProfile);
+    InterlockedExchange(&gLocalReapplyPending, 1);
+#endif
+}
+
+// Consumed by sitl_local_step() on the UE thread.
+bool sitlLocalReapplyPending(void)
+{
+#ifdef SITL_LOCAL
+    return InterlockedCompareExchange(&gLocalReapplyPending, 0, 1) != 0;
+#else
+    return false;
+#endif
+}
+
+// sitl_local_step() consumed the request while armed; put it back so the
+// re-apply runs on the next step after disarming.
+void sitlLocalRestoreReapplyPending(void)
+{
+#ifdef SITL_LOCAL
+    InterlockedExchange(&gLocalReapplyPending, 1);
+#endif
+}
+
+void sitlLocalRunBootReapply(void)
+{
+#ifdef SITL_LOCAL
+    gyroInitFilters();
+    pidInit(currentPidProfile);
+    // Mixer / motor / servo config: re-applies the mixer mode (motor count,
+    // fixed-wing surfaces) from the saved setting. motorDevInit leaves the
+    // device disabled, so re-enable it like initPhase3 does.
+    mixerInit(mixerConfig()->mixerMode);
+    motorDevInit(getMotorCount());
+#ifdef USE_SERVOS
+    servosInit();
+    if (isMixerUsingServos()) {
+        servoDevInit(&servoConfig()->dev);
     }
+    servosFilterInit();
+#endif
+    motorPostInit();
+    motorEnable();
+    sitlLocalSyncDebugMode();
 #endif
 }
 

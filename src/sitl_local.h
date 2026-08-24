@@ -25,6 +25,7 @@
 
 #define SITL_LOCAL_MAX_RC_CHANNELS 16
 #define SITL_LOCAL_MAX_MOTORS      16
+#define SITL_LOCAL_MAX_SERVOS      8
 
 typedef struct {
     double timestamp;                   // seconds, monotonic (logging only)
@@ -44,6 +45,10 @@ typedef struct {
     uint8_t motor_count;
     float pwm_output_raw[SITL_LOCAL_MAX_MOTORS]; // 1000..2000 (raw PWM)
     bool armed;
+    // Fixed-wing / unusual mixers also produce servo outputs (after the
+    // motors in the raw PWM stream). servo_count is 0 for multicopters.
+    uint8_t servo_count;
+    float servo_output_raw[SITL_LOCAL_MAX_SERVOS]; // 1000..2000 (raw PWM)
 } sitl_local_output_t;
 
 #ifdef __cplusplus

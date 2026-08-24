@@ -224,6 +224,7 @@ while (physicsTick) {
     sitl_local_output_t out;
     sitl_local_step(&in, 1000, &out);               // 1000 = 1 ms virtual step
     // out.pwm_output_raw[0..motor_count-1] are the motor PWM values (1000..2000)
+    // out.servo_output_raw[0..servo_count-1] are fixed-wing surface PWM values
 }
 ```
 
@@ -242,6 +243,16 @@ instead of a 1 kHz duplicate-frame flood (which inflated setpoint-speed
 impulses on stick snaps). `sitl_local_init()` also forces the UDP RX provider
 and the ADC battery/current meters so RC and voltage work regardless of the
 EEPROM configuration.
+
+**Mixer type / motor count.** The mixer mode drives the output configuration:
+`motor_count` and `servo_count` in `sitl_local_output_t` follow the current
+mixer (QUADX = 4 motors, AIRPLANE/FLYING_WING = 1 motor + 6/2 servos, HEX6 =
+6 motors, ...). Change it from the configurator (or CLI `mixer <name>`) and
+`save`/reboot: the DLL re-applies the mixer, motor and servo setup on the
+next `sitl_local_step` (on the host thread, between steps, so it never races
+the flight loop). Fixed-wing is fully compiled in (`USE_SERVOS`,
+`USE_UNCOMMON_MIXERS`), and `servo_output_raw[]` carries the surface PWM
+after the motors.
 
 ### Synchronous state access (no serial traffic)
 
