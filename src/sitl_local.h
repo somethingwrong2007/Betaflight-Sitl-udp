@@ -139,6 +139,18 @@ SITL_LOCAL_API void sitl_local_get_arm_switch(uint8_t *auxChannel,
                                               uint8_t *endStep);
 
 /**
+ * Bind BOXARM to an aux channel and 25 us-step range and persist it (same
+ * semantics as the configurator's MSP_SET_MODE_RANGE). auxChannel follows the
+ * get_arm_switch convention (the raw auxChannelIndex stored in the condition,
+ * e.g. the value GetSitlArmSwitch returns); 0xFF clears the ARM condition.
+ * Returns 0 on success, -1 when not initialized, on invalid parameters, or
+ * when no mode-condition slot is free.
+ */
+SITL_LOCAL_API int sitl_local_set_arm_switch(uint8_t auxChannel,
+                                             uint8_t startStep,
+                                             uint8_t endStep);
+
+/**
  * Redirect the blackbox log directory at runtime (e.g. one folder per
  * aircraft in UE). The directory is created if missing, and the log-number
  * scan is re-run for that folder so LOG00001.BFL numbering is correct and

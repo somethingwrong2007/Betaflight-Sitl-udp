@@ -33,6 +33,7 @@
 #include "drivers/dshot.h"
 #include "io/gps_virtual.h"
 #include "fc/controlrate_profile.h"
+#include "fc/rc_controls.h"
 #include "flight/imu.h"
 #include "fc/rc_modes.h"
 #include "flight/mixer.h"
@@ -534,6 +535,53 @@ void sitl_local_get_arm_switch(uint8_t *auxChannel, uint8_t *startStep,
             return;
         }
     }
+}
+
+int sitl_local_set_arm_switch(uint8_t auxChannel, uint8_t startStep,
+                              uint8_t endStep)
+{
+    if (!gLocalRunning) {
+        return -1;
+    }
+    if (auxChannel != 0xFF && auxChannel >= SITL_LOCAL_MAX_RC_CHANNELS) {
+        return -1;
+    }
+    if (startStep > MAX_MODE_RANGE_STEP || endStep > MAX_MODE_RANGE_STEP
+        || startStep > endStep) {
+        return -1;
+    }
+
+    // Clear every existing BOXARM condition (frees a slot at the tail).
+    removeModeActivationCondition(BOXARM);
+
+    if (auxChannel != 0xFF) {
+        // Reuse the first all-zero slot.
+        int slot = -1;
+        modeActivationCondition_t emptyMac;
+        memset(&emptyMac, 0, sizeof(emptyMac));
+        for (int i = 0; i < MAX_MODE_ACTIVATION_CONDITION_COUNT; i++) {
+            if (!isModeActivationConditionConfigured(modeActivationConditions(i), &emptyMac)) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot < 0) {
+            return -1; // all 20 slots used
+        }
+
+        modeActivationCondition_t *mac = modeActivationConditionsMutable(slot);
+        memset(mac, 0, sizeof(*mac));
+        mac->modeId = BOXARM;
+        mac->auxChannelIndex = auxChannel;
+        mac->range.startStep = startStep;
+        mac->range.endStep = endStep;
+    }
+
+    // Same refresh as MSP_SET_MODE_RANGE: rebuild the active-condition list
+    // and update stick-vs-switch arming, then persist on the background thread.
+    rcControlsInit();
+    sitlLocalRequestEepromWrite();
+    return 0;
 }
 
 // Number of servo outputs the current mixer writes, mirroring writeServos()

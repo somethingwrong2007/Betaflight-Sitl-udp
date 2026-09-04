@@ -272,6 +272,7 @@ handlers use, so both sides always agree:
 | `sitl_local_get_rate_mode()` | rate mode of the current profile: 0 = BETAFLIGHT, 1 = RACEFLIGHT, 2 = KISS, 3 = ACTUAL, 4 = QUICK; -1 before init |
 | `sitl_local_set_rate_mode(mode)` | sets the rate mode (same values) and persists it; returns 0, or -1 for an invalid mode |
 | `sitl_local_get_arm_switch(&auxChannel, &startStep, &endStep)` | ARM mode condition: RC channel index (4 = AUX1) and the 25 us-step range; `auxChannel` is `0xFF` when no ARM switch is configured |
+| `sitl_local_set_arm_switch(auxChannel, startStep, endStep)` | bind BOXARM to an aux channel + 25 us-step range and persist it (same semantics as MSP_SET_MODE_RANGE); `auxChannel = 0xFF` clears the ARM condition; returns 0, or -1 for invalid parameters / no free slot |
 | `sitl_local_set_blackbox_dir(path)` | redirect the blackbox log folder (e.g. one folder per aircraft); creates the directory and re-scans for correct log numbering; returns 0, or -1 for a NULL/empty/too-long path |
 
 All accessors are plain memory reads (safe from the UE tick); the only
