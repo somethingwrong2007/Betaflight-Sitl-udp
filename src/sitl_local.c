@@ -39,6 +39,8 @@
 #include "flight/mixer.h"
 #include "flight/servos.h"
 #include "sitl_gyro.h"
+#include "config/config.h"
+#include "config/config_streamer_impl.h"
 #include "fc/runtime_config.h"
 #include "config/feature.h"
 #include "msp/msp.h"
@@ -197,6 +199,53 @@ void sitlLocalPreMotorInit(void)
     motorConfigMutable()->dev.motorProtocol = MOTOR_PROTOCOL_PWM;
 }
 
+// The LOCAL link owns a few settings that the stock firmware would take from
+// the EEPROM: the virtual UDP receiver, the ADC battery shims that read
+// sitl_local_step() telemetry and the virtual PWM motor backend. sitl.c's boot
+// path applies them once (sitl_local_init + main_windows.c's
+// sitlLocalPreMotorInit call); a runtime config reload replaces every PG
+// record, so they must be re-applied afterwards or the FC would start running
+// the stored hardware settings (e.g. DSHOT600, whose device init is a stub in
+// this build, so the motors would stop).
+static void localApplyLinkOverrides(void)
+{
+    // Simulated motor RPM participates in the firmware (RPM filter, motor
+    // telemetry, OSD/MSP): mark DSHOT telemetry as active so the RPM filter
+    // and telemetry consumers use the bridged values from the wrappers.
+    useDshotTelemetry = true;
+
+    // The FC blocks arming for powerOnArmingGraceTime seconds after every
+    // boot; a reload must not re-block a session that is already running.
+    unsetArmingDisabled(ARMING_DISABLED_BOOT_GRACE_TIME);
+
+    // Sensor input arrives via sitl_local_step(), not a serial receiver.
+    featureEnableImmediate(FEATURE_RX_UDP);
+
+    // Seed the UDP provider's channel count before rxInit() snapshots it into
+    // rx.c's file-static rxChannelCount. After the takeover below the frame
+    // status callback no longer updates rxChannelCount (frameStatusUdp does),
+    // and readRxChannelsApplyRanges()/detectAndApplySignalLossBehaviour()
+    // loop over rxChannelCount - if it stays 0 no channel is ever read.
+    uint16_t initRc[SITL_LOCAL_MAX_RC_CHANNELS];
+    for (int i = 0; i < SITL_LOCAL_MAX_RC_CHANNELS; i++) {
+        initRc[i] = 1000;
+    }
+    rxUpdateUdpChannels(initRc, SITL_LOCAL_MAX_RC_CHANNELS);
+    rxInit();
+
+    // Take over the RC provider functions with the cache semantics above.
+    rxRuntimeState.rcReadRawFn = localRcReadRaw;
+    rxRuntimeState.rcFrameStatusFn = localRcFrameStatus;
+    rxRuntimeState.channelCount = SITL_LOCAL_MAX_RC_CHANNELS;
+
+    // Voltage/current arrive as telemetry, not from a real ADC input.
+    batteryConfigMutable()->voltageMeterSource = VOLTAGE_METER_ADC;
+    batteryConfigMutable()->currentMeterSource = CURRENT_METER_ADC;
+
+    // Pin the virtual PWM backend before the next motorDevInit().
+    sitlLocalPreMotorInit();
+}
+
 // systemReset() defers the EEPROM persist here so it never runs on the UE
 // thread (the scheduler may execute systemReset via TASK_SERIAL while the
 // configurator exits the CLI panel). The background thread picks it up.
@@ -215,6 +264,122 @@ static volatile LONG gLocalPendingEepromWrite = 0;
 void sitlLocalRequestEepromWrite(void)
 {
     InterlockedExchange(&gLocalPendingEepromWrite, 1);
+}
+
+// --- virtual EEPROM path / runtime config reload ---
+// The requested work is deferred to sitl_local_step() (host thread, between
+// steps) because reading a config rewrites every PG record the flight loop
+// reads, and re-initialising the mixer/motor/servo state from another thread
+// crashes the host. Deferring the path switch as well keeps the "persist the
+// aircraft being left" write ahead of the environment change, which is what
+// makes it target the old file (and what makes a brand-new path detectable).
+static volatile LONG gLocalReloadPending = 0;
+static volatile LONG gLocalPathPending = 0;
+static char gLocalPendingEepromPath[1024];
+
+extern void ensureEepromDirectory(void);
+extern bool sitlEepromFileIsOpen(void);
+
+// Persist the current RAM config and close the virtual EEPROM file. The write
+// goes to the file the open handle points at (or, when the handle is closed,
+// to BF_SITL_EEPROM as it is set right now), i.e. always to the aircraft being
+// left. Closing matters because loadEEPROMFromFile() refuses to open a file
+// while a handle is open, and configs are only written when the streamer sees
+// a change - so the handle opened at boot can still be around.
+static void localFlushEepromWrite(void)
+{
+    InterlockedExchange(&gLocalPendingEepromWrite, 0);
+    writeEEPROM();
+    if (sitlEepromFileIsOpen()) {
+        configLock();
+    }
+}
+
+int sitl_local_set_eeprom_path(const char *path)
+{
+    if (path == NULL) {
+        return -1;
+    }
+
+    char resolved[1024];
+    if (path[0] == '\0') {
+        char appData[MAX_PATH];
+        if (GetEnvironmentVariableA("LOCALAPPDATA", appData, sizeof(appData)) > 0) {
+            _snprintf(resolved, sizeof(resolved),
+                      "%s\\Betaflight-SITL\\eeprom.bin", appData);
+        } else {
+            resolved[0] = '\0'; // no override: eeprom.bin in the working directory
+        }
+    } else {
+        if (strlen(path) >= sizeof(resolved)) {
+            return -1;
+        }
+        _snprintf(resolved, sizeof(resolved), "%s", path);
+    }
+
+    // Applied by the next sitl_local_step(): the switch saves the aircraft
+    // being left, then opens (and, when new, initialises) the requested file.
+    strncpy(gLocalPendingEepromPath, resolved, sizeof(gLocalPendingEepromPath) - 1);
+    gLocalPendingEepromPath[sizeof(gLocalPendingEepromPath) - 1] = '\0';
+    InterlockedExchange(&gLocalPathPending, 1);
+    return 0;
+}
+
+int sitl_local_reload_config(void)
+{
+    if (!gLocalRunning || ARMING_FLAG(ARMED)) {
+        return -1;
+    }
+    InterlockedExchange(&gLocalReloadPending, 1);
+    return 0;
+}
+
+// Runs on the host thread inside sitl_local_step(). Applies a pending EEPROM
+// path switch and/or re-reads the selected file into the flash mirror and then
+// into the PG config, followed by everything the boot path derives from it
+// (LOCAL link overrides, mixer/motor/servo setup, filters, ...).
+static void localRunPendingReload(void)
+{
+    InterlockedExchange(&gLocalReloadPending, 0);
+
+    // Save the aircraft being left and close its file. This has to happen
+    // before the environment changes so the write targets the old path, and
+    // before the re-read because an open handle blocks opening another file.
+    localFlushEepromWrite();
+
+    bool freshFile = false;
+    if (InterlockedExchange(&gLocalPathPending, 0) != 0) {
+        // A path that does not exist yet is a brand-new aircraft. sitl.c's
+        // loadEEPROMFromFile() creates it from the flash mirror, i.e. it would
+        // inherit the aircraft we just left. Clear the mirror (erased flash)
+        // so the new file is created empty and then re-initialised with
+        // factory defaults below, exactly like a fresh FC.
+        freshFile = gLocalPendingEepromPath[0] != '\0'
+            && GetFileAttributesA(gLocalPendingEepromPath) == INVALID_FILE_ATTRIBUTES;
+        if (freshFile) {
+            memset(eepromData, 0, sizeof(eepromData));
+        }
+        _putenv_s("BF_SITL_EEPROM", gLocalPendingEepromPath);
+        ensureEepromDirectory();
+    }
+
+    // Open the file named by BF_SITL_EEPROM (sitlFopen resolves the env var on
+    // every call) and load it into the flash mirror, then into the PG records.
+    configUnlock();
+    if (freshFile) {
+        // Mirrors fc/init.c: an invalid/erased config resets to the factory
+        // defaults and writes them (here into the newly created file).
+        ensureEEPROMStructureIsValid();
+    }
+    readEEPROM();
+
+    // Re-apply what readEEPROM/activateConfig does not cover: the LOCAL link
+    // overrides (UDP RX provider, battery shims, PWM motor backend) and the
+    // boot-time derived state (mixer mode, motor/servo setup, gyro filters,
+    // debug mode).
+    localApplyLinkOverrides();
+    extern void sitlLocalRunBootReapply(void);
+    sitlLocalRunBootReapply();
 }
 
 // --- LOCAL-mode link stubs ---
@@ -337,41 +502,11 @@ int sitl_local_init(void)
 
     sitlBoot(0, NULL);
 
-    // Simulated motor RPM participates in the firmware (RPM filter, motor
-    // telemetry, OSD/MSP): mark DSHOT telemetry as active so the RPM filter
-    // and telemetry consumers use the bridged values from the wrappers.
-    useDshotTelemetry = true;
-
-    // The FC blocks arming for powerOnArmingGraceTime seconds after every
-    // boot. In-process LOCAL sessions start a new boot each time the host
-    // loads the DLL, so remove the grace block immediately.
-    unsetArmingDisabled(ARMING_DISABLED_BOOT_GRACE_TIME);
-
-    // Make the local link self-sufficient regardless of the EEPROM contents:
-    // force the UDP RX provider (sensor input arrives via sitl_local_step,
-    // not a serial receiver) and pin the battery meters to the ADC shims that
-    // read simTelemetrySet() values.
-    featureEnableImmediate(FEATURE_RX_UDP);
-
-    // Seed the UDP provider's channel count before rxInit() snapshots it into
-    // rx.c's file-static rxChannelCount. After the takeover below the frame
-    // status callback no longer updates rxChannelCount (frameStatusUdp does),
-    // and readRxChannelsApplyRanges()/detectAndApplySignalLossBehaviour()
-    // loop over rxChannelCount - if it stays 0 no channel is ever read.
-    uint16_t initRc[SITL_LOCAL_MAX_RC_CHANNELS];
-    for (int i = 0; i < SITL_LOCAL_MAX_RC_CHANNELS; i++) {
-        initRc[i] = 1000;
-    }
-    rxUpdateUdpChannels(initRc, SITL_LOCAL_MAX_RC_CHANNELS);
-    rxInit();
-
-    // Take over the RC provider functions with the cache semantics above.
-    rxRuntimeState.rcReadRawFn = localRcReadRaw;
-    rxRuntimeState.rcFrameStatusFn = localRcFrameStatus;
-    rxRuntimeState.channelCount = SITL_LOCAL_MAX_RC_CHANNELS;
-
-    batteryConfigMutable()->voltageMeterSource = VOLTAGE_METER_ADC;
-    batteryConfigMutable()->currentMeterSource = CURRENT_METER_ADC;
+    // Make the local link self-sufficient regardless of the EEPROM contents
+    // (UDP RX provider, ADC battery shims, virtual PWM backend, DSHOT
+    // telemetry). Shared with the runtime config reload, which replaces every
+    // PG record and therefore has to re-apply the same overrides.
+    localApplyLinkOverrides();
 
     gLocalRunning = true;
     gMspThreadStop = 0;
@@ -625,20 +760,23 @@ void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
         return;
     }
 
-    // A reboot requested a boot-config re-apply (mixer change, filters, ...).
-    // Run it here, on the same thread as the scheduler and between steps, so
-    // it cannot race the flight loop. Skip while armed and retry on a later
-    // step so a save/reboot never yanks the mixer out from under a flying
-    // craft.
-    extern bool sitlLocalReapplyPending(void);
-    extern void sitlLocalRunBootReapply(void);
-    if (sitlLocalReapplyPending()) {
-        if (!ARMING_FLAG(ARMED)) {
-            sitlLocalRunBootReapply();
+    // Deferred config work (EEPROM reload and/or boot-config re-apply) runs
+    // here, on the same thread as the scheduler and between steps, so it can
+    // never race the flight loop. While armed the requests stay pending and
+    // are retried on a later step, so a save/reload never yanks the mixer out
+    // from under a flying craft.
+    if (!ARMING_FLAG(ARMED)) {
+        const bool reloadPending =
+            InterlockedCompareExchange(&gLocalReloadPending, 0, 0) != 0 ||
+            InterlockedCompareExchange(&gLocalPathPending, 0, 0) != 0;
+        if (reloadPending) {
+            localRunPendingReload();
         } else {
-            // Leave the request pending; the next step while disarmed applies it.
-            extern void sitlLocalRestoreReapplyPending(void);
-            sitlLocalRestoreReapplyPending();
+            extern bool sitlLocalReapplyPending(void);
+            extern void sitlLocalRunBootReapply(void);
+            if (sitlLocalReapplyPending()) {
+                sitlLocalRunBootReapply();
+            }
         }
     }
 

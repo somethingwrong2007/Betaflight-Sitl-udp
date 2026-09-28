@@ -140,8 +140,10 @@ static bool createDirectoryChain(char *path)
 }
 
 // If BF_SITL_EEPROM points into a directory that does not exist yet, create
-// it before init so sitl.c's virtual EEPROM can create the file there.
-static void ensureEepromDirectory(void)
+// it before init so sitl.c's virtual EEPROM can create the file there. Also
+// used by sitl_local_set_eeprom_path() when the host switches aircraft at
+// runtime.
+void ensureEepromDirectory(void)
 {
     const char *eeprom = getenv("BF_SITL_EEPROM");
     if (eeprom == NULL || eeprom[0] == '\0') {

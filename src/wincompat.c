@@ -110,18 +110,15 @@ bool sitlLocalReapplyPending(void)
 #endif
 }
 
-// sitl_local_step() consumed the request while armed; put it back so the
-// re-apply runs on the next step after disarming.
-void sitlLocalRestoreReapplyPending(void)
-{
-#ifdef SITL_LOCAL
-    InterlockedExchange(&gLocalReapplyPending, 1);
-#endif
-}
-
 void sitlLocalRunBootReapply(void)
 {
 #ifdef SITL_LOCAL
+    // Re-pin the virtual PWM motor backend first: the EEPROM may hold DSHOT600
+    // (the default once USE_DSHOT is compiled in) and its device init is a
+    // false-returning stub in this build, which would leave the craft without
+    // motor output.
+    extern void sitlLocalPreMotorInit(void);
+    sitlLocalPreMotorInit();
     gyroInitFilters();
     pidInit(currentPidProfile);
     // Mixer / motor / servo config: re-applies the mixer mode (motor count,
@@ -338,15 +335,37 @@ void systemResetToBootloader(bootloaderRequestType_e requestType)
 // directory.
 #define SITL_EEPROM_FILENAME "eeprom.bin"
 
+// sitl.c's virtual EEPROM handle. sitl.c assigns eepromFd from the fopens
+// below and only ever clears it in configLock(), so mirroring it here tells
+// the LOCAL link whether the file is currently open. loadEEPROMFromFile()
+// refuses to reopen a file while a handle is open, so switching to another
+// EEPROM path requires closing this one first.
+static FILE *gSitlEepromFd = NULL;
+
 FILE *sitlFopen(const char *filename, const char *mode)
 {
     if (strcmp(filename, SITL_EEPROM_FILENAME) == 0) {
         const char *eeprom = getenv("BF_SITL_EEPROM");
-        if (eeprom != NULL && eeprom[0] != '\0') {
-            return fopen(eeprom, mode);
-        }
+        FILE *fp = (eeprom != NULL && eeprom[0] != '\0')
+            ? fopen(eeprom, mode)
+            : fopen(filename, mode);
+        gSitlEepromFd = fp;
+        return fp;
     }
     return fopen(filename, mode);
+}
+
+int sitlFclose(FILE *fp)
+{
+    if (fp == gSitlEepromFd) {
+        gSitlEepromFd = NULL;
+    }
+    return fclose(fp);
+}
+
+bool sitlEepromFileIsOpen(void)
+{
+    return gSitlEepromFd != NULL;
 }
 
 void dyad_update(void)

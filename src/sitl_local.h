@@ -160,6 +160,31 @@ SITL_LOCAL_API int sitl_local_set_arm_switch(uint8_t auxChannel,
  */
 SITL_LOCAL_API int sitl_local_set_blackbox_dir(const char *path);
 
+/**
+ * Point the virtual EEPROM at another file (one per aircraft). An empty or
+ * NULL path restores the LOCAL default
+ * (%LOCALAPPDATA%\Betaflight-SITL\eeprom.bin). The switch is applied by the
+ * next sitl_local_step(): the aircraft being left is saved into the file it
+ * came from, then the new file is opened and read. A path that does not exist
+ * yet is created with factory defaults, so a new aircraft does not inherit
+ * the previous one's tune. Returns 0 when the switch was queued, or -1 for a
+ * NULL path or a path that is too long.
+ */
+SITL_LOCAL_API int sitl_local_set_eeprom_path(const char *path);
+
+/**
+ * Re-read the EEPROM at the current path and re-apply the configuration
+ * without restarting the process: the LOCAL link overrides (virtual UDP
+ * receiver, ADC battery shims, virtual PWM motor backend), the boot-time
+ * derived state (mixer/motor/servo setup, gyro filters, debug mode) and the
+ * PG config itself. A pending sitl_local_set_eeprom_path() is applied first.
+ * The work runs on the next sitl_local_step() call, between steps, so it never
+ * races the flight loop. Returns 0 when the reload was queued, -1 when the FC
+ * is not running or is currently armed (disarm first, or the request is
+ * applied on the first step after disarming).
+ */
+SITL_LOCAL_API int sitl_local_reload_config(void);
+
 /** Stop the background MSP thread. Does not exit the host process. */
 SITL_LOCAL_API void sitl_local_shutdown(void);
 

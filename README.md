@@ -274,11 +274,17 @@ handlers use, so both sides always agree:
 | `sitl_local_get_arm_switch(&auxChannel, &startStep, &endStep)` | ARM mode condition: RC channel index (4 = AUX1) and the 25 us-step range; `auxChannel` is `0xFF` when no ARM switch is configured |
 | `sitl_local_set_arm_switch(auxChannel, startStep, endStep)` | bind BOXARM to an aux channel + 25 us-step range and persist it (same semantics as MSP_SET_MODE_RANGE); `auxChannel = 0xFF` clears the ARM condition; returns 0, or -1 for invalid parameters / no free slot |
 | `sitl_local_set_blackbox_dir(path)` | redirect the blackbox log folder (e.g. one folder per aircraft); creates the directory and re-scans for correct log numbering; returns 0, or -1 for a NULL/empty/too-long path |
+| `sitl_local_set_eeprom_path(path)` | queue a switch of the virtual EEPROM to another file (e.g. one per aircraft); an empty path restores the default `%LOCALAPPDATA%\Betaflight-SITL\eeprom.bin`. Applied by the next `sitl_local_step()`: the aircraft being left is saved into its own file first. A path that does not exist yet is created with factory defaults. Returns 0 when queued, or -1 for a NULL/too-long path |
+| `sitl_local_reload_config()` | queue a re-read of the selected EEPROM (plus a pending path switch) and re-apply it: LOCAL link overrides (UDP RX, ADC battery shims, PWM motor backend), mixer/motor/servo setup, filters and the PG config. Runs inside the next `sitl_local_step()`, never while armed. Returns 0 when queued, or -1 when not initialised or currently armed |
 
-All accessors are plain memory reads (safe from the UE tick); the only
-write, `sitl_local_set_rate()`, writes the RAM profile immediately and defers
-the EEPROM persist to the background MSP thread, so no file I/O happens on
-the UE thread. Arming itself still goes through the RC auxiliary channel -
+The `get_*` accessors and `sitl_local_set_rate()`/`sitl_local_set_rate_mode()`
+are plain memory reads/writes (safe from the UE tick); `sitl_local_set_rate()`
+writes the RAM profile immediately and defers the EEPROM persist to the
+background MSP thread, so no file I/O happens on the UE thread.
+`sitl_local_set_eeprom_path()` and `sitl_local_reload_config()` only record a
+request: the file I/O and the re-initialisation run inside the next
+`sitl_local_step()`, between scheduler passes, so they can never tear the
+flight loop apart. Arming itself still goes through the RC auxiliary channel -
 drive the channel returned by `sitl_local_get_arm_switch()`.
 
 Motor RPM from `in.motor_rpm[0..3]` (and the UDP extended tail) is bridged
@@ -441,6 +447,37 @@ specific file (the directory is created automatically):
 $env:BF_SITL_EEPROM = "E:\sim\flight.bin"
 .\betaflight_SITL.exe
 ```
+
+### Per-aircraft EEPROM at runtime (LOCAL DLL)
+
+The LOCAL link can move the virtual EEPROM between files while the host
+process keeps running, so every aircraft can own its own `eeprom.bin`:
+
+```c
+sitl_local_set_eeprom_path("E:\\MySim\\Aircraft\\747\\eeprom.bin");
+sitl_local_reload_config();
+// both only queue work - the switch happens inside the next sitl_local_step()
+```
+
+Sequence and rules:
+
+- `sitl_local_set_eeprom_path()` records the new path. On the next step the
+  aircraft being left is written to the file it came from (so its tune is
+  never lost) and that file is closed, then the new path is opened.
+- A path that does not exist yet is created with **factory defaults** - a new
+  aircraft does not silently inherit the previous one's rates/PID/mixer. The
+  configurator then writes it like a fresh FC.
+- `sitl_local_reload_config()` is optional after a path switch (the switch
+  already re-reads the file); call it on its own to re-apply the current file,
+  e.g. after changing it outside the process.
+- Both are ignored while armed: the request stays queued and is applied on the
+  first step after disarming. They do nothing before `sitl_local_init()`.
+- Everything the boot path derives from the config is re-applied, including the
+  LOCAL-mode overrides (virtual UDP receiver, ADC battery shims, virtual PWM
+  motor backend) and the mixer/motor/servo setup, so the motor outputs keep
+  working after a switch.
+- The configurator connection (TCP 5761 / WebSocket 6761) is not affected; it
+  simply shows the newly loaded aircraft after the next MSP poll.
 
 ### Automatic restart on firmware reboot (Windows)
 

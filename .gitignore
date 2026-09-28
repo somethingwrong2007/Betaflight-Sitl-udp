@@ -3,6 +3,7 @@ build-*/
 !wincompat/build/
 !wincompat/build/atomic.h
 /.edge-test-profile*/
+/.vs/
 /bf-configurator/
 /.simitl-ref/
 /.simitl-ref2/

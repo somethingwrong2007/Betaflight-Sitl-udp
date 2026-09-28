@@ -436,7 +436,10 @@ if(WIN32)
   # a few fixed steps instead of spinning in real time.
   # systemReset is renamed so wincompat.c can install a custom firmware reboot
   # that relaunches the SITL process automatically instead of just exiting.
-  set(SITL_SITL_C_OPTS "-Dmicros64=sitlMicros64;-Dmillis64=sitlMillis64;-Dmicros=sitlMicros;-Dmillis=sitlMillis;-DdelayMicroseconds=sitlDelayMicroseconds;-DgetCycleCounter=sitlGetCycleCounter;-Dfopen=sitlFopen;-Dpthread_mutex_trylock=sitlMutexTrylock;-Dpthread_mutex_unlock=sitlMutexUnlock;-DsystemReset=sitlSystemResetNative")
+  # fopen/fclose are renamed so wincompat.c can redirect the virtual EEPROM to
+  # BF_SITL_EEPROM and track whether that file is currently open (the LOCAL
+  # link needs to know before re-opening it at another path).
+  set(SITL_SITL_C_OPTS "-Dmicros64=sitlMicros64;-Dmillis64=sitlMillis64;-Dmicros=sitlMicros;-Dmillis=sitlMillis;-DdelayMicroseconds=sitlDelayMicroseconds;-DgetCycleCounter=sitlGetCycleCounter;-Dfopen=sitlFopen;-Dfclose=sitlFclose;-Dpthread_mutex_trylock=sitlMutexTrylock;-Dpthread_mutex_unlock=sitlMutexUnlock;-DsystemReset=sitlSystemResetNative")
   if(SITL_LINK_MODE STREQUAL "LOCAL")
     # sitl.c's systemResetToBootloader() calls exit(0), which would kill the
     # host process from a DLL ("Enter DFU/bootloader" in the configurator).
