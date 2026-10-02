@@ -88,6 +88,18 @@ SITL_LOCAL_API bool sitl_local_is_arming_disabled(void);
 /** True when the FC is armed (same flag as the configurator's status icon). */
 SITL_LOCAL_API bool sitl_local_get_armed(void);
 
+/**
+ * Return the aircraft to the disarmed state - the same effect as the
+ * configurator's Disarm button, i.e. disarm(DISARM_REASON_ARMING_DISABLED).
+ * Safe to call at any time and idempotent: it only acts when the FC is
+ * actually armed, and it never leaves an arming-disable flag behind, so the
+ * craft can arm again normally. Arming is still driven by the RC ARM switch,
+ * so a host that keeps the ARM channel high must release it too, otherwise the
+ * scheduler simply arms again on its next pass.
+ * Returns 0, or -1 when the FC is not running.
+ */
+SITL_LOCAL_API int sitl_local_disarm(void);
+
 /** flightModeFlags bitmask (ANGLE/HORIZON/MAG/... active modes). */
 SITL_LOCAL_API uint32_t sitl_local_get_flight_modes(void);
 

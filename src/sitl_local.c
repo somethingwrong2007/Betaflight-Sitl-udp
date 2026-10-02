@@ -32,6 +32,7 @@
 #include "drivers/dma.h"
 #include "drivers/dshot.h"
 #include "io/gps_virtual.h"
+#include "fc/core.h"
 #include "fc/controlrate_profile.h"
 #include "fc/rc_controls.h"
 #include "flight/imu.h"
@@ -539,6 +540,23 @@ bool sitl_local_is_arming_disabled(void)
 bool sitl_local_get_armed(void)
 {
     return gLocalRunning && ARMING_FLAG(ARMED);
+}
+
+// Same action as the configurator's Disarm button (msp.c's MSP_SET_ARMING_DISABLED
+// path): the reason only tags the blackbox disarm event, it does not set an
+// arming-disable flag, so the craft can arm again as soon as the ARM switch
+// asks for it. Note that rc_controls.c calls tryArm() on every scheduler pass
+// while BOXARM is active, so a host that disarms through this call must also
+// drive the ARM channel low - otherwise the FC re-arms on the next pass.
+int sitl_local_disarm(void)
+{
+    if (!gLocalRunning) {
+        return -1;
+    }
+    if (ARMING_FLAG(ARMED)) {
+        disarm(DISARM_REASON_ARMING_DISABLED);
+    }
+    return 0;
 }
 
 uint32_t sitl_local_get_flight_modes(void)

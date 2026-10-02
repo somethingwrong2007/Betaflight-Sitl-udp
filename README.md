@@ -266,6 +266,7 @@ handlers use, so both sides always agree:
 | `sitl_local_get_arming_flags()` | arming-disable bitmask (same value as MSP_STATUS_EX; 0 = may arm) |
 | `sitl_local_is_arming_disabled()` | `true` while any arming-disable reason is blocking arming |
 | `sitl_local_get_armed()` | `true` when armed |
+| `sitl_local_disarm()` | put the aircraft back into the disarmed state (same call the configurator's Disarm button makes: `disarm(DISARM_REASON_ARMING_DISABLED)`). Idempotent, leaves no arming-disable flag behind, so it can arm again normally; returns 0, or -1 when the FC is not running. Arming is still driven by the RC ARM switch, so a host that keeps the ARM channel high must release it too or the scheduler arms again |
 | `sitl_local_get_flight_modes()` | `flightModeFlags` bitmask (ANGLE/HORIZON/MAG/...) |
 | `sitl_local_get_rate(index, rcRate[3], rcExpo[3], superRate[3])` | rate profile `index` (any out-of-range index = current profile); each array is per-axis in ROLL, PITCH, YAW order and in the same display units as the Rates tab for the current rate mode; pass NULL to skip a group |
 | `sitl_local_set_rate(rcRate[3], rcExpo[3], superRate[3])` | writes the current profile per axis (same display units, converted and clamped per rate mode like the Rates tab) and persists it via the background thread; pass NULL to leave a group unchanged |
@@ -471,7 +472,9 @@ Sequence and rules:
   already re-reads the file); call it on its own to re-apply the current file,
   e.g. after changing it outside the process.
 - Both are ignored while armed: the request stays queued and is applied on the
-  first step after disarming. They do nothing before `sitl_local_init()`.
+  first step after disarming (call `sitl_local_disarm()` first if the aircraft
+  is airborne and you do not want to wait for the ARM switch). They do nothing
+  before `sitl_local_init()`.
 - Everything the boot path derives from the config is re-applied, including the
   LOCAL-mode overrides (virtual UDP receiver, ADC battery shims, virtual PWM
   motor backend) and the mixer/motor/servo setup, so the motor outputs keep
