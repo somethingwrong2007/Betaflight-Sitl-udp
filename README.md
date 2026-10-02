@@ -507,8 +507,8 @@ Sequence and rules:
 ### Automatic restart on firmware reboot (Windows)
 
 This applies to the standalone UDP build. The LOCAL (DLL) build never
-restarts the process: its reboot handler persists the config and keeps the
-FC running in-process (see the LOCAL caveats above).
+restarts the process: its reboot handler reproduces the reboot in-process
+(see "Firmware reboot in-process" below).
 
 Any firmware reboot (`MSP_REBOOT`, CLI `save`, CLI `exit`, CMS save-exit)
 no longer leaves the simulator dead:
@@ -525,6 +525,46 @@ Windows sockets are marked non-inheritable so the child does not inherit the
 parent's listeners (which would leave connections landing on a socket nobody
 accepts from). CLI semantics are preserved: `save` persists, plain `exit`
 reboots without saving.
+
+### Firmware reboot in-process (LOCAL DLL)
+
+Every reboot path - the configurator's **Save and Reboot** (`MSP_REBOOT` after
+`MSP_EEPROM_WRITE`), CLI `save`/`exit`/`defaults`, CMS, and **Enter
+bootloader/DFU** - funnels into one handler that reproduces, as closely as an
+in-process DLL can, what real hardware does:
+
+1. **Immediately** (on whatever thread asked): close the blackbox log, disarm
+   (a real reboot drops the motor output - the very next `sitl_local_step()`
+   already returns disarmed motor values, so rebooting while airborne stops
+   the motors instead of leaving the old configuration flying), reset the
+   arming state machines, drop the CLI mode and the `ARMING_DISABLED_CLI` /
+   `ARMING_DISABLED_REBOOT_REQUIRED` flags.
+2. **On the next `sitl_local_step()`**, between scheduler passes: persist the
+   current RAM config, re-read the EEPROM (also applies a pending
+   `sitl_local_set_eeprom_path()`), re-apply every boot-derived setting -
+   `activateConfig()` covers PID/rate/battery profiles, RC processing,
+   failsafe, acc filters, `imuConfigure()`, active box ids; the LOCAL link
+   overrides re-pin the UDP receiver, the ADC battery meters and the virtual
+   PWM motor backend; then mixer/motor/servo, gyro filters and debug mode - and
+   finally re-init the `initPhase3` modules (`blackboxInit()`,
+   `gyroStartCalibration()`), exactly like a boot.
+3. The configurator connection survives the reboot (the MSP thread is moved
+   back to its idle parser state instead of being left in `mspRebootFn()`'s
+   `while (true);`). Expect a short RX re-acquisition right after the reboot,
+   like real hardware.
+
+Two deliberate deviations, both simulator-specific:
+
+- The virtual clock is **not** reset (the host drives it and the scheduler
+  anchors its deadline grid to it), so uptime/stats keep counting across a
+  reboot.
+- `ARMING_DISABLED_BOOT_GRACE_TIME` is **not** re-armed, so the craft stays
+  immediately armable after a "Save and Reboot" instead of waiting out
+  `powerOnArmingGraceTime`.
+
+The gyro calibration a real boot performs is kept (`gyroStartCalibration()`),
+but the virtual gyro reports it as complete immediately, so it never delays
+arming here.
 
 ### Tuning note: configurator shows 999/333
 

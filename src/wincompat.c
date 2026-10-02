@@ -34,6 +34,8 @@
 #include "sensors/voltage.h"
 #include "sensors/current.h"
 #include "fc/runtime_config.h"
+#include "fc/core.h"
+#include "cli/cli.h"
 #include "sim_telemetry.h"
 
 extern uint64_t micros64_real(void);
@@ -82,31 +84,45 @@ void sitlLocalSyncDebugMode(void)
 #endif
 }
 
-// Real firmware re-runs init on every reboot, which applies boot-time config
-// (filters, mixer, debug mode, ...) to runtime state. The LOCAL reboot keeps
-// the process alive, so this requests a re-apply: debugMode is re-synced
-// immediately (a trivial global write, safe from the MSP thread), and the
-// heavier filter/mixer/motor/servo re-init is deferred to the next
-// sitl_local_step() call - it runs on the same thread as the scheduler,
-// between steps, so it can never race the flight loop (running it on the MSP
-// thread while the UE thread steps crashes the host).
-static volatile LONG gLocalReapplyPending = 0;
-
-void sitlLocalReapplyBootConfig(void)
+// A firmware reboot, reproduced in-process. Every reboot path ends up here:
+// the configurator's "Save and Reboot" (msp.c -> systemReset), the CLI
+// "save"/"exit"/"defaults", CMS, and the DFU request. Real hardware re-runs
+// init on every reboot; here that means re-reading the EEPROM and re-applying
+// everything derived from it (see localRunPendingReboot() in sitl_local.c).
+//
+// A real reboot drops the motor output, forgets the runtime state and starts
+// over from the EEPROM. The cheap, thread-safe half of that runs here - the
+// caller may be the MSP thread or the host thread (a CLI save processed by
+// TASK_SERIAL). The config re-read and the derived re-init are queued for
+// sitl_local_step(), because re-initialising the mixer, motors, servos and IMU
+// from another thread while the host is stepping crashes the process.
+void sitlLocalRequestReboot(void)
 {
 #ifdef SITL_LOCAL
-    sitlLocalSyncDebugMode();
-    InterlockedExchange(&gLocalReapplyPending, 1);
+    extern void sitlLocalRequestRebootApply(void);
+
+    // The reboot ends the log; the re-init below opens a new one.
+#ifdef USE_BLACKBOX
+    blackboxFinish();
 #endif
-}
 
-// Consumed by sitl_local_step() on the UE thread.
-bool sitlLocalReapplyPending(void)
-{
-#ifdef SITL_LOCAL
-    return InterlockedCompareExchange(&gLocalReapplyPending, 0, 1) != 0;
-#else
-    return false;
+    // A reboot drops the motor output. Disarming here (instead of waiting for
+    // the ARM switch) also resets the arming state machines and the PID
+    // integrators, and lets the queued re-init run on the very next step.
+    if (ARMING_FLAG(ARMED)) {
+        disarm(DISARM_REASON_ARMING_DISABLED);
+    }
+    resetTryingToArm();
+    resetArmingDisabled();
+
+    // Reboot-only runtime state: the CLI link is rebuilt from scratch and a
+    // pending "reboot required" request is satisfied by this reboot.
+    // ARMING_DISABLED_MSP belongs to the configurator (it re-asserts it while
+    // it holds the FC in a config state), so that one is deliberately kept.
+    cliMode = false;
+    unsetArmingDisabled(ARMING_DISABLED_CLI | ARMING_DISABLED_REBOOT_REQUIRED);
+
+    sitlLocalRequestRebootApply();
 #endif
 }
 
@@ -347,15 +363,15 @@ int sitl_local_set_blackbox_dir(const char *path)
 
 // sitl.c's systemResetToBootloader() calls exit(0), which would terminate the
 // host process from a DLL. "Enter bootloader / DFU" has no meaning for the
-// in-process FC, so treat it like the firmware reboot: persist and jump back
-// to the MSP thread loop instead (mspRebootFn's bootloader branch spins in a
-// `while (true);` after this returns, exactly like the firmware case).
+// in-process FC, so treat it like any other firmware reboot: persist, reset the
+// runtime state, re-read the config, and jump back to the MSP thread loop
+// (mspRebootFn's bootloader branch spins in a `while (true);` after this
+// returns, exactly like the firmware case).
 void systemResetToBootloader(bootloaderRequestType_e requestType)
 {
     UNUSED(requestType);
     writeEEPROM();
-    unsetArmingDisabled(ARMING_DISABLED_CLI);
-    sitlLocalReapplyBootConfig();
+    sitlLocalRequestReboot();
     sitlLocalRebootJump();
 }
 
@@ -479,9 +495,7 @@ void sitlSystemReset(void)
     // sends MSP_SET_REBOOT right after a CLI "exit"). Jump back to the MSP
     // thread loop instead; the parser is already back in PORT_IDLE when the
     // reboot handler runs, so the next MSP request is processed normally.
-    blackboxFinish();
-    unsetArmingDisabled(ARMING_DISABLED_CLI);
-    sitlLocalReapplyBootConfig();
+    sitlLocalRequestReboot();
     sitlLocalRebootJump();
 #else
     systemReset();
@@ -541,25 +555,22 @@ static void sitlRelaunchSelf(void)
 // as sitlSystemResetNative() so the symbol is free for this wrapper.
 void systemReset(void)
 {
-#ifdef USE_BLACKBOX
-    // Close any in-progress blackbox log cleanly (writes the end-of-log event)
-    // before relaunching, so a reboot never leaves a truncated .BFL file.
-    blackboxFinish();
-#endif
 #ifdef SITL_LOCAL
     // In-process library mode: there is no standalone process to relaunch and
     // exiting would kill the host engine. Defer the (potentially slow)
     // EEPROM persist to the background thread so systemReset() never blocks
     // the UE thread that may be executing it via the scheduler's TASK_SERIAL
-    // (the MSP caller already persisted via sitlSystemReset when applicable).
+    // (the MSP caller already persisted via sitlSystemReset when applicable;
+    // the reboot re-persists as its own first step anyway).
     extern void sitlLocalRequestReset(void);
     sitlLocalRequestReset();
-    // cliEnter() sets ARMING_DISABLED_CLI and nothing ever clears it (real
-    // FCs clear it on reboot, which LOCAL mode does not do). Clear it so the
-    // craft can arm again after the CLI panel is closed.
-    unsetArmingDisabled(ARMING_DISABLED_CLI);
-    sitlLocalReapplyBootConfig();
+    sitlLocalRequestReboot();
 #else
+#ifdef USE_BLACKBOX
+    // Close any in-progress blackbox log cleanly (writes the end-of-log event)
+    // before relaunching, so a reboot never leaves a truncated .BFL file.
+    blackboxFinish();
+#endif
     sitlRelaunchSelf();
     sitlSystemResetNative();
 #endif

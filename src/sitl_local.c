@@ -47,6 +47,9 @@
 #include "msp/msp.h"
 #include "rx/rx.h"
 #include "sensors/battery.h"
+#ifdef USE_BLACKBOX
+#include "blackbox/blackbox.h"
+#endif
 
 #include "sitl_local.h"
 #include "sim_telemetry.h"
@@ -275,6 +278,7 @@ void sitlLocalRequestEepromWrite(void)
 // aircraft being left" write ahead of the environment change, which is what
 // makes it target the old file (and what makes a brand-new path detectable).
 static volatile LONG gLocalReloadPending = 0;
+static volatile LONG gLocalRebootPending = 0;
 static volatile LONG gLocalPathPending = 0;
 static char gLocalPendingEepromPath[1024];
 
@@ -381,6 +385,41 @@ static void localRunPendingReload(void)
     localApplyLinkOverrides();
     extern void sitlLocalRunBootReapply(void);
     sitlLocalRunBootReapply();
+}
+
+// Deferred half of a firmware reboot; the immediate half (disarm, CLI and
+// arming state, log close) is sitlLocalRequestReboot() in wincompat.c. Queued
+// here for the same reason as the config reload: the EEPROM re-read and every
+// derived re-init must happen on the host thread, between scheduler passes.
+void sitlLocalRequestRebootApply(void)
+{
+    InterlockedExchange(&gLocalRebootPending, 1);
+}
+
+// Mirrors what a real boot does after loading the config (fc/init.c):
+// everything localRunPendingReload() re-applies, followed by the initPhase3
+// modules a reboot re-initialises.
+static void localRunPendingReboot(void)
+{
+    InterlockedExchange(&gLocalRebootPending, 0);
+
+    // Persist + re-read the EEPROM, re-apply the LOCAL link overrides (UDP RX,
+    // ADC battery meters, PWM motor backend) and the derived mixer/motor/
+    // servo/filter/debug state. Also applies a pending EEPROM path switch.
+    localRunPendingReload();
+
+#ifdef USE_BLACKBOX
+    // initPhase3 re-inits the blackbox (the log was closed by the reboot), so
+    // a blackbox device / directory change takes effect.
+    blackboxInit();
+#endif
+    // Real FCs calibrate the gyro on every boot. With the virtual gyro this
+    // completes immediately (gyroSetCalibrationCycles() leaves 0 cycles for
+    // GYRO_VIRTUAL), so it cannot delay arming in the simulator.
+    // (Declared here rather than including sensors/gyro.h: the LOCAL stub
+    // mpuGyroReadRegister() below deliberately uses a different signature.)
+    extern void gyroStartCalibration(bool isFirstArmingCalibration);
+    gyroStartCalibration(false);
 }
 
 // --- LOCAL-mode link stubs ---
@@ -778,23 +817,19 @@ void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
         return;
     }
 
-    // Deferred config work (EEPROM reload and/or boot-config re-apply) runs
-    // here, on the same thread as the scheduler and between steps, so it can
-    // never race the flight loop. While armed the requests stay pending and
+    // Deferred config work (firmware reboot, EEPROM reload and/or path switch)
+    // runs here, on the same thread as the scheduler and between steps, so it
+    // can never race the flight loop. While armed the requests stay pending and
     // are retried on a later step, so a save/reload never yanks the mixer out
-    // from under a flying craft.
+    // from under a flying craft (a reboot disarms first, so it applies at once).
     if (!ARMING_FLAG(ARMED)) {
-        const bool reloadPending =
-            InterlockedCompareExchange(&gLocalReloadPending, 0, 0) != 0 ||
-            InterlockedCompareExchange(&gLocalPathPending, 0, 0) != 0;
-        if (reloadPending) {
+        if (InterlockedCompareExchange(&gLocalRebootPending, 0, 0) != 0) {
+            // A reboot re-reads the config and re-applies it plus the
+            // initPhase3 modules, mirroring a real boot.
+            localRunPendingReboot();
+        } else if (InterlockedCompareExchange(&gLocalReloadPending, 0, 0) != 0 ||
+                   InterlockedCompareExchange(&gLocalPathPending, 0, 0) != 0) {
             localRunPendingReload();
-        } else {
-            extern bool sitlLocalReapplyPending(void);
-            extern void sitlLocalRunBootReapply(void);
-            if (sitlLocalReapplyPending()) {
-                sitlLocalRunBootReapply();
-            }
         }
     }
 
