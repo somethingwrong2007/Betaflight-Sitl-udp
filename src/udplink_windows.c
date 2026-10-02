@@ -20,17 +20,20 @@
 
 static bool wsaInitialized = false;
 
-// Optional extended tail appended after the official fdm_packet:
+// Extended tail appended after the official fdm_packet:
 // double battery_voltage (V), double battery_current (A),
-// double motor_rpm[4]. Senders that only send the 144-byte packet keep the
-// defaults below. These shims are compiled in every Windows mode because
-// CMakeLists.txt routes battery.c's ADC meter reads to them; in REALTIME
-// mode (no FDM tail parser) they simply report the defaults.
-#define SITL_FDM_EXTENDED_SIZE 192
+// double motor_rpm[4], double motor_temperature[4] (degC). Senders that only
+// send the 144-byte packet keep the defaults below. These shims are compiled
+// in every Windows mode because CMakeLists.txt routes battery.c's ADC meter
+// reads to them; in REALTIME mode (no FDM tail parser) they simply report the
+// defaults.
+#define SITL_FDM_EXTENDED_SIZE 224
 #define SITL_FDM_EXT_BATTERY_VOLTAGE 144
 #define SITL_FDM_EXT_BATTERY_CURRENT 152
 #define SITL_FDM_EXT_MOTOR_RPM 160
 #define SITL_FDM_EXT_MOTOR_RPM_COUNT 4
+#define SITL_FDM_EXT_MOTOR_TEMPERATURE 192
+#define SITL_FDM_EXT_MOTOR_TEMPERATURE_COUNT 4
 // Official FDM packet geometry. Compiled in every Windows mode: udpRecv() on
 // port 9003 reads into the extended buffer (and parses the telemetry tail)
 // regardless of the time base, while the virtual-clock bookkeeping stays
@@ -42,8 +45,13 @@ static double sitlBatteryVoltage = 16.8; // V, 4S default so the FC always sees 
 static double sitlBatteryCurrent = 0.0;  // A
 static double sitlMotorRpm[SITL_FDM_EXT_MOTOR_RPM_COUNT] = { 0.0 };
 static double sitlMahDrawn = 0.0;        // mAh
+// 25 degC: the temperature an ESC reports at rest, so hosts that do not send
+// ESC telemetry still show a plausible value instead of 0.
+static double sitlMotorTemperature[SITL_FDM_EXT_MOTOR_TEMPERATURE_COUNT] = { 25.0, 25.0, 25.0, 25.0 };
 
-void simTelemetrySet(double voltage, double current, const double *rpm, int rpmCount)
+void simTelemetrySet(double voltage, double current,
+                     const double *rpm, int rpmCount,
+                     const double *temperature, int temperatureCount)
 {
     if (voltage > 0.0) {
         sitlBatteryVoltage = voltage;
@@ -54,6 +62,13 @@ void simTelemetrySet(double voltage, double current, const double *rpm, int rpmC
     for (int i = 0; i < SITL_FDM_EXT_MOTOR_RPM_COUNT && i < rpmCount; i++) {
         if (rpm[i] >= 0.0) {
             sitlMotorRpm[i] = rpm[i];
+        }
+    }
+    if (temperature != NULL) {
+        for (int i = 0; i < SITL_FDM_EXT_MOTOR_TEMPERATURE_COUNT && i < temperatureCount; i++) {
+            if (temperature[i] > 0.0) {
+                sitlMotorTemperature[i] = temperature[i];
+            }
         }
     }
 }
@@ -87,6 +102,22 @@ float simTelemetryMotorFrequencyHz(uint8_t motorIndex)
         return 0.0f;
     }
     return (float)(sitlMotorRpm[motorIndex] / 60.0);
+}
+
+uint8_t simTelemetryEscTemperatureCelsius(uint8_t motorIndex)
+{
+    if (motorIndex >= SITL_FDM_EXT_MOTOR_TEMPERATURE_COUNT) {
+        return 0;
+    }
+    // DSHOT/ESC telemetry carries whole degrees Celsius in one byte.
+    const double temp = sitlMotorTemperature[motorIndex];
+    if (temp <= 0.0) {
+        return 0;
+    }
+    if (temp > 255.0) {
+        return 255;
+    }
+    return (uint8_t)(temp + 0.5);
 }
 
 #ifdef SITL_UDP_TIME
@@ -318,12 +349,17 @@ int udpRecv(udpLink_t *link, void *data, size_t size, uint32_t timeout_ms)
             double voltage = 0.0;
             double current = 0.0;
             double rpm[SITL_FDM_EXT_MOTOR_RPM_COUNT] = { 0.0 };
+            double temperature[SITL_FDM_EXT_MOTOR_TEMPERATURE_COUNT] = { 0.0 };
             memcpy(&voltage, rxBuf + SITL_FDM_EXT_BATTERY_VOLTAGE, sizeof(voltage));
             memcpy(&current, rxBuf + SITL_FDM_EXT_BATTERY_CURRENT, sizeof(current));
             for (int i = 0; i < SITL_FDM_EXT_MOTOR_RPM_COUNT; i++) {
                 memcpy(&rpm[i], rxBuf + SITL_FDM_EXT_MOTOR_RPM + i * (int)sizeof(double), sizeof(double));
             }
-            simTelemetrySet(voltage, current, rpm, SITL_FDM_EXT_MOTOR_RPM_COUNT);
+            for (int i = 0; i < SITL_FDM_EXT_MOTOR_TEMPERATURE_COUNT; i++) {
+                memcpy(&temperature[i], rxBuf + SITL_FDM_EXT_MOTOR_TEMPERATURE + i * (int)sizeof(double), sizeof(double));
+            }
+            simTelemetrySet(voltage, current, rpm, SITL_FDM_EXT_MOTOR_RPM_COUNT,
+                            temperature, SITL_FDM_EXT_MOTOR_TEMPERATURE_COUNT);
         }
 
 #ifdef SITL_UDP_TIME

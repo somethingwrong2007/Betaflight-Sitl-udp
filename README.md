@@ -244,6 +244,21 @@ impulses on stick snaps). `sitl_local_init()` also forces the UDP RX provider
 and the ADC battery/current meters so RC and voltage work regardless of the
 EEPROM configuration.
 
+**Motor telemetry (RPM + ESC temperature).** `in.motor_rpm[4]` and
+`in.motor_temperature[4]` (degrees Celsius) are pushed into the firmware as
+DSHOT/BLHeli telemetry, the only path the SITL can populate: RPM drives the
+RPM filter, dynamic idle, blackbox eRPM and the `MSP_MOTOR_TELEMETRY` RPM
+field, and the temperature shows up in the configurator's Motors tab
+(`MSP_MOTOR_TELEMETRY`), in `MSP_ESC_SENSOR_DATA` (DJI FPV) and in the OSD ESC
+over-temperature alarm (`esc_temp_alarm`, via `getDshotSensorData()`), clamped
+to the 0..255 degC the telemetry field carries. The OSD's numeric ESC
+temperature *element* reads the ESC-sensor store instead, which the SITL never
+fills (there is no serial ESC telemetry), so that one element stays at 0.
+`motor_temperature` is appended after `rc_channels`, so every earlier field
+keeps its offset - but the struct does grow, so rebuild the host when the DLL
+is replaced. Values <= 0 mean "no data" and keep the previous temperature;
+25 degC is the startup default.
+
 **Mixer type / motor count.** The mixer mode drives the output configuration:
 `motor_count` and `servo_count` in `sitl_local_output_t` follow the current
 mixer (QUADX = 4 motors, AIRPLANE/FLYING_WING = 1 motor + 6/2 servos, HEX6 =
@@ -368,17 +383,20 @@ monotonic clock automatically.
 ### Extended FDM packet (Windows UDP mode, optional)
 
 The first 144 bytes stay the official `fdm_packet`. A sender may append
-simulator telemetry that the SITL feeds into the virtual battery/RPM sensors:
+simulator telemetry that the SITL feeds into the virtual battery and motor
+telemetry:
 
 | Offset | Type | Field |
 |--------|------|-------|
 | 144 | double | battery voltage (V) |
 | 152 | double | battery current (A) |
 | 160 | double[4] | motor RPM (per motor) |
+| 192 | double[4] | motor ESC temperature (degC, per motor) |
 
-Total extended size: 192 bytes. Senders that only send the official 144-byte
-packet still work: voltage defaults to 16.8 V (4S), current to 0 A and RPM to
-0, so the FC always sees a battery.
+Total extended size: 224 bytes. Senders that only send the official 144-byte
+packet still work: voltage defaults to 16.8 V (4S), current to 0 A, RPM to 0
+and ESC temperature to 25 degC, so the FC always sees a battery. A value <= 0
+in the temperature block means "no data" and keeps the previous temperature.
 
 With the extended fields, the configurator and blackbox show real voltage,
 current and mAh draw. Fresh EEPROMs default `battery_meter` and
@@ -390,9 +408,13 @@ set current_meter = ADC
 save
 ```
 
-The per-motor RPM is parsed and kept available, but Betaflight's RPM filter
-and blackbox RPM fields require DSHOT telemetry, which the official SITL
-target excludes on x86, so the firmware does not consume RPM yet.
+The per-motor RPM and ESC temperature are pushed into the firmware through the
+DSHOT telemetry bridge (`getDshotRpm`/`getDshotErpm` and the DSHOT telemetry
+state), which is where the RPM filter, dynamic idle, blackbox eRPM, the
+configurator's Motors tab (`MSP_MOTOR_TELEMETRY`), `MSP_ESC_SENSOR_DATA` and
+the OSD ESC over-temperature alarm read them from. The OSD's numeric ESC
+temperature element instead reads the ESC-sensor store, which the SITL never
+fills, so that element stays at 0.
 
 ### rc_packet (9004)
 

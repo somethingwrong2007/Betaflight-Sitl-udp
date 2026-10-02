@@ -896,7 +896,15 @@ void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
     }
 
     // --- battery / RPM telemetry ---
-    simTelemetrySet(in->battery_voltage, in->battery_current, in->motor_rpm, 4);
+    simTelemetrySet(in->battery_voltage, in->battery_current,
+                    in->motor_rpm, 4,
+                    in->motor_temperature, 4);
+
+    // Publish the ESC telemetry that is read straight out of the DSHOT
+    // telemetry state (configurator Motors tab, MSP_ESC_SENSOR_DATA, OSD ESC
+    // alarms) - the virtual PWM backend never fills that structure itself.
+    extern void sitlLocalApplyDshotTelemetry(void);
+    sitlLocalApplyDshotTelemetry();
 
     // --- RC ---
     // Refresh the cache only when the host data actually changed. The frame

@@ -39,6 +39,10 @@ typedef struct {
     double battery_current;             // A
     double motor_rpm[4];                // per-motor RPM (telemetry)
     uint16_t rc_channels[SITL_LOCAL_MAX_RC_CHANNELS]; // 1000..2000, AETR + aux
+    // Simulated per-motor ESC temperature in degrees Celsius (telemetry).
+    // Appended after rc_channels so every earlier field keeps its offset.
+    // Values <= 0 mean "no data" and keep the last known temperature.
+    double motor_temperature[4];
 } sitl_local_input_t;
 
 typedef struct {

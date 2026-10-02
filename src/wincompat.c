@@ -156,6 +156,7 @@ void sitlMspWriteEEPROM(void)
 // (sitl_local_input_t.motor_rpm / the UDP extended tail) whenever it is
 // nonzero, and fall back to the real (always-zero in SITL) telemetry state.
 #include "pg/motor.h"
+#include "drivers/dshot.h"
 
 #define SITL_ERPM_PER_LSB 100.0f
 #define SITL_SIM_MOTOR_COUNT 4
@@ -200,6 +201,38 @@ uint16_t getDshotErpm(uint8_t motorIndex)
         return (uint16_t)(hz * 60.0f * polePairs / SITL_ERPM_PER_LSB);
     }
     return sitlDshotErpmReal(motorIndex);
+}
+
+// ESC telemetry bridge for the parts that are *not* read through a getter:
+// MSP_MOTOR_TELEMETRY (configurator Motors tab), MSP_ESC_SENSOR_DATA (DJI FPV)
+// and getDshotSensorData() (OSD ESC alarms) read dshotTelemetryState directly.
+// The DSHOT decoder never runs in SITL - the virtual PWM motor backend does -
+// so nothing would ever fill that structure. sitl_local_step() calls this once
+// per step (the temperature follows the host's thermal model at 1 kHz).
+//
+// The telemetry type bits matter as much as the values:
+//   TEMPERATURE -> the ACK'd DSHOT values are reported at all,
+//   eRPM        -> isDshotMotorTelemetryActive(), which getDshotSensorData()
+//                  requires before it hands the data to the OSD warnings.
+void sitlLocalApplyDshotTelemetry(void)
+{
+    unsigned motorCount = getMotorCount();
+    if (motorCount > MAX_SUPPORTED_MOTORS) {
+        motorCount = MAX_SUPPORTED_MOTORS;
+    }
+    for (unsigned i = 0; i < motorCount; i++) {
+        dshotTelemetryMotorState_t *state = &dshotTelemetryState.motorState[i];
+        const uint8_t temperature = simTelemetryEscTemperatureCelsius((uint8_t)i);
+
+        state->telemetryData[DSHOT_TELEMETRY_TYPE_TEMPERATURE] = temperature;
+        state->telemetryTypes |= (1 << DSHOT_TELEMETRY_TYPE_TEMPERATURE);
+        if (temperature > state->maxTemp) {
+            state->maxTemp = temperature;
+        }
+
+        state->telemetryData[DSHOT_TELEMETRY_TYPE_eRPM] = getDshotErpm((uint8_t)i);
+        state->telemetryTypes |= (1 << DSHOT_TELEMETRY_TYPE_eRPM);
+    }
 }
 
 float getMotorFrequencyHz(uint8_t motorIndex)
