@@ -355,8 +355,29 @@ void sitlLocalRequestEepromWrite(void)
 // makes it target the old file (and what makes a brand-new path detectable).
 static volatile LONG gLocalReloadPending = 0;
 static volatile LONG gLocalRebootPending = 0;
+// Set by sitl_local_reload_config(): force the boot-equivalent re-init of the
+// stateful filter chains (gyro LPF/notch/dyn-notch/RPM + PID D-term filters)
+// instead of only re-applying them when their configuration changed. A fresh
+// boot always rebuilds them; a configurator write can leave them inconsistent,
+// and this is the repair path for that.
+static volatile LONG gLocalForceFullInit = 0;
 static volatile LONG gLocalPathPending = 0;
 static char gLocalPendingEepromPath[1024];
+
+// A configurator Save runs a chain of MSP_SET_* handlers, and some of them
+// re-run firmware initialisation right there on the MSP thread
+// (MSP_SET_FILTER_CONFIG calls gyroInitFilters() + pidInitFilters(),
+// MSP_SET_PID* call pidInitConfig(), ...). In this build that can leave the
+// derived runtime - filter coefficients/state, task periods, pidRuntime.dT -
+// inconsistent, which shows up as a persistent tremor that only a fresh DLL
+// load (a real boot) clears. So a save also schedules the *boot-equivalent*
+// re-init; it is applied on the next sitl_local_step() while disarmed, i.e.
+// exactly the work a DLL restart would do, without restarting the process.
+void sitlLocalRequestSaveReinit(void)
+{
+    InterlockedExchange(&gLocalForceFullInit, 1);
+    InterlockedExchange(&gLocalReloadPending, 1);
+}
 
 extern void ensureEepromDirectory(void);
 extern bool sitlEepromFileIsOpen(void);
@@ -411,6 +432,7 @@ int sitl_local_reload_config(void)
     if (!gLocalRunning || ARMING_FLAG(ARMED)) {
         return -1;
     }
+    InterlockedExchange(&gLocalForceFullInit, 1);
     InterlockedExchange(&gLocalReloadPending, 1);
     return 0;
 }
@@ -464,13 +486,17 @@ static void localRunPendingReload(void)
     }
     readEEPROM();
     const bool gyroFiltersChanged = sitlLocalGyroFilterConfigChanged();
+    const bool forceFullInit = InterlockedExchange(&gLocalForceFullInit, 0) != 0;
+    if (forceFullInit) {
+        sitlAuditLog("reload: forced boot-equivalent re-init (gyro + PID filter chains)");
+    }
 
     // Re-apply what readEEPROM/activateConfig does not cover: the LOCAL link
     // overrides (UDP RX provider, battery shims, PWM motor backend) and the
     // boot-time derived state (mixer mode, motor/servo setup, gyro filters,
     // debug mode).
     localApplyLinkOverrides();
-    sitlLocalRunBootReapply(gyroFiltersChanged);
+    sitlLocalRunBootReapply(forceFullInit || gyroFiltersChanged);
 
     // Finish what fc/init.c's initPhase3 does after that (looptime + DShot
     // telemetry, board alignment, IMU/failsafe init, and the profile-derived
