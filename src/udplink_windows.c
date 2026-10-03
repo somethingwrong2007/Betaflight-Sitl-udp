@@ -221,6 +221,9 @@ static void ensureWsaStartup(void)
 // legacy UDP receive threads idle instead of spinning.
 static uint8_t gLocalMotorPacket[256];
 static volatile LONG gLocalMotorPacketLen = 0;
+static volatile LONG gLocalMotorPacketsCaptured = 0;
+static volatile LONG gLocalMotorPacketsTaken = 0;
+static volatile LONG gLocalMotorPacketMisses = 0;
 
 void sitlLocalCaptureMotorPacket(const void *data, size_t size)
 {
@@ -229,16 +232,30 @@ void sitlLocalCaptureMotorPacket(const void *data, size_t size)
     }
     memcpy(gLocalMotorPacket, data, size);
     InterlockedExchange(&gLocalMotorPacketLen, (LONG)size);
+    InterlockedIncrement(&gLocalMotorPacketsCaptured);
 }
 
 bool sitlLocalTakeMotorPacket(void *out, size_t size)
 {
     const LONG len = InterlockedExchange(&gLocalMotorPacketLen, 0);
     if (len <= 0 || (size_t)len > size) {
+        InterlockedIncrement(&gLocalMotorPacketMisses);
         return false;
     }
     memcpy(out, gLocalMotorPacket, (size_t)len);
+    InterlockedIncrement(&gLocalMotorPacketsTaken);
     return true;
+}
+
+// Diagnostics: how healthy is the motor stream the host consumes? A cached
+// length of 0 (i.e. a step that found no freshly captured packet) or a captured
+// count that stops growing is exactly the kind of glitch that shows up as
+// "the sticks are fine but the aircraft shakes".
+void sitlLocalMotorStreamStats(uint32_t *captured, uint32_t *taken, uint32_t *missed)
+{
+    if (captured) { *captured = (uint32_t)InterlockedCompareExchange(&gLocalMotorPacketsCaptured, 0, 0); }
+    if (taken)    { *taken = (uint32_t)InterlockedCompareExchange(&gLocalMotorPacketsTaken, 0, 0); }
+    if (missed)   { *missed = (uint32_t)InterlockedCompareExchange(&gLocalMotorPacketMisses, 0, 0); }
 }
 #endif
 

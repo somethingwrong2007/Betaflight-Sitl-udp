@@ -263,8 +263,23 @@ void sitlLocalLogStateIfChanged(const char *tag)
                  now.hashSystem, now.hashPid, now.hashRates, now.hashGyro, now.hashMotor,
                  now.hashBattery, now.hashMixer, now.hashFeature, now.hashRx, now.hashImu,
                  now.hashAcc);
+    extern void sitlLocalStepStats(uint32_t *maxUs, uint32_t *avgUs, uint32_t *steps,
+                                   float motors[4], uint32_t *zeroWhileArmed);
+    extern void sitlLocalMotorStreamStats(uint32_t *captured, uint32_t *taken, uint32_t *missed);
+    extern void sitlLocalMspLoad(uint32_t *busyUs, uint32_t *calls);
+    uint32_t stepMaxUs = 0, stepAvgUs = 0, stepCount = 0, zeroArmed = 0;
+    uint32_t capPkts = 0, takePkts = 0, missPkts = 0;
+    uint32_t mspBusyUs = 0, mspCalls = 0;
+    float motors[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    sitlLocalStepStats(&stepMaxUs, &stepAvgUs, &stepCount, motors, &zeroArmed);
+    sitlLocalMotorStreamStats(&capPkts, &takePkts, &missPkts);
+    sitlLocalMspLoad(&mspBusyUs, &mspCalls);
+
     sitlAuditLog("%s rt protocol=%u dshot(cfg/edt/bb)=%u/%u/%u idle=%u thr=%u/%u poles=%u "
                  "battSrc=%u/%u rcOurs=%u mixer(cfg/rt/count)=%u/%u/%u denom=%u looptime=%u pidDt=%u "
+                 "stepUs(max/avg/count)=%u/%u/%u motorPkts(cap/take/miss)=%u/%u/%u "
+                 "motors=%.0f/%.0f/%.0f/%.0f zeroWhileArmed=%u "
+                 "mspThread(busyUs/calls)=%u/%u "
                  "featRt(air/ag/udp/gps/3d/esc)=%u/%u/%u/%u/%u/%u "
                  "lpf=%u/%u-%u/%u notch=%u/%u/%u/%u pidProf=%u ratesType=%u armed=%u armFlags=%08X "
                  "pidR=%u/%u/%u/%u pidP=%u/%u/%u/%u pidY=%u/%u/%u/%u",
@@ -275,6 +290,11 @@ void sitlLocalLogStateIfChanged(const char *tag)
                  (unsigned)now.voltSrc, (unsigned)now.currSrc, (unsigned)now.rcOurs,
                  (unsigned)now.mixerCfg, (unsigned)now.mixerRt, (unsigned)now.motorCount,
                  (unsigned)now.denom, (unsigned)now.targetLooptime, (unsigned)now.pidDtMicro,
+                 (unsigned)stepMaxUs, (unsigned)stepAvgUs, (unsigned)stepCount,
+                 (unsigned)capPkts, (unsigned)takePkts, (unsigned)missPkts,
+                 (double)motors[0], (double)motors[1], (double)motors[2], (double)motors[3],
+                 (unsigned)zeroArmed,
+                 (unsigned)mspBusyUs, (unsigned)mspCalls,
                  (unsigned)now.rtAirMode, (unsigned)now.rtAntiGravity, (unsigned)now.rtRxUdp,
                  (unsigned)now.rtGps, (unsigned)now.rt3d, (unsigned)now.rtEscSensor,
                  (unsigned)now.lpf1, (unsigned)now.lpf1DynMin, (unsigned)now.lpf1DynMax,

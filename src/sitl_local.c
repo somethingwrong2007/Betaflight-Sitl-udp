@@ -103,6 +103,16 @@ extern void sitlMspSerialProcessReal(localMspEvaluateNonMspData_e evaluateNonMsp
 static CRITICAL_SECTION gMspCrit;
 static volatile LONG gMspThreadId = 0;
 
+// Diagnostics: how much of the host's CPU the MSP/configurator link burns.
+static volatile LONG64 gMspBusyUs = 0;
+static volatile LONG gMspProcessCalls = 0;
+
+void sitlLocalMspLoad(uint32_t *busyUs, uint32_t *calls)
+{
+    if (busyUs) { *busyUs = (uint32_t)InterlockedCompareExchange64(&gMspBusyUs, 0, 0); }
+    if (calls)  { *calls = (uint32_t)InterlockedCompareExchange(&gMspProcessCalls, 0, 0); }
+}
+
 void mspSerialProcess(localMspEvaluateNonMspData_e evaluateNonMspData,
                       mspProcessCommandFnPtr mspProcessCommandFn,
                       mspProcessReplyFnPtr mspProcessReplyFn)
@@ -115,7 +125,11 @@ void mspSerialProcess(localMspEvaluateNonMspData_e evaluateNonMspData,
         return;
     }
     EnterCriticalSection(&gMspCrit);
+    extern uint64_t micros64_real(void);
+    const uint64_t mspStartUs = micros64_real();
     sitlMspSerialProcessReal(evaluateNonMspData, mspProcessCommandFn, mspProcessReplyFn);
+    InterlockedExchangeAdd64(&gMspBusyUs, (LONG64)(micros64_real() - mspStartUs));
+    InterlockedIncrement(&gMspProcessCalls);
     LeaveCriticalSection(&gMspCrit);
 }
 
@@ -887,6 +901,44 @@ static uint8_t sitlLocalServoCount(void)
     return 0;
 }
 
+// Host-side step diagnostics (see sitlLocalStepStats()).
+static uint32_t gLocalStepUsMax = 0;
+static uint32_t gLocalStepUsAvg = 0;
+static uint32_t gLocalStepCount = 0;
+static uint32_t gLocalStepUsSum = 0;
+static float gLocalLastMotors[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+static uint32_t gLocalZeroMotorStepsWhileArmed = 0;
+
+static void localRecordStepStats(uint64_t stepStartUs, const sitl_local_output_t *out)
+{
+    extern uint64_t micros64_real(void);
+    const uint32_t elapsedUs = (uint32_t)(micros64_real() - stepStartUs);
+    if (elapsedUs > gLocalStepUsMax) {
+        gLocalStepUsMax = elapsedUs;
+    }
+    gLocalStepUsSum += elapsedUs;
+    if (++gLocalStepCount >= 1000) {
+        gLocalStepUsAvg = gLocalStepUsSum / gLocalStepCount;
+        gLocalStepUsSum = 0;
+        gLocalStepUsMax = 0;
+        gLocalStepCount = 0;
+    }
+
+    if (out != NULL) {
+        float sum = 0.0f;
+        for (int i = 0; i < 4; i++) {
+            gLocalLastMotors[i] = out->pwm_output_raw[i];
+            sum += out->pwm_output_raw[i];
+        }
+        // All-zero motor outputs are only legitimate while disarmed (the
+        // disarmed value is ~1000): while armed they mean the captured motor
+        // packet was missing and the host received garbage.
+        if (out->armed && sum < 1.0f) {
+            gLocalZeroMotorStepsWhileArmed++;
+        }
+    }
+}
+
 void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
                      sitl_local_output_t *out)
 {
@@ -896,6 +948,8 @@ void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
     if (!gLocalRunning || !in) {
         return;
     }
+    extern uint64_t micros64_real(void);
+    const uint64_t stepStartUs = micros64_real();
 
     // A configurator Save may have undone the pinned LOCAL runtime state; this
     // only rewrites flags/mode sources, so it also runs while armed.
@@ -1079,6 +1133,23 @@ void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
         }
         out->armed = (armingFlags & ARMED) != 0;
     }
+
+    // Host-side diagnostics: how long this step took in real time, and what the
+    // host actually receives (all-zero motor outputs while armed mean the
+    // captured motor packet was missing - the FC state looks fine, but the
+    // aircraft would get garbage).
+    localRecordStepStats(stepStartUs, out);
+}
+
+// Exposed to the state recorder in wincompat.c.
+void sitlLocalStepStats(uint32_t *maxUs, uint32_t *avgUs, uint32_t *steps,
+                        float motors[4], uint32_t *zeroWhileArmed)
+{
+    if (maxUs)  { *maxUs = gLocalStepUsMax; }
+    if (avgUs)  { *avgUs = gLocalStepUsAvg; }
+    if (steps)  { *steps = gLocalStepCount; }
+    if (motors) { memcpy(motors, gLocalLastMotors, sizeof(gLocalLastMotors)); }
+    if (zeroWhileArmed) { *zeroWhileArmed = gLocalZeroMotorStepsWhileArmed; }
 }
 
 uint64_t sitl_local_time_us(void)
