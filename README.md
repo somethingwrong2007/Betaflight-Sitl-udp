@@ -604,6 +604,64 @@ every save, and writes two `state ...` lines to the same audit log whenever any
 of it changes. Diffing those two lines pinpoints what a configurator write (or
 anything else) changed at runtime, including state no configurator page shows.
 
+### What a configurator Save does to a running LOCAL build (measured)
+
+`sitl_local_save_compare` replays one deterministic scenario (armed, 1500
+throttle, roll stick doublet plus a fixed gyro waveform) before and after a save
+on the *same* flight controller and diffs the motor outputs sample by sample:
+
+```
+sitl_local_save_compare save-only     plain "Save" (MSP_EEPROM_WRITE)
+sitl_local_save_compare save-reboot   "Save and Reboot" (+ MSP_REBOOT)
+sitl_local_save_compare api-only      MSP round trip, no EEPROM write (bisect)
+sitl_local_save_compare control       no MSP traffic at all (baseline)
+sitl_local_save_compare sensitivity   no save; doubles the gyro noise instead
+```
+
+Measured on this build (motor PWM, 1000..2000 us):
+
+| mode | before vs after | after vs after (repeat) |
+| --- | --- | --- |
+| `control` | identical (max 0.0009 us) | identical |
+| `api-only` | identical (max 0.0009 us) | identical |
+| `save-only` | **changes by up to 153 us** | identical |
+| `save-reboot` | **changes by up to 153 us** | identical |
+| `sensitivity` (2x gyro noise) | changes by 10.6 us | identical |
+
+A plain Save does **not** change the steady state - the two traces are
+bit-identical while the stick is still - but the response to a stick input is
+different afterwards: the difference starts exactly at the stick step, peaks at
+~153 us (~15% of the output range) and decays as the transient settles.
+Repeating the after-trace reproduces the new response exactly, so a save leaves
+the loop on a *different but stable* operating point rather than on a transient
+that simply needs longer settling.
+
+Where it comes from: a configurator Save is `MSP_EEPROM_WRITE`, and the firmware
+handler does
+
+```c
+writeEEPROM();
+readEEPROM();        // msp.c: writeReadEeprom()
+```
+
+`readEEPROM()` re-reads the EEPROM and calls `activateConfig()`, which
+re-initialises runtime state *while the flight loop keeps running*:
+`initRcProcessing()` (resets the feedforward / setpoint-smoothing chain and the
+derived rate tables), `pidInit()`, `rcControlsInit()`, `failsafeReset()`,
+`accInitFilters()`, `initActiveBoxIds()`. On real hardware that only ever happens
+at boot with the motors off; in a LOCAL build the same code runs with a live gyro
+stream and a live PID loop, which is why a Save can change how the aircraft
+reacts to stick input. Steady-state behaviour, PID/rate/filter settings and every
+value in the `state` fingerprint of `sitl-audit.log` stay identical - the change
+lives in the stick-transient state that fingerprint does not cover.
+
+Harness notes: it needs an ARM switch in the EEPROM (it probes every AUX channel
+and both switch positions until the firmware really arms, then turns the runaway
+takeoff protection off the way a real takeoff does), it runs the FC at 1 kHz
+synchronously, it compares traces by scenario phase and aligns them to the 8 ms
+RC-frame cadence, and its output goes to stderr because LOCAL mode reopens stdout
+to `NUL`.
+
 ### Tuning note: configurator shows 999/333
 
 The Setup page computes `pidHz = 1e6 / cycleTime` and `gyroHz = pidHz *

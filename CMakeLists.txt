@@ -677,4 +677,10 @@ if(SITL_LINK_MODE STREQUAL "LOCAL")
   add_executable(sitl_local_host tools/sitl_local_host.c)
   target_link_libraries(sitl_local_host PRIVATE betaflight_SITL)
   target_include_directories(sitl_local_host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+  # Save-invariance harness: replays one deterministic control scenario before
+  # and after a configurator save and diffs the motor outputs.
+  add_executable(sitl_local_save_compare tools/sitl_local_save_compare.c)
+  target_link_libraries(sitl_local_save_compare PRIVATE betaflight_SITL ws2_32)
+  target_include_directories(sitl_local_save_compare PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 endif()
