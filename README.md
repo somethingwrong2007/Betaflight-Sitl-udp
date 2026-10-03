@@ -507,8 +507,8 @@ Sequence and rules:
 ### Automatic restart on firmware reboot (Windows)
 
 This applies to the standalone UDP build. The LOCAL (DLL) build never
-restarts the process: its reboot handler persists the config and keeps the
-FC running in-process (see the LOCAL caveats above).
+restarts the process: its reboot handler reproduces the reboot in-process
+(see "Firmware reboot in-process" below).
 
 Any firmware reboot (`MSP_REBOOT`, CLI `save`, CLI `exit`, CMS save-exit)
 no longer leaves the simulator dead:
@@ -528,59 +528,71 @@ reboots without saving.
 
 ### Firmware reboot in-process (LOCAL DLL)
 
-The LOCAL build never reboots the process and never re-runs the firmware boot.
-Every reboot path - the configurator's **Save and Reboot** (`MSP_EEPROM_WRITE`
-followed by `MSP_REBOOT`), CLI `save`/`exit`/`defaults`, CMS, and **Enter
-bootloader/DFU** - persists the config and keeps the FC running:
+Every reboot path - the configurator's **Save and Reboot** (`MSP_REBOOT` after
+`MSP_EEPROM_WRITE`), CLI `save`/`exit`/`defaults`, CMS, and **Enter
+bootloader/DFU** - funnels into one handler that reproduces, as closely as an
+in-process DLL can, what real hardware does:
 
-1. `systemReset()` re-syncs `debugMode` (so a CHIRP / blackbox `debug_mode`
-   change takes effect) and asks for a boot-config re-apply.
-2. On the next `sitl_local_step()`, between scheduler passes, the boot-time
-   *derived* state is re-applied: the virtual PWM motor backend, the mixer mode
-   (motor count / fixed-wing surfaces), servos, the PID state and `debugMode`.
-   The EEPROM is **not** re-read - the RAM config the configurator just wrote is
-   already the live one, so a reboot can never roll a save back.
+1. **Immediately** (on whatever thread asked): close the blackbox log, disarm
+   (a real reboot drops the motor output - the very next `sitl_local_step()`
+   already returns disarmed motor values, so rebooting while airborne stops
+   the motors instead of leaving the old configuration flying), reset the
+   arming state machines, drop the CLI mode and the `ARMING_DISABLED_CLI` /
+   `ARMING_DISABLED_REBOOT_REQUIRED` flags.
+2. **On the next `sitl_local_step()`**, between scheduler passes: persist the
+   current RAM config, re-read the EEPROM (also applies a pending
+   `sitl_local_set_eeprom_path()`), re-apply every boot-derived setting -
+   `activateConfig()` covers PID/rate/battery profiles, RC processing,
+   failsafe, acc filters, `imuConfigure()`, active box ids; the LOCAL link
+   overrides re-pin the UDP receiver, the ADC battery meters and the virtual
+   PWM motor backend; then mixer/motor/servo, gyro filters and debug mode - and
+   finally re-init the `initPhase3` modules (`blackboxInit()`,
+   `gyroStartCalibration()`) plus the rest of `initPhase3` that the reload
+   path cannot cover (`gyroSetTargetLooptime()` + `initDshotTelemetry()`,
+   `initBoardAlignment()`, `imuInit()`, `failsafeInit()`, `mixerInitProfile()`
+   with its dynamic-idle / VBAT-sag / RPM-limiter / ez-landing runtime,
+   `positionInit()`, `autopilotInit()`), exactly like a boot.
 3. The configurator connection survives the reboot (the MSP thread is moved
-   back into its idle parser state instead of being left in `mspRebootFn()`'s
-   `while (true);`).
+   back to its idle parser state instead of being left in `mspRebootFn()`'s
+   `while (true);`). Expect a short RX re-acquisition right after the reboot,
+   like real hardware.
 
-What a real reboot does and this one deliberately does **not**:
+Three deliberate deviations, all simulator-specific:
 
 - The gyro filter chain (LPF1/LPF2, notches, dynamic notch, RPM filter) keeps
-  its state and is rebuilt only when the filter settings actually changed. The
-  LOCAL gyro stream never stops, so zeroing that state injects a step into the
-  filtered rate which the PID's D-term (`delta/dt`) amplifies into a
-  full-authority spike - measured as motors slamming between their limits and
-  reversing within a few ms right after a reload/reboot, i.e. the "violent shake
-  after Save and Reboot" symptom. A real FC zeroes those filters on boot, but its
-  motors are off and its gyro stream restarts, so it never sees that step. A
-  change to the gyro filter settings still rebuilds the filters (logged to the
-  audit log as `reload: gyro filter configuration changed, filters re-inited`),
-  exactly like a real FC applying a filter change live.
-- A reboot while armed does not drop the motor output: there is no MCU reset
-  here, and the re-apply above only runs while disarmed, so a craft in the air
-  keeps flying with the config it already had in RAM.
-- The virtual clock, the arming/failsafe state, the PID integrators and
-  `ARMING_DISABLED_BOOT_GRACE_TIME` are not reset, so the craft stays immediately
-  armable after a "Save and Reboot" instead of waiting out
+  its state across a reload/reboot and is only rebuilt when the filter
+  settings themselves changed. The LOCAL gyro stream never stops, so zeroing
+  that state injects a step into the filtered rate which the PID's D-term
+  (`delta/dt`) amplifies into a full-authority spike - measured as motors
+  slamming between their limits and reversing within a few ms right after a
+  reload/reboot, i.e. the "violent shake after Save and Reboot" symptom. A
+  real FC zeroes those filters on boot, but its motors are off and its gyro
+  stream restarts, so it never sees that step. A change to the gyro filter
+  settings still rebuilds the filters (logged to the audit log), exactly like
+  a real FC applying a filter change live.
+
+- The virtual clock is **not** reset (the host drives it and the scheduler
+  anchors its deadline grid to it), so uptime/stats keep counting across a
+  reboot.
+- `ARMING_DISABLED_BOOT_GRACE_TIME` is **not** re-armed, so the craft stays
+  immediately armable after a "Save and Reboot" instead of waiting out
   `powerOnArmingGraceTime`.
 
-If you want a *real* boot from the loaded EEPROM, call
-`sitl_local_reload_config()` (queued, applied on the next step, never while
-armed): it re-reads the file, re-applies every boot-derived setting and rebuilds
-the filter chains on purpose.
+The gyro calibration a real boot performs is kept (`gyroStartCalibration()`),
+but the virtual gyro reports it as complete immediately, so it never delays
+arming here.
 
 **Configurator writes cannot break the LOCAL link.** The configurator's Save
 writes settings over MSP (feature bitset, battery/ESC meters, motor config,
-mixer, board alignment, ...) without rebooting, which can undo the runtime state
-the LOCAL link pins at boot: the virtual receiver takeover, `FEATURE_RX_UDP`,
-the ADC battery meter sources, the virtual PWM motor protocol and the
-DShot-telemetry flag. Every `MSP_EEPROM_WRITE` therefore re-pins those overrides
-on the next `sitl_local_step()` (flags/mode sources only - no mixer, motor or
-filter state, so it is safe while armed) and logs a before/after fingerprint of
-the runtime state to `%LOCALAPPDATA%\Betaflight-SITL\sitl-audit.log`
-(`save state: ...` followed by `re-pin after config write: ...` when something
-had to be restored).
+mixer, board alignment, ...) without rebooting, which can undo the runtime
+state the LOCAL link pins at boot: the virtual receiver takeover,
+`FEATURE_RX_UDP`, the ADC battery meter sources, the virtual PWM motor protocol
+and the DShot-telemetry flag. Every `MSP_EEPROM_WRITE` therefore re-pins those
+overrides on the next `sitl_local_step()` (flags/mode sources only - no mixer,
+motor or filter state, so it is safe while armed) and logs a before/after
+fingerprint of the runtime state to
+`%LOCALAPPDATA%\Betaflight-SITL\sitl-audit.log` (`save state: ...` followed by
+`re-pin after config write: ...` when something had to be restored).
 
 On top of that, a **state flight recorder** watches everything control-relevant
 - config hashes (system/PID/rates/gyro/motor/battery/mixer/features/RX/IMU/acc),
@@ -663,9 +675,7 @@ mode, gyro/dterm filters) only at boot, and the LOCAL "reboot" does not re-run
 the boot sequence. The DLL re-applies this boot-time config on every config
 save / reboot: `debug_mode` is re-synced (so `set debug_mode = CHIRP` +
 `save` works for blackbox recording without reloading the DLL) and the
-gyro/dterm filter chains are rebuilt when the saved Filter-tab settings changed
-(an unchanged filter config keeps its state, which is what prevents the
-"violent shake after Save and Reboot").
+gyro/dterm filter chains are rebuilt from the saved settings (Filter tab).
 Filter re-init is skipped while armed so it never races the flight loop; a
 later save/reboot while disarmed applies it. Settings that still need a full
 host-session restart are the hardware-class ones (sensor selection, motor
