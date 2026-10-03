@@ -463,7 +463,8 @@ void sitlLocalRunSchedulerRepin(void)
     rescheduleTask(TASK_PID, periodUs);
     sitlAuditLog("scheduler re-anchored after config write (tasksInit, period=%u us)", (unsigned)periodUs);
 #else
-    UNUSED_NONE;
+    // Only the LOCAL link needs this: the standalone builds own the process, so
+    // a "reboot" really restarts it and re-runs tasksInit() anyway.
 #endif
 }
 
