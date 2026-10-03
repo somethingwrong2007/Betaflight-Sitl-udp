@@ -36,7 +36,9 @@
 #include "fc/controlrate_profile.h"
 #include "fc/rc_controls.h"
 #include "flight/imu.h"
+#include "flight/pid.h"
 #include "fc/rc_modes.h"
+#include "scheduler/scheduler.h"
 #include "flight/mixer.h"
 #include "flight/servos.h"
 #include "sitl_gyro.h"
@@ -201,6 +203,69 @@ static uint64_t gLocalRcAnnounceUs = 0;
 static uint32_t gLocalRcFrameCount = 0;
 // Last motor values handed to the host (step diagnostics / audit log).
 static float gLocalLastMotors[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+// Last raw gyro values fed to the virtual gyro device (for the burst recorder;
+// sensors/gyro.h cannot be included here, see the LOCAL mpuGyroReadRegister stub).
+static int16_t gLocalLastGyroRaw[3] = { 0, 0, 0 };
+
+// --- burst recorder -----------------------------------------------------------
+// The audit trail samples once a second, which cannot show a tremor. Once every
+// 12 s this records 2 s of 1 kHz control-loop data (gyro, the PID term
+// contributions, the motors, attitude and the active modes) so a real
+// oscillation can be analysed: which term drives it, how big it is and what the
+// motor response looks like.
+#define SITL_BURST_STEPS   2000
+#define SITL_BURST_PERIOD  12000
+
+static bool localBurstLog(void)
+{
+    static uint32_t stepsSinceBurst = SITL_BURST_PERIOD;
+    static uint32_t burstStep = 0;
+    static FILE *fp = NULL;
+
+    if (fp == NULL) {
+        if (++stepsSinceBurst < SITL_BURST_PERIOD) {
+            return false;
+        }
+        const char *appData = getenv("LOCALAPPDATA");
+        if (appData == NULL) {
+            return false;
+        }
+        char path[MAX_PATH];
+        _snprintf(path, sizeof(path), "%s\\Betaflight-SITL\\sitl-burst.log", appData);
+        fp = fopen(path, "w");
+        if (fp == NULL) {
+            return false;
+        }
+        fprintf(fp, "# t_us gyroR gyroP gyroY pR pP pY iR iP iY dR dP dY fR fP fY "
+                    "sumR sumP sumY m0 m1 m2 m3 attR attP attY modes armFlags "
+                    "pidDeltaUs gyroDeltaUs\n");
+        stepsSinceBurst = 0;
+        burstStep = 0;
+    }
+
+    fprintf(fp, "%.0f %.1f %.1f %.1f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f "
+                "%.2f %.2f %.2f %.2f %.2f %.2f %.0f %.0f %.0f %.0f %d %d %d %04X %08X "
+                "%d %d\n",
+            (double)micros64(),
+            (double)gLocalLastGyroRaw[0], (double)gLocalLastGyroRaw[1],
+            (double)gLocalLastGyroRaw[2],
+            (double)pidData[0].P, (double)pidData[1].P, (double)pidData[2].P,
+            (double)pidData[0].I, (double)pidData[1].I, (double)pidData[2].I,
+            (double)pidData[0].D, (double)pidData[1].D, (double)pidData[2].D,
+            (double)pidData[0].F, (double)pidData[1].F, (double)pidData[2].F,
+            (double)pidData[0].Sum, (double)pidData[1].Sum, (double)pidData[2].Sum,
+            (double)gLocalLastMotors[0], (double)gLocalLastMotors[1],
+            (double)gLocalLastMotors[2], (double)gLocalLastMotors[3],
+            (int)attitude.values.roll, (int)attitude.values.pitch, (int)attitude.values.yaw,
+            (unsigned)flightModeFlags, (unsigned)getArmingDisableFlags(),
+            (int)getTaskDeltaTimeUs(TASK_PID), (int)getTaskDeltaTimeUs(TASK_GYRO));
+
+    if (++burstStep >= SITL_BURST_STEPS) {
+        fclose(fp);
+        fp = NULL;
+    }
+    return true;
+}
 // Mirror of cliMode seen by the MSP thread (a real FC drops the CLI arming
 // block on reboot; LOCAL clears it when the CLI is left). File scope so a
 // in-process restart starts with a clean value.
@@ -1128,6 +1193,9 @@ void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
     const int16_t gy = (int16_t)constrain(gyroPitch * LOCAL_GYRO_SCALE * LOCAL_RAD2DEG, -32767, 32767);
     const int16_t gz = (int16_t)constrain(gyroYaw   * LOCAL_GYRO_SCALE * LOCAL_RAD2DEG, -32767, 32767);
     virtualGyroSet(virtualGyroDev, gx, gy, gz);
+    gLocalLastGyroRaw[0] = gx;
+    gLocalLastGyroRaw[1] = gy;
+    gLocalLastGyroRaw[2] = gz;
 
     // --- pressure derived from altitude (Gazebo bridge convention) ---
     const double altMeters = in->position_xyz[2];
@@ -1244,15 +1312,20 @@ void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
     // (schedLoopRemainingCycles > CHECK_GUARD_MARGIN_US), so stepping in
     // 100 us quanta gives the pre-deadline passes a chance to run them -
     // otherwise TASK_RX never processes RC frames and RXLOSS stays active.
-    uint32_t remainingUs = dtUs;
+    //
+    // Carry the sub-quantum remainder over to the next call. Without it a host
+    // that does not step in exact multiples of the quantum (any real engine tick
+    // jitters a little) injects a short extra step, and that shifts the gyro/PID
+    // deadline grid: the loop period then alternates instead of staying at 1 ms,
+    // which the D term (delta/dt) turns into a high-frequency tremor. Carrying
+    // the remainder keeps every step a whole quantum and the grid aligned.
+    static uint32_t gStepRemainderUs = 0;
+    uint32_t remainingUs = dtUs + gStepRemainderUs;
     const uint32_t quantumUs = 100;
+    gStepRemainderUs = remainingUs % quantumUs;
     while (remainingUs >= quantumUs) {
         sitlStepTime(quantumUs);
         remainingUs -= quantumUs;
-        scheduler();
-    }
-    if (remainingUs > 0) {
-        sitlStepTime(remainingUs);
         scheduler();
     }
 
@@ -1277,6 +1350,9 @@ void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
     // captured motor packet was missing - the FC state looks fine, but the
     // aircraft would get garbage).
     localRecordStepStats(stepStartUs, out);
+
+    // 1 kHz control-loop burst, once every 12 s (see localBurstLog).
+    (void)localBurstLog();
 }
 
 // Exposed to the state recorder in wincompat.c.
