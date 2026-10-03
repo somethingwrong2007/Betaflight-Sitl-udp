@@ -309,6 +309,20 @@ void sitlLocalRequestHardReboot(void)
     InterlockedExchange(&gLocalHardRebootPending, 1);
 }
 
+// Set when a configurator Save leaves state that only a fresh process/DLL load
+// rebuilds; the host polls it with sitl_local_take_reload_request().
+static volatile LONG gLocalHostReloadRequested = 0;
+
+void sitlLocalRequestHostReload(void)
+{
+    InterlockedExchange(&gLocalHostReloadRequested, 1);
+}
+
+int sitl_local_take_reload_request(void)
+{
+    return InterlockedExchange(&gLocalHostReloadRequested, 0) != 0 ? 1 : 0;
+}
+
 bool sitlLocalRcTakeOverActive(void)
 {
     return gLocalRunning && rxRuntimeState.rcReadRawFn == localRcReadRaw;

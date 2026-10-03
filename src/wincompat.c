@@ -483,6 +483,7 @@ void sitlMspWriteEEPROM(void)
     extern void sitlLocalRequestRepinOverrides(void);
     extern void sitlLocalRequestSchedulerRepin(void);
     extern void sitlLocalRequestHardReboot(void);
+    extern void sitlLocalRequestHostReload(void);
     sitlLocalLogStateIfChanged("save");
     sitlLocalRequestRepinOverrides();
     // The save path also perturbs the scheduler's own state (see
@@ -493,6 +494,10 @@ void sitlMspWriteEEPROM(void)
     // sensor device init, scheduler state), which used to require restarting
     // the host process. Applied on the next step while disarmed.
     sitlLocalRequestHardReboot();
+    // Tell the host as well: if the in-process reboot does not clear the
+    // state, the host can reload this library (shutdown + FreeLibrary +
+    // LoadLibrary + init), which is what restarting the engine does.
+    sitlLocalRequestHostReload();
 #endif
 }
 
