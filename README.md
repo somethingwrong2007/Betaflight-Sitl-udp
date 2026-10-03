@@ -553,7 +553,19 @@ in-process DLL can, what real hardware does:
    `while (true);`). Expect a short RX re-acquisition right after the reboot,
    like real hardware.
 
-Two deliberate deviations, both simulator-specific:
+Three deliberate deviations, all simulator-specific:
+
+- The gyro filter chain (LPF1/LPF2, notches, dynamic notch, RPM filter) keeps
+  its state across a reload/reboot and is only rebuilt when the filter
+  settings themselves changed. The LOCAL gyro stream never stops, so zeroing
+  that state injects a step into the filtered rate which the PID's D-term
+  (`delta/dt`) amplifies into a full-authority spike - measured as motors
+  slamming between their limits and reversing within a few ms right after a
+  reload/reboot, i.e. the "violent shake after Save and Reboot" symptom. A
+  real FC zeroes those filters on boot, but its motors are off and its gyro
+  stream restarts, so it never sees that step. A change to the gyro filter
+  settings still rebuilds the filters (logged to the audit log), exactly like
+  a real FC applying a filter change live.
 
 - The virtual clock is **not** reset (the host drives it and the scheduler
   anchors its deadline grid to it), so uptime/stats keep counting across a

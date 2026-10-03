@@ -368,6 +368,16 @@ static void localRunPendingReload(void)
         ensureEepromDirectory();
     }
 
+    // Snapshot the gyro filter configuration first: the filter chain is
+    // stateful, and re-initialising it while the host keeps feeding gyro
+    // samples injects a step that the PID's D-term amplifies into a
+    // full-authority spike (violent oscillation right after a reload/reboot).
+    // It is therefore only rebuilt when the filter settings really changed.
+    extern void sitlLocalSnapshotGyroFilterConfig(void);
+    extern bool sitlLocalGyroFilterConfigChanged(void);
+    extern void sitlLocalRunBootReapply(bool reinitGyroFilters);
+    sitlLocalSnapshotGyroFilterConfig();
+
     // Open the file named by BF_SITL_EEPROM (sitlFopen resolves the env var on
     // every call) and load it into the flash mirror, then into the PG records.
     configUnlock();
@@ -377,14 +387,14 @@ static void localRunPendingReload(void)
         ensureEEPROMStructureIsValid();
     }
     readEEPROM();
+    const bool gyroFiltersChanged = sitlLocalGyroFilterConfigChanged();
 
     // Re-apply what readEEPROM/activateConfig does not cover: the LOCAL link
     // overrides (UDP RX provider, battery shims, PWM motor backend) and the
     // boot-time derived state (mixer mode, motor/servo setup, gyro filters,
     // debug mode).
     localApplyLinkOverrides();
-    extern void sitlLocalRunBootReapply(void);
-    sitlLocalRunBootReapply();
+    sitlLocalRunBootReapply(gyroFiltersChanged);
 }
 
 // Deferred half of a firmware reboot; the immediate half (disarm, CLI and

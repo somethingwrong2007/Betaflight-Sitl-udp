@@ -24,6 +24,9 @@
 #include "flight/mixer.h"
 #include "flight/servos.h"
 #include "sensors/gyro_init.h"
+#include "sensors/gyro.h"
+#include "pg/dyn_notch.h"
+#include "pg/rpm_filter.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -126,7 +129,64 @@ void sitlLocalRequestReboot(void)
 #endif
 }
 
-void sitlLocalRunBootReapply(void)
+// The gyro filter chain (LPF1/LPF2, notches, dynamic notch, RPM filter) is
+// stateful, and zeroing that state while the host keeps feeding gyro samples
+// injects a step into the filtered rate: the PID's D-term (delta/dt) turns it
+// into a full-authority spike, which shows up as violent oscillation right
+// after a reload/reboot. Real hardware only rebuilds these filters at boot or
+// when the filter settings change (a real reboot also restarts the gyro
+// stream, so a zero state means something), while the LOCAL link's gyro stream
+// never stops. Snapshot the filter configuration around the EEPROM read and
+// re-init only when it actually changed.
+static gyroConfig_t gGyroFilterConfigSnapshot;
+#ifdef USE_DYN_NOTCH_FILTER
+static dynNotchConfig_t gDynNotchConfigSnapshot;
+#endif
+#ifdef USE_RPM_FILTER
+static rpmFilterConfig_t gRpmFilterConfigSnapshot;
+#endif
+static bool gGyroFilterConfigSnapshotValid = false;
+
+void sitlLocalSnapshotGyroFilterConfig(void)
+{
+#ifdef SITL_LOCAL
+    gGyroFilterConfigSnapshot = *gyroConfig();
+#ifdef USE_DYN_NOTCH_FILTER
+    gDynNotchConfigSnapshot = *dynNotchConfig();
+#endif
+#ifdef USE_RPM_FILTER
+    gRpmFilterConfigSnapshot = *rpmFilterConfig();
+#endif
+    gGyroFilterConfigSnapshotValid = true;
+#endif
+}
+
+bool sitlLocalGyroFilterConfigChanged(void)
+{
+#ifdef SITL_LOCAL
+    if (!gGyroFilterConfigSnapshotValid) {
+        return true;
+    }
+    if (memcmp(&gGyroFilterConfigSnapshot, gyroConfig(), sizeof(gyroConfig_t)) != 0) {
+        return true;
+    }
+#ifdef USE_DYN_NOTCH_FILTER
+    if (memcmp(&gDynNotchConfigSnapshot, dynNotchConfig(), sizeof(dynNotchConfig_t)) != 0) {
+        return true;
+    }
+#endif
+#ifdef USE_RPM_FILTER
+    if (memcmp(&gRpmFilterConfigSnapshot, rpmFilterConfig(), sizeof(rpmFilterConfig_t)) != 0) {
+        return true;
+    }
+#endif
+    return false;
+#else
+    return true;
+#endif
+}
+
+void sitlLocalRunBootReapply(bool reinitGyroFilters)
 {
 #ifdef SITL_LOCAL
     // Re-pin the virtual PWM motor backend first: the EEPROM may hold DSHOT600
@@ -135,7 +195,10 @@ void sitlLocalRunBootReapply(void)
     // motor output.
     extern void sitlLocalPreMotorInit(void);
     sitlLocalPreMotorInit();
-    gyroInitFilters();
+    if (reinitGyroFilters) {
+        sitlAuditLog("reload: gyro filter configuration changed, filters re-inited");
+        gyroInitFilters();
+    }
     pidInit(currentPidProfile);
     // Mixer / motor / servo config: re-applies the mixer mode (motor count,
     // fixed-wing surfaces) from the saved setting. motorDevInit leaves the
