@@ -547,7 +547,11 @@ in-process DLL can, what real hardware does:
    overrides re-pin the UDP receiver, the ADC battery meters and the virtual
    PWM motor backend; then mixer/motor/servo, gyro filters and debug mode - and
    finally re-init the `initPhase3` modules (`blackboxInit()`,
-   `gyroStartCalibration()`), exactly like a boot.
+   `gyroStartCalibration()`) plus the rest of `initPhase3` that the reload
+   path cannot cover (`gyroSetTargetLooptime()` + `initDshotTelemetry()`,
+   `initBoardAlignment()`, `imuInit()`, `failsafeInit()`, `mixerInitProfile()`
+   with its dynamic-idle / VBAT-sag / RPM-limiter / ez-landing runtime,
+   `positionInit()`, `autopilotInit()`), exactly like a boot.
 3. The configurator connection survives the reboot (the MSP thread is moved
    back to its idle parser state instead of being left in `mspRebootFn()`'s
    `while (true);`). Expect a short RX re-acquisition right after the reboot,

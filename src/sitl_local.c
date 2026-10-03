@@ -395,6 +395,14 @@ static void localRunPendingReload(void)
     // debug mode).
     localApplyLinkOverrides();
     sitlLocalRunBootReapply(gyroFiltersChanged);
+
+    // Finish what fc/init.c's initPhase3 does after that (looptime + DShot
+    // telemetry, board alignment, IMU/failsafe init, and the profile-derived
+    // mixer runtime: dynamic idle, VBAT sag compensation, RPM limiter, ez
+    // landing). Without it an in-process reboot would not match a fresh boot
+    // for a configured aircraft.
+    extern void sitlLocalRunBootProfileInit(void);
+    sitlLocalRunBootProfileInit();
 }
 
 // Deferred half of a firmware reboot; the immediate half (disarm, CLI and

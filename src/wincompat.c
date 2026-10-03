@@ -22,9 +22,16 @@
 #include "flight/pid.h"
 #include "flight/pid_init.h"
 #include "flight/mixer.h"
+#include "flight/mixer_init.h"
 #include "flight/servos.h"
+#include "flight/imu.h"
+#include "flight/failsafe.h"
+#include "flight/position.h"
+#include "flight/autopilot.h"
 #include "sensors/gyro_init.h"
 #include "sensors/gyro.h"
+#include "sensors/boardalignment.h"
+#include "drivers/dshot.h"
 #include "pg/dyn_notch.h"
 #include "pg/rpm_filter.h"
 
@@ -215,6 +222,40 @@ void sitlLocalRunBootReapply(bool reinitGyroFilters)
     motorPostInit();
     motorEnable();
     sitlLocalSyncDebugMode();
+#endif
+}
+
+// The rest of fc/init.c's initPhase3 that the reload path does not cover.
+// Without it an in-process reboot is *not* the same state as a fresh boot: the
+// gyro/dshot looptime derivation, the board alignment, IMU and failsafe init,
+// and above all the profile-derived mixer runtime that mixerInitProfile()
+// builds (dynamic idle gains and the DShot minimum-output override, VBAT sag
+// compensation, RPM limiter gains, ez-landing thresholds) would keep whatever
+// the previous boot left behind - a configured aircraft then flies with a
+// different motor output range / idle behaviour than a freshly started one.
+// Must run after sitlLocalRunBootReapply() (mixerInit + pidInit) and after the
+// EEPROM was re-read, mirroring initPhase3's order.
+void sitlLocalRunBootProfileInit(void)
+{
+#ifdef SITL_LOCAL
+    // initPhase3 derives the looptime from the (validated) pid_process_denom
+    // and hands it to the DShot telemetry backend.
+    gyroSetTargetLooptime(pidConfig()->pid_process_denom);
+    validateAndFixGyroConfig();
+    gyroSetTargetLooptime(pidConfig()->pid_process_denom);
+    initDshotTelemetry(gyro.targetLooptime);
+
+    initBoardAlignment(boardAlignment());
+    imuInit();
+    failsafeInit();
+
+    // pidInit() already ran in sitlLocalRunBootReapply(); redo it here so the
+    // PID dt matches the looptime derived above, exactly like initPhase3.
+    pidInit(currentPidProfile);
+    mixerInitProfile();
+
+    positionInit();
+    autopilotInit();
 #endif
 }
 
