@@ -734,8 +734,11 @@ high, i.e. with whatever other mode boxes the config has bound there active),
 edit flows (`cfg-change-filter`, `cfg-change-rate`, `cfg-change-pid`,
 `cfg-change`), a double save (`twice`), five saves in a row (`repeat`) and an
 in-process FC restart (`reinit`). A no-op save must leave the traces identical; a
-real edit must change them and reverting must return to the baseline. Current
-state: **46/46 pass**.
+real edit must change them and reverting must return to the baseline. `reinit` is
+the exception by design: after the "second-boot chain rebuild" was removed (see
+below) a restart no longer has to match the pre-restart traces bit for bit - it is
+the boot path the firmware builds that matters. Current state: the save/edit cases
+pass; the `reinit` verdict is informational.
 
 Known gap: the CLI's own `save` (`#` to enter the CLI, then `save`) is not part
 of the matrix yet - the CLI is entered (`ARMING_DISABLED_CLI` shows up) and the
@@ -751,7 +754,7 @@ reboot handling differs from ours in two important ways:
 | | AJ92/SimITL | this build (LOCAL) |
 | --- | --- | --- |
 | plain Save (`MSP_EEPROM_WRITE`) | stock firmware: `writeReadEeprom()` -> `writeEEPROM(); readEEPROM();` -> `activateConfig()`, i.e. `initRcProcessing()` / `pidInit()` / `rcControlsInit()` / `accInitFilters()` run live | persist only; those live re-inits are gated on "the settings really changed" (stock behaviour measured: 153 us / 318 us of different stick response) |
-| Save and Reboot | `systemReset()` calls `init()`, a full in-process firmware init, and their `systemInit()` resets the virtual clock to 0 and `cliMode` | persist + re-apply (mixer/motor/servo, filters only when changed, `debugMode`, `initPhase3` modules); `sitl_local_init()` additionally rebuilds the gyro/D-term/RC chains so an in-process restart is byte-for-byte a fresh boot (0.0007 us) |
+| Save and Reboot | `systemReset()` calls `init()`, a full in-process firmware init, and their `systemInit()` resets the virtual clock to 0 and `cliMode` | persist + re-apply (mixer/motor/servo, filters only when changed, `debugMode`, `initPhase3` modules); nothing is re-initialised that the firmware's own boot built, so the running loop is never disturbed (see "The shake: one root cause, two triggers") |
 | leaving the CLI | the reboot's `systemInit()` sets `cliMode = false` | `sitlLocalRequestReboot()` clears `cliMode` and the CLI arming block; a watcher clears them when the CLI is left without a reboot |
 | virtual EEPROM | their `target.c` closes a stale handle on re-open ("can just restart without closing the fileDesc") | `sitl_local_shutdown()` flushes+closes it, and `sitl_local_init()` now also closes a stale handle before boot (adopted from SimITL) |
 | configurator link | WebSocket straight onto the serial port (5761) via libwebsockets | plain TCP 5761 plus a separate WebSocket proxy on 6761 |
@@ -779,7 +782,58 @@ Two further problems were found and fixed while building that matrix:
   loader only zeroes once per process, so `sitl_local_init()` now re-derives them
   explicitly (`gyroInitFilters()`, `pidInitFilters()`, `initRcProcessing()`) and
   resets the link state a fresh process would start with. `reinit` now measures
-  identical (0.0007 us).
+  identical (0.0007 us) - see "The shake: one root cause, two triggers" below:
+  that rebuild was removed again, because it moved the shake trigger onto the
+  restart path.
+
+#### The shake: one root cause, two triggers
+
+The "aircraft shakes until the process is restarted" symptom has **one** root
+cause: *anything that re-initialises the stateful control chains while the flight
+loop is running* - the gyro filter block (`gyroInitFilters()`), the D-term filter
+block (`pidInitFilters()`) and the rate/RC processing (`initRcProcessing()`), all
+three also touched by `activateConfig()`. Rebuilding them under a live gyro stream
+injects a step that the D term (`delta/dt`) amplifies into a full-authority
+oscillation (measured: one axis railing the motors between 2000/1054 us at
+~120 Hz). Two rounds were needed because the trigger moved:
+
+| trigger | how it fired | fix |
+| --- | --- | --- |
+| configurator **Save** / **Save and Reboot** | the page writes its settings first (`MSP_SET_PID`, `MSP_SET_FILTER_CONFIG`, `MSP_SET_RC_TUNING`), then `MSP_EEPROM_WRITE` -> `writeReadEeprom()` -> `writeEEPROM(); readEEPROM();` -> `activateConfig()`, all under a live loop | the Save no longer re-reads the EEPROM, and those three handlers rebuild only when the settings really changed |
+| **in-process FC restart / level reload** (a regression of ours) | `sitl_local_init()` was made to re-derive the same three chains on a *second* init inside one process, to make a restart byte-identical to a fresh boot | removed again: the boot path is left exactly as the firmware builds it |
+
+That second trigger is the pitfall worth remembering: it was added while fixing a
+*measurement* (a synthetic 315 us "restart is not a fresh boot" difference) and it
+made the shake appear from boot instead of after a save. Do not "helpfully"
+re-initialise what the firmware itself just built - the trigger only reappears
+somewhere else.
+
+How it was pinned down:
+
+- the **state flight recorder** in `sitl-audit.log` (config hashes + runtime
+  values, timestamped) *disproved* the "EEPROM corrupted / tuning changed"
+  hypotheses: every control-relevant field was constant across sessions;
+- the **1 kHz burst recorder** (`sitl-burst.log`: fed gyro, PID term
+  contributions, motors, attitude, modes, and the loop period the firmware really
+  used) showed a D-dominated ~120 Hz limit cycle with saturated motors - the
+  signature of a mid-flight re-init, not of a gain problem;
+- **A/B builds** separated the suspects: attitude estimator bypassed, Save
+  re-reading the EEPROM again, and finally the historical commit `a315ef9` (the
+  state before the save/reboot work). `a315ef9` was clean at boot but shook after
+  saving the PID tab, while the newer build shook from boot - which located the
+  moved trigger.
+
+Also fixed along the way:
+
+- **A test tool must never write the user's EEPROM**: the harness works on a copy
+  in `%TEMP%` and selects it with `sitl_local_set_eeprom_path()` *before*
+  `sitl_local_init()` (a `BF_SITL_EEPROM` set by the host before the DLL is loaded
+  is not reliable - the DLL has its own CRT environment). With that, a writing
+  test case leaves the real `eeprom.bin` byte-identical (SHA256 checked).
+- **`reinit` is no longer expected to be identical** to the pre-restart state: the
+  FC is left exactly as its own boot built it, which is what keeps the shake away.
+  The save / save-and-reboot cases are the ones that must stay identical, and the
+  matrix checks exactly that.
 
 Harness notes: it needs an ARM switch in the EEPROM (it probes every AUX channel
 and both switch positions until the firmware really arms, then turns the runaway
