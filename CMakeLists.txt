@@ -494,6 +494,15 @@ if(WIN32)
   list(APPEND BF_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/ws_proxy_win.c")
   if(SITL_LINK_MODE STREQUAL "LOCAL")
     list(APPEND BF_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/sitl_local.c")
+    # Optional A/B switch: inject the FDM attitude straight into the IMU instead
+    # of letting the firmware's estimator (USE_IMU_CALC) derive it from the
+    # virtual acc/gyro/mag. Applied to sitl_local.c only, so toggling it rebuilds
+    # one file and a comparison build can coexist with the default one.
+    option(SITL_ATTITUDE_DIRECT "LOCAL: inject the FDM attitude directly (bypass the estimator)" OFF)
+    if(SITL_ATTITUDE_DIRECT)
+      set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/sitl_local.c"
+        PROPERTIES COMPILE_OPTIONS "-DSITL_ATTITUDE_DIRECT")
+    endif()
   endif()
 endif()
 
