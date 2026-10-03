@@ -818,22 +818,6 @@ int sitl_local_init(void)
     // PG record and therefore has to re-apply the same overrides.
     localApplyLinkOverrides();
 
-    // A *second* boot inside the same process (level reload, PIE restart) has to
-    // re-derive the stateful filter/PID/RC chains: their state lives in firmware
-    // module statics that the loader only zeroes once per process, so otherwise
-    // the restart inherits the previous run's state (measured: 315 us difference
-    // in the stick response). The first boot must NOT do this - the boot sequence
-    // has just built those chains, and rebuilding them on top can disturb the
-    // very setpoint/feedforward state a normal boot relies on.
-    static bool gLocalBootedBefore = false;
-    if (gLocalBootedBefore) {
-        sitlAuditLog("sitl_local_init: re-init, re-deriving gyro/dterm/RC chains");
-        gyroInitFilters();
-        pidInitFilters(currentPidProfile);
-        initRcProcessing();
-    }
-    gLocalBootedBefore = true;
-
     // Record the settings the boot path built its stateful chains from (gyro
     // filters, D-term filters, rate/RC processing). The configurator's SET
     // handlers only rebuild them when the settings really changed, so a save
