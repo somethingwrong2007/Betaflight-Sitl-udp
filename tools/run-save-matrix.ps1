@@ -26,7 +26,7 @@ New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 #   keep   the two traces must be identical (a no-op save must change nothing)
 #   change the first comparison must differ (a real edit must still apply) and
 #          the second one must be identical again (reverting returns to baseline)
-$saveOps = @('save-only', 'save-reboot', 'cfg-save', 'cfg-save-reboot')
+$saveOps = @('save-only', 'save-reboot', 'cfg-save', 'cfg-save-reboot', 'aux-save')
 $editOps = @{
     'cfg-change'        = @('DIVERGES', 'identical')
     'cfg-change-filter' = @('DIVERGES', 'identical')
@@ -34,6 +34,8 @@ $editOps = @{
     'cfg-change-pid'    = @('DIVERGES', 'identical')
     'twice'             = @('identical', 'identical')
     'reinit'            = @('identical', 'identical')
+    'repeat'            = @('identical', 'identical')
+    'armed-save'        = @('identical', 'identical')
 }
 
 function Invoke-Case {

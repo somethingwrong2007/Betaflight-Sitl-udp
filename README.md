@@ -725,13 +725,22 @@ file's state.
 pwsh -File tools\run-save-matrix.ps1
 ```
 
-It covers six stick scenarios (`roll-step`, `pitch-step`, `yaw-step`, `snap`,
-`throttle`, `combined`) against `save-only`, `save-reboot`, `cfg-save`,
-`cfg-save-reboot`, plus the edit flows (`cfg-change-filter`, `cfg-change-rate`,
-`cfg-change-pid`, `cfg-change`), a double save (`twice`) and an in-process FC
-restart (`reinit`). A no-op save must leave the traces identical; a real edit
-must change them and reverting must return to the baseline. Current state: 36/36
-pass.
+Stick scenarios: `roll-step`, `pitch-step`, `yaw-step`, `snap` (fast doublet),
+`throttle`, `combined` (all three axes at once). Operations: `save-only`,
+`save-reboot`, `cfg-save`, `cfg-save-reboot` (the configurator's read-modify-
+write burst + save), `aux-save` (the save happens with every non-ARM AUX channel
+high, i.e. with whatever other mode boxes the config has bound there active),
+`armed-save` (the save attempt while armed, which the firmware must reject), the
+edit flows (`cfg-change-filter`, `cfg-change-rate`, `cfg-change-pid`,
+`cfg-change`), a double save (`twice`), five saves in a row (`repeat`) and an
+in-process FC restart (`reinit`). A no-op save must leave the traces identical; a
+real edit must change them and reverting must return to the baseline. Current
+state: **46/46 pass**.
+
+Known gap: the CLI's own `save` (`#` to enter the CLI, then `save`) is not part
+of the matrix yet - the CLI is entered (`ARMING_DISABLED_CLI` shows up) and the
+harness can drive it, but the `save` command did not reach `writeEEPROM()` in
+that emulation, so the mode (`cli-save`) is experimental and excluded for now.
 
 Two further problems were found and fixed while building that matrix:
 

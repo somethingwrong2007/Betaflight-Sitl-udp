@@ -147,6 +147,13 @@ static const scenario_t *gScenario = &gScenarios[0];
 // arming rules and the runaway-takeoff deactivation are not disturbed.
 static bool gScenarioActive = false;
 
+// Set while a save is performed with every non-ARM AUX channel high, i.e. with
+// whatever modes the configurator has bound there active (ANGLE, HORIZON,
+// beeper, ...). The traces themselves run with the AUX channels in their normal
+// position, so the comparison stays well defined; this only changes the state
+// the save happens in.
+static bool gAuxHighOverride = false;
+
 static uint16_t stickAt(const stickStep_t *s, int phase)
 {
     if (s->start < 0 || !gScenarioActive) {
@@ -317,7 +324,7 @@ static void makeInput(int phase, uint16_t throttle, bool armHigh,
 {
     memset(in, 0, sizeof(*in));
 
-    in->orientation_quat[0] = 1.0;   // level
+    in->orientation_quat[0] = 1.0;   // level: the FC derives accel/mag from this
     in->position_xyz[2] = 1.0;       // 1 m altitude
     in->battery_voltage = 16.8;
 
@@ -327,7 +334,7 @@ static void makeInput(int phase, uint16_t throttle, bool armHigh,
     // Every AUX low, then the ARM channel high - a mode bound to another AUX
     // (e.g. ALT HOLD) would block arming and mask the control loop entirely.
     for (int i = ARM_CHANNEL_FIRST; i < SITL_LOCAL_MAX_RC_CHANNELS; i++) {
-        in->rc_channels[i] = 1000;
+        in->rc_channels[i] = gAuxHighOverride ? 2000 : 1000;
     }
     in->rc_channels[gArmChannel] = armHigh ? gArmHigh : gArmLow;
 
@@ -685,6 +692,25 @@ static void restoreConfigVariant(void)
     fprintf(stderr, "[cfg-change] %s restored: %s\n", gCfgName, same ? "yes" : "NO");
 }
 
+// Raw bytes on the same socket (used for the CLI paths, which are plain text on
+// the MSP link).
+static void sendRaw(const char *text)
+{
+    send(gSock, text, (int)strlen(text), 0);
+}
+
+// The CLI's own `save` command: writeEEPROM() + reboot, i.e. a different entry
+// point than MSP_EEPROM_WRITE and worth covering - it is how most people change
+// settings by hand.
+static void cliSave(void)
+{
+    sendRaw("\r\n#");
+    Sleep(300);
+    sendRaw("save\r\n");
+    Sleep(1500);
+    fprintf(stderr, "[cli] '#' + 'save' sent (writeEEPROM + reboot)\n");
+}
+
 static void saveConfig(const char *mode)
 {
     // The reply can be late the first time the MSP thread is used from this
@@ -875,16 +901,6 @@ int main(int argc, char **argv)
     fprintf(stderr, "[trace] before save: armed=%d motors=%u motor range %.0f..%.0f us\n",
             armedA ? 1 : 0, (unsigned)motorCountA, (double)rangeA[0], (double)rangeA[1]);
 
-    // A save while armed is rejected by the firmware, exactly like the
-    // configurator; drop the ARM switch first.
-    runSteps(400, ARM_THROTTLE, false);
-    if (sitl_local_get_armed()) {
-        sitl_local_disarm();
-        runSteps(100, ARM_THROTTLE, false);
-    }
-    fprintf(stderr, "[trace] disarmed for the save\n");
-    printArmingFlags(sitl_local_get_arming_flags());
-
     const bool sensitivityMode = strcmp(mode, "sensitivity") == 0;
     const bool controlMode = strcmp(mode, "control") == 0;
     const bool apiOnlyMode = strcmp(mode, "api-only") == 0;
@@ -897,6 +913,32 @@ int main(int argc, char **argv)
     const bool cfgChangePidMode = strcmp(mode, "cfg-change-pid") == 0;
     const bool twiceMode = strcmp(mode, "twice") == 0;
     const bool reinitMode = strcmp(mode, "reinit") == 0;
+    const bool repeatMode = strcmp(mode, "repeat") == 0;
+    const bool armedSaveMode = strcmp(mode, "armed-save") == 0;
+    const bool cliSaveMode = strcmp(mode, "cli-save") == 0;
+    const bool auxSaveMode = strcmp(mode, "aux-save") == 0;
+
+    // The armed-save case first attempts a save exactly the way the configurator
+    // would while flying: the firmware rejects MSP_EEPROM_WRITE while armed, so
+    // nothing may change. Then it falls through to the normal sequence, which
+    // makes the before/after traces comparable.
+    if (armedSaveMode) {
+        fprintf(stderr, "[armed-save] MSP_EEPROM_WRITE while armed (must be rejected)\n");
+        saveConfig("save-only");
+        runSteps(200, TRACE_THROTTLE, true);
+        fprintf(stderr, "[armed-save] still armed=%d\n", sitl_local_get_armed() ? 1 : 0);
+    }
+
+    // A save while armed is rejected by the firmware, exactly like the
+    // configurator; drop the ARM switch first.
+    runSteps(400, ARM_THROTTLE, false);
+    if (sitl_local_get_armed()) {
+        sitl_local_disarm();
+        runSteps(100, ARM_THROTTLE, false);
+    }
+    fprintf(stderr, "[trace] disarmed for the save\n");
+    printArmingFlags(sitl_local_get_arming_flags());
+
     if (controlMode) {
         fprintf(stderr, "[control] no save, no MSP traffic - repeats the same "
                         "sequence to show what the harness measures without a save\n");
@@ -934,6 +976,26 @@ int main(int argc, char **argv)
     } else if (reinitMode) {
         fprintf(stderr, "[reinit] save, measure, then shutdown + init (fresh boot)\n");
         saveConfig("save-only");
+    } else if (armedSaveMode) {
+        // Already done above, before the disarm.
+        fprintf(stderr, "[armed-save] proceeding with the normal save after the rejected one\n");
+        saveConfig("save-only");
+    } else if (cliSaveMode) {
+        fprintf(stderr, "[cli-save] CLI '#': save (writeEEPROM + reboot)\n");
+        cliSave();
+    } else if (repeatMode) {
+        fprintf(stderr, "[repeat] five saves in a row\n");
+        saveConfig("save-only");
+    } else if (auxSaveMode) {
+        fprintf(stderr, "[aux-save] save while every non-ARM AUX is high "
+                        "(other mode boxes active)\n");
+        gAuxHighOverride = true;
+        runSteps(400, TRACE_THROTTLE, false);
+        saveConfig("save-only");
+        runSteps(400, TRACE_THROTTLE, false);
+        gAuxHighOverride = false;
+        fprintf(stderr, "[aux-save] AUX back to normal, arming flags now:\n");
+        printArmingFlags(sitl_local_get_arming_flags());
     } else if (sensitivityMode) {
         fprintf(stderr, "[sensitivity] no save: the second trace doubles the gyro "
                         "noise instead, to prove a loop change is visible\n");
@@ -945,6 +1007,9 @@ int main(int argc, char **argv)
     // the stepping thread (that is where a firmware reboot re-applies the
     // config), then re-arm. Identical settle sequence before every trace, so the
     // traces are comparable.
+    if (cliSaveMode) {
+        runSteps(1000, TRACE_THROTTLE, false);
+    }
     if (!settleAndRearm()) {
         fprintf(stderr, "[arm] FAILED to re-arm after the save.\n");
         sitl_local_shutdown();
@@ -980,6 +1045,14 @@ int main(int argc, char **argv)
         fprintf(stderr, "[twice] second save, nothing changed since the first\n");
         saveConfig("save-only");
     }
+    if (repeatMode) {
+        // Four more saves (the first one already happened): a drift check.
+        for (int i = 0; i < 4; i++) {
+            saveConfig("save-only");
+            runSteps(300, TRACE_THROTTLE, false);
+        }
+        fprintf(stderr, "[repeat] five saves done, measuring again\n");
+    }
     if (reinitMode) {
         fprintf(stderr, "[reinit] sitl_local_shutdown() + sitl_local_init()\n");
         sitl_local_shutdown();
@@ -1010,6 +1083,9 @@ int main(int argc, char **argv)
     } else if (twiceMode) {
         fprintf(stderr, "\n=== twice: two saves in a row, second one changed nothing ===\n");
         compare("after1-vs-after2", traceB, traceC);
+    } else if (repeatMode) {
+        fprintf(stderr, "\n=== repeat: five saves, no drift allowed ===\n");
+        compare("after1-vs-after5", traceB, traceC);
     } else if (reinitMode) {
         fprintf(stderr, "\n=== reinit: post-save state vs a fresh in-process boot ===\n");
         compare("after-save-vs-fresh-boot", traceB, traceC);
