@@ -33,6 +33,7 @@
 #include "drivers/dshot.h"
 #include "io/gps_virtual.h"
 #include "fc/core.h"
+#include "fc/tasks.h"
 #include "fc/controlrate_profile.h"
 #include "fc/rc_controls.h"
 #include "flight/imu.h"
@@ -281,9 +282,23 @@ static volatile LONG gLocalPendingReset = 0;
 // executed on the host thread between steps.
 static volatile LONG gLocalRepinPending = 0;
 
+// The scheduler's own state (deadline grid anchor, task queue, task ages and
+// periods) is established by tasksInit() -> schedulerInit() and only ever at
+// boot. The configurator's Save path runs schedulerIgnoreTaskStateTime()
+// (msp.c, MSP_EEPROM_WRITE) and a chain of MSP_SET_* handlers that call
+// initialisation routines, which perturbs that state: the tasks then no longer
+// line up with the host's fixed stepping grid, and the craft trembles until a
+// *new process* re-runs tasksInit(). Re-anchor it in-process instead.
+static volatile LONG gLocalSchedRepinPending = 0;
+
 void sitlLocalRequestRepinOverrides(void)
 {
     InterlockedExchange(&gLocalRepinPending, 1);
+}
+
+void sitlLocalRequestSchedulerRepin(void)
+{
+    InterlockedExchange(&gLocalSchedRepinPending, 1);
 }
 
 bool sitlLocalRcTakeOverActive(void)
@@ -966,6 +981,14 @@ void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
     // only rewrites flags/mode sources, so it also runs while armed.
     if (InterlockedCompareExchange(&gLocalRepinPending, 0, 0) != 0) {
         localRepinOverrides();
+    }
+
+    // Rebuild the scheduler state a fresh boot would have (grid anchor, task
+    // queue/ages/periods) after a configurator write. Between steps, so it can
+    // never run inside a scheduler pass.
+    if (InterlockedExchange(&gLocalSchedRepinPending, 0) != 0) {
+        extern void sitlLocalRunSchedulerRepin(void);
+        sitlLocalRunSchedulerRepin();
     }
 
     // State flight recorder: ~1 Hz, and only writes to the audit log when any

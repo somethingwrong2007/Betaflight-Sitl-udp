@@ -31,6 +31,8 @@
 #include "config/feature.h"
 #include "sensors/battery.h"
 #include "flight/pid.h"
+#include "scheduler/scheduler.h"
+#include "fc/tasks.h"
 #include "fc/controlrate_profile.h"
 #include "pg/rx.h"
 #include "sensors/acceleration.h"
@@ -444,6 +446,27 @@ void sitlLocalRunBootProfileInit(void)
 #endif
 }
 
+// A configurator Save perturbs the scheduler's own state (its deadline grid
+// anchor, task queue, task ages and periods are all built by
+// tasksInit()/schedulerInit() and only ever at boot; the save path runs
+// schedulerIgnoreTaskStateTime() and re-runs various init routines). The tasks
+// then stop lining up with the host's fixed stepping grid and the craft
+// trembles until a *new process* re-runs tasksInit(). Rebuild it in-process,
+// between steps, and re-pin the three realtime periods to the LOCAL loop time.
+void sitlLocalRunSchedulerRepin(void)
+{
+#ifdef SITL_LOCAL
+    tasksInit();
+    const uint32_t periodUs = (gyro.targetLooptime > 0) ? (uint32_t)gyro.targetLooptime : 1000u;
+    rescheduleTask(TASK_GYRO, periodUs);
+    rescheduleTask(TASK_FILTER, periodUs);
+    rescheduleTask(TASK_PID, periodUs);
+    sitlAuditLog("scheduler re-anchored after config write (tasksInit, period=%u us)", (unsigned)periodUs);
+#else
+    UNUSED_NONE;
+#endif
+}
+
 // msp.c's writeEEPROM() calls are renamed to this in LOCAL mode so a save
 // attempt is visible in the audit log (including whether the FC was armed,
 // which makes MSP_EEPROM_WRITE get rejected before writeEEPROM is reached).
@@ -457,8 +480,12 @@ void sitlMspWriteEEPROM(void)
     // it changed (full control-relevant fingerprint) and queue the re-pin.
     extern void sitlLocalLogStateIfChanged(const char *tag);
     extern void sitlLocalRequestRepinOverrides(void);
+    extern void sitlLocalRequestSchedulerRepin(void);
     sitlLocalLogStateIfChanged("save");
     sitlLocalRequestRepinOverrides();
+    // The save path also perturbs the scheduler's own state (see
+    // sitlLocalRequestSchedulerRepin()); rebuild it like a boot would.
+    sitlLocalRequestSchedulerRepin();
 #endif
 }
 
