@@ -742,6 +742,27 @@ of the matrix yet - the CLI is entered (`ARMING_DISABLED_CLI` shows up) and the
 harness can drive it, but the `save` command did not reach `writeEEPROM()` in
 that emulation, so the mode (`cli-save`) is experimental and excluded for now.
 
+#### How this compares to AJ92/SimITL
+
+SimITL is the reference implementation this link design follows (its own
+`extern/betaflightext` overrides plus a stock-ish Betaflight fork). Its save and
+reboot handling differs from ours in two important ways:
+
+| | AJ92/SimITL | this build (LOCAL) |
+| --- | --- | --- |
+| plain Save (`MSP_EEPROM_WRITE`) | stock firmware: `writeReadEeprom()` -> `writeEEPROM(); readEEPROM();` -> `activateConfig()`, i.e. `initRcProcessing()` / `pidInit()` / `rcControlsInit()` / `accInitFilters()` run live | persist only; those live re-inits are gated on "the settings really changed" (stock behaviour measured: 153 us / 318 us of different stick response) |
+| Save and Reboot | `systemReset()` calls `init()`, a full in-process firmware init, and their `systemInit()` resets the virtual clock to 0 and `cliMode` | persist + re-apply (mixer/motor/servo, filters only when changed, `debugMode`, `initPhase3` modules); `sitl_local_init()` additionally rebuilds the gyro/D-term/RC chains so an in-process restart is byte-for-byte a fresh boot (0.0007 us) |
+| leaving the CLI | the reboot's `systemInit()` sets `cliMode = false` | `sitlLocalRequestReboot()` clears `cliMode` and the CLI arming block; a watcher clears them when the CLI is left without a reboot |
+| virtual EEPROM | their `target.c` closes a stale handle on re-open ("can just restart without closing the fileDesc") | `sitl_local_shutdown()` flushes+closes it, and `sitl_local_init()` now also closes a stale handle before boot (adopted from SimITL) |
+| configurator link | WebSocket straight onto the serial port (5761) via libwebsockets | plain TCP 5761 plus a separate WebSocket proxy on 6761 |
+
+Netting it out: SimITL deliberately does a *full* `init()` on reboot and leaves
+the firmware's own save path untouched, which is simple but means a plain Save
+re-initialises the stick-transient chain under a live flight loop. This build
+keeps the same semantics a real FC has (Save persists, boot-time settings need a
+reboot) while making both paths measurably non-invasive - which is what the
+matrix above checks.
+
 Two further problems were found and fixed while building that matrix:
 
 - **An in-process FC restart did not reproduce a fresh boot.** `reinit`

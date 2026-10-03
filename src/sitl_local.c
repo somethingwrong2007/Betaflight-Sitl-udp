@@ -711,6 +711,18 @@ int sitl_local_init(void)
         }
     }
 
+    // Tolerate a stale virtual-EEPROM handle, the same way AJ92/SimITL's target
+    // does ("simitl can just restart without closing the fileDesc"): sitl.c's
+    // loadEEPROMFromFile() refuses to start while its own eepromFd is open, so a
+    // host that restarts the FC in process without a clean sitl_local_shutdown()
+    // would otherwise hang in FLASH_Unlock. configLock() flushes the flash mirror
+    // (which still matches the file unless the previous run changed settings
+    // without saving) and clears the handle, so the boot below can open it again.
+    if (sitlEepromFileIsOpen()) {
+        sitlAuditLog("sitl_local_init: closing a stale EEPROM handle before boot");
+        configLock();
+    }
+
     sitlBoot(0, NULL);
 
     // Make the local link self-sufficient regardless of the EEPROM contents
