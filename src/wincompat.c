@@ -457,12 +457,8 @@ void sitlMspWriteEEPROM(void)
     // it changed (full control-relevant fingerprint) and queue the re-pin.
     extern void sitlLocalLogStateIfChanged(const char *tag);
     extern void sitlLocalRequestRepinOverrides(void);
-    extern void sitlLocalRequestSaveReinit(void);
     sitlLocalLogStateIfChanged("save");
     sitlLocalRequestRepinOverrides();
-    // Boot-equivalent repair (applied on the next step while disarmed): a save
-    // must not leave the FC in a state that only a DLL restart clears.
-    sitlLocalRequestSaveReinit();
 #endif
 }
 

@@ -364,21 +364,6 @@ static volatile LONG gLocalForceFullInit = 0;
 static volatile LONG gLocalPathPending = 0;
 static char gLocalPendingEepromPath[1024];
 
-// A configurator Save runs a chain of MSP_SET_* handlers, and some of them
-// re-run firmware initialisation right there on the MSP thread
-// (MSP_SET_FILTER_CONFIG calls gyroInitFilters() + pidInitFilters(),
-// MSP_SET_PID* call pidInitConfig(), ...). In this build that can leave the
-// derived runtime - filter coefficients/state, task periods, pidRuntime.dT -
-// inconsistent, which shows up as a persistent tremor that only a fresh DLL
-// load (a real boot) clears. So a save also schedules the *boot-equivalent*
-// re-init; it is applied on the next sitl_local_step() while disarmed, i.e.
-// exactly the work a DLL restart would do, without restarting the process.
-void sitlLocalRequestSaveReinit(void)
-{
-    InterlockedExchange(&gLocalForceFullInit, 1);
-    InterlockedExchange(&gLocalReloadPending, 1);
-}
-
 extern void ensureEepromDirectory(void);
 extern bool sitlEepromFileIsOpen(void);
 
