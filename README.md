@@ -594,6 +594,16 @@ fingerprint of the runtime state to
 `%LOCALAPPDATA%\Betaflight-SITL\sitl-audit.log` (`save state: ...` followed by
 `re-pin after config write: ...` when something had to be restored).
 
+On top of that, a **state flight recorder** watches everything control-relevant
+- config hashes (system/PID/rates/gyro/motor/battery/mixer/features/RX/IMU/acc),
+the applied runtime values (motor protocol and output range, idle, feature
+*runtime* mask, battery meter sources, virtual-receiver takeover ownership,
+mixer config vs runtime, `pid_process_denom` / `targetLooptime` / `pidDT`, gyro
+filter and notch settings, current PID/rates) - once per ~1000 steps and after
+every save, and writes two `state ...` lines to the same audit log whenever any
+of it changes. Diffing those two lines pinpoints what a configurator write (or
+anything else) changed at runtime, including state no configurator page shows.
+
 ### Tuning note: configurator shows 999/333
 
 The Setup page computes `pidHz = 1e6 / cycleTime` and `gyroHz = pidHz *

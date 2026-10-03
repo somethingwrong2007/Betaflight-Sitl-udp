@@ -31,6 +31,9 @@
 #include "config/feature.h"
 #include "sensors/battery.h"
 #include "flight/pid.h"
+#include "fc/controlrate_profile.h"
+#include "pg/rx.h"
+#include "sensors/acceleration.h"
 #include "sensors/gyro_init.h"
 #include "sensors/gyro.h"
 #include "sensors/boardalignment.h"
@@ -137,6 +140,152 @@ void sitlLocalRequestReboot(void)
     unsetArmingDisabled(ARMING_DISABLED_CLI | ARMING_DISABLED_REBOOT_REQUIRED);
 
     sitlLocalRequestRebootApply();
+#endif
+}
+
+// --- runtime state flight recorder ------------------------------------------
+// A configurator Save (or any MSP write) can change state that no configurator
+// page shows: applied runtime values, the *runtime* feature mask, the failsafe /
+// RX state machines, the applied mixer runtime, ... Those are exactly the
+// differences a DLL restart clears, so log a fingerprint of everything
+// control-relevant whenever any of it changes. Cheap: collected every ~1000
+// steps, only written to the audit log when something actually differs.
+static uint32_t fnv32Struct(const void *data, size_t len)
+{
+    const uint8_t *bytes = (const uint8_t *)data;
+    uint32_t hash = 2166136261u;
+    for (size_t i = 0; i < len; i++) {
+        hash = (hash ^ bytes[i]) * 16777619u;
+    }
+    return hash;
+}
+
+typedef struct {
+    uint32_t hashSystem, hashPid, hashRates, hashGyro, hashMotor, hashBattery,
+             hashMixer, hashFeature, hashRx, hashImu, hashAcc;
+    uint8_t  protocol, poles, dshotCfg, dshotEdt, bitbang, motorIdle;
+    uint16_t maxthrottle, mincommand;
+    uint8_t  voltSrc, currSrc, rcOurs;
+    uint8_t  mixerCfg, mixerRt, motorCount, denom;
+    uint16_t targetLooptime;
+    uint32_t pidDtMicro;
+    uint8_t  rtAirMode, rtAntiGravity, rtRxUdp, rtGps, rt3d, rtEscSensor;
+    uint16_t lpf1, lpf1DynMin, lpf1DynMax, lpf2, notch1Hz, notch1Cut, notch2Hz, notch2Cut;
+    uint8_t  pidProfileIdx, ratesType, armed;
+    uint16_t pidP[3], pidI[3], pidD[3], pidF[3];
+    uint8_t  rcRate[3], rates[3], expo[3];
+    uint32_t armDisableFlags;
+} sitlLocalStateFp_t;
+
+static void sitlCollectStateFp(sitlLocalStateFp_t *fp)
+{
+    memset(fp, 0, sizeof(*fp));
+    extern bool sitlLocalRcTakeOverActive(void);
+
+    fp->hashSystem = fnv32Struct(systemConfig(), sizeof(systemConfig_t));
+    fp->hashPid = fnv32Struct(pidConfig(), sizeof(pidConfig_t));
+    fp->hashRates = fnv32Struct(&controlRateProfiles(0)[0], sizeof(controlRateConfig_t) * CONTROL_RATE_PROFILE_COUNT);
+    fp->hashGyro = fnv32Struct(gyroConfig(), sizeof(gyroConfig_t));
+    fp->hashMotor = fnv32Struct(motorConfig(), sizeof(motorConfig_t));
+    fp->hashBattery = fnv32Struct(batteryConfig(), sizeof(batteryConfig_t));
+    fp->hashMixer = fnv32Struct(mixerConfig(), sizeof(mixerConfig_t));
+    fp->hashFeature = fnv32Struct(featureConfig(), sizeof(featureConfig_t));
+    fp->hashRx = fnv32Struct(rxConfig(), sizeof(rxConfig_t));
+    fp->hashImu = fnv32Struct(imuConfig(), sizeof(imuConfig_t));
+    fp->hashAcc = fnv32Struct(accelerometerConfig(), sizeof(accelerometerConfig_t));
+
+    fp->protocol = motorConfig()->dev.motorProtocol;
+    fp->poles = motorConfig()->motorPoleCount;
+    fp->dshotCfg = motorConfig()->dev.useDshotTelemetry;
+    fp->dshotEdt = motorConfig()->dev.useDshotEdt;
+    fp->bitbang = motorConfig()->dev.useDshotBitbang;
+    fp->motorIdle = motorConfig()->motorIdle;
+    fp->maxthrottle = motorConfig()->maxthrottle;
+    fp->mincommand = motorConfig()->mincommand;
+    fp->voltSrc = batteryConfig()->voltageMeterSource;
+    fp->currSrc = batteryConfig()->currentMeterSource;
+    fp->rcOurs = sitlLocalRcTakeOverActive() ? 1 : 0;
+    fp->mixerCfg = mixerConfig()->mixerMode;
+    fp->mixerRt = getMixerMode();
+    fp->motorCount = getMotorCount();
+    fp->denom = pidConfig()->pid_process_denom;
+    fp->targetLooptime = (uint16_t)gyro.targetLooptime;
+    fp->pidDtMicro = (uint32_t)(pidGetDT() * 1e6f + 0.5f);
+    fp->rtAirMode = featureIsEnabled(FEATURE_AIRMODE) ? 1 : 0;
+    fp->rtAntiGravity = featureIsEnabled(FEATURE_ANTI_GRAVITY) ? 1 : 0;
+    fp->rtRxUdp = featureIsEnabled(FEATURE_RX_UDP) ? 1 : 0;
+    fp->rtGps = featureIsEnabled(FEATURE_GPS) ? 1 : 0;
+    fp->rt3d = featureIsEnabled(FEATURE_3D) ? 1 : 0;
+    fp->rtEscSensor = featureIsEnabled(FEATURE_ESC_SENSOR) ? 1 : 0;
+    fp->lpf1 = gyroConfig()->gyro_lpf1_static_hz;
+    fp->lpf1DynMin = gyroConfig()->gyro_lpf1_dyn_min_hz;
+    fp->lpf1DynMax = gyroConfig()->gyro_lpf1_dyn_max_hz;
+    fp->lpf2 = gyroConfig()->gyro_lpf2_static_hz;
+    fp->notch1Hz = gyroConfig()->gyro_soft_notch_hz_1;
+    fp->notch1Cut = gyroConfig()->gyro_soft_notch_cutoff_1;
+    fp->notch2Hz = gyroConfig()->gyro_soft_notch_hz_2;
+    fp->notch2Cut = gyroConfig()->gyro_soft_notch_cutoff_2;
+    fp->pidProfileIdx = systemConfig()->pidProfileIndex;
+    fp->ratesType = currentControlRateProfile ? currentControlRateProfile->rates_type : 0;
+    fp->armed = ARMING_FLAG(ARMED) ? 1 : 0;
+    for (int axis = 0; axis < 3; axis++) {
+        fp->pidP[axis] = currentPidProfile->pid[axis].P;
+        fp->pidI[axis] = currentPidProfile->pid[axis].I;
+        fp->pidD[axis] = currentPidProfile->pid[axis].D;
+        fp->pidF[axis] = currentPidProfile->pid[axis].F;
+        if (currentControlRateProfile) {
+            fp->rcRate[axis] = currentControlRateProfile->rcRates[axis];
+            fp->rates[axis] = currentControlRateProfile->rates[axis];
+            fp->expo[axis] = currentControlRateProfile->rcExpo[axis];
+        }
+    }
+    fp->armDisableFlags = (uint32_t)getArmingDisableFlags();
+}
+
+void sitlLocalLogStateIfChanged(const char *tag)
+{
+#ifdef SITL_LOCAL
+    static sitlLocalStateFp_t last;
+    static bool haveLast = false;
+
+    sitlLocalStateFp_t now;
+    sitlCollectStateFp(&now);
+    if (haveLast && memcmp(&last, &now, sizeof(now)) == 0) {
+        return;
+    }
+    const bool first = !haveLast;
+    last = now;
+    haveLast = true;
+
+    sitlAuditLog("%s%s hash sys=%08X pid=%08X rates=%08X gyro=%08X motor=%08X batt=%08X "
+                 "mix=%08X feat=%08X rx=%08X imu=%08X acc=%08X",
+                 tag, first ? " (initial)" : "",
+                 now.hashSystem, now.hashPid, now.hashRates, now.hashGyro, now.hashMotor,
+                 now.hashBattery, now.hashMixer, now.hashFeature, now.hashRx, now.hashImu,
+                 now.hashAcc);
+    sitlAuditLog("%s rt protocol=%u dshot(cfg/edt/bb)=%u/%u/%u idle=%u thr=%u/%u poles=%u "
+                 "battSrc=%u/%u rcOurs=%u mixer(cfg/rt/count)=%u/%u/%u denom=%u looptime=%u pidDt=%u "
+                 "featRt(air/ag/udp/gps/3d/esc)=%u/%u/%u/%u/%u/%u "
+                 "lpf=%u/%u-%u/%u notch=%u/%u/%u/%u pidProf=%u ratesType=%u armed=%u armFlags=%08X "
+                 "pidR=%u/%u/%u/%u pidP=%u/%u/%u/%u pidY=%u/%u/%u/%u",
+                 tag,
+                 (unsigned)now.protocol, (unsigned)now.dshotCfg,
+                 (unsigned)now.dshotEdt, (unsigned)now.bitbang, (unsigned)now.motorIdle,
+                 (unsigned)now.maxthrottle, (unsigned)now.mincommand, (unsigned)now.poles,
+                 (unsigned)now.voltSrc, (unsigned)now.currSrc, (unsigned)now.rcOurs,
+                 (unsigned)now.mixerCfg, (unsigned)now.mixerRt, (unsigned)now.motorCount,
+                 (unsigned)now.denom, (unsigned)now.targetLooptime, (unsigned)now.pidDtMicro,
+                 (unsigned)now.rtAirMode, (unsigned)now.rtAntiGravity, (unsigned)now.rtRxUdp,
+                 (unsigned)now.rtGps, (unsigned)now.rt3d, (unsigned)now.rtEscSensor,
+                 (unsigned)now.lpf1, (unsigned)now.lpf1DynMin, (unsigned)now.lpf1DynMax,
+                 (unsigned)now.lpf2, (unsigned)now.notch1Hz, (unsigned)now.notch1Cut,
+                 (unsigned)now.notch2Hz, (unsigned)now.notch2Cut, (unsigned)now.pidProfileIdx,
+                 (unsigned)now.ratesType, (unsigned)now.armed, now.armDisableFlags,
+                 now.pidP[0], now.pidI[0], now.pidD[0], now.pidF[0],
+                 now.pidP[1], now.pidI[1], now.pidD[1], now.pidF[1],
+                 now.pidP[2], now.pidI[2], now.pidD[2], now.pidF[2]);
+#else
+    UNUSED(tag);
 #endif
 }
 
@@ -272,28 +421,11 @@ void sitlMspWriteEEPROM(void)
     writeEEPROM();
     sitlLocalSyncDebugMode();
 #ifdef SITL_LOCAL
-    // A configurator Save writes settings (motor config, features, battery/ESC
-    // meters, mixer, board alignment, ...) that can undo the runtime state the
-    // LOCAL link pins at boot. Log a fingerprint of that state around the write
-    // and queue a re-pin, executed on the host thread between steps.
-    extern bool sitlLocalRcTakeOverActive(void);
+    // A configurator Save writes settings over MSP without rebooting; log what
+    // it changed (full control-relevant fingerprint) and queue the re-pin.
+    extern void sitlLocalLogStateIfChanged(const char *tag);
     extern void sitlLocalRequestRepinOverrides(void);
-    sitlAuditLog("save state: motorProtocol=%u maxthrottle=%u mincommand=%u poles=%u "
-                 "dshotTlm(global/config)=%u/%u features=0x%08X batteryMeter=%u/%u "
-                 "rcTakeover=%u mixer(cfg/rt)=%u/%u denom=%u targetLooptime=%u pidDT=%.6f",
-                 (unsigned)motorConfig()->dev.motorProtocol,
-                 (unsigned)motorConfig()->maxthrottle,
-                 (unsigned)motorConfig()->mincommand,
-                 (unsigned)motorConfig()->motorPoleCount,
-                 (unsigned)(useDshotTelemetry ? 1 : 0),
-                 (unsigned)motorConfig()->dev.useDshotTelemetry,
-                 (unsigned)featureConfig()->enabledFeatures,
-                 (unsigned)batteryConfig()->voltageMeterSource,
-                 (unsigned)batteryConfig()->currentMeterSource,
-                 (unsigned)(sitlLocalRcTakeOverActive() ? 1 : 0),
-                 (unsigned)mixerConfig()->mixerMode, (unsigned)getMixerMode(),
-                 (unsigned)pidConfig()->pid_process_denom,
-                 (unsigned)gyro.targetLooptime, (double)pidGetDT());
+    sitlLocalLogStateIfChanged("save");
     sitlLocalRequestRepinOverrides();
 #endif
 }

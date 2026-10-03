@@ -903,6 +903,15 @@ void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
         localRepinOverrides();
     }
 
+    // State flight recorder: ~1 Hz, and only writes to the audit log when any
+    // control-relevant state actually changed (see wincompat.c). This is what
+    // makes "a save left the FC in a different state" visible.
+    static uint32_t stepCounter = 0;
+    if (++stepCounter % 1000 == 0) {
+        extern void sitlLocalLogStateIfChanged(const char *tag);
+        sitlLocalLogStateIfChanged("state");
+    }
+
     // Deferred config work (firmware reboot, EEPROM reload and/or path switch)
     // runs here, on the same thread as the scheduler and between steps, so it
     // can never race the flight loop. While armed the requests stay pending and
