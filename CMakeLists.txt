@@ -460,7 +460,7 @@ if(WIN32)
   # saves even if the MSP_EEPROM_WRITE step was skipped or lost.
   if(SITL_LINK_MODE STREQUAL "LOCAL")
     set_source_files_properties("${BF_ROOT}/src/main/msp/msp.c" PROPERTIES COMPILE_OPTIONS
-      "-DsystemReset=sitlSystemReset;-DwriteEEPROM=sitlMspWriteEEPROM;-DreadEEPROM=sitlMspReadEEPROM")
+      "-DsystemReset=sitlSystemReset;-DwriteEEPROM=sitlMspWriteEEPROM;-DreadEEPROM=sitlMspReadEEPROM;-DinitRcProcessing=sitlMspInitRcProcessing;-DgyroInitFilters=sitlMspGyroInitFilters;-DpidInitFilters=sitlMspPidInitFilters")
     # Every reboot path (CLI exit, MSP reboot) calls motorShutdown() to stop
     # the ESC outputs before the MCU resets. LOCAL mode never actually resets:
     # systemReset() defers the EEPROM persist and the FC keeps running, so the

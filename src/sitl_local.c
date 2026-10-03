@@ -684,6 +684,18 @@ int sitl_local_init(void)
     // PG record and therefore has to re-apply the same overrides.
     localApplyLinkOverrides();
 
+    // Record the settings the boot path built its stateful chains from (gyro
+    // filters, D-term filters, rate/RC processing). The configurator's SET
+    // handlers only rebuild them when the settings really changed, so a save
+    // that changes nothing leaves the running control loop alone - see
+    // wincompat.c's sitlMsp*Init* wrappers.
+    extern void sitlLocalSnapshotGyroFilterConfig(void);
+    extern void sitlLocalSnapshotPidFilterConfig(void);
+    extern void sitlLocalSnapshotRcProcessingConfig(void);
+    sitlLocalSnapshotGyroFilterConfig();
+    sitlLocalSnapshotPidFilterConfig();
+    sitlLocalSnapshotRcProcessingConfig();
+
     gLocalRunning = true;
     gMspThreadStop = 0;
     InitializeCriticalSection(&gMspCrit);

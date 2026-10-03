@@ -45,6 +45,15 @@
 #define MSP_SET_REBOOT      68
 #define MSP_EEPROM_WRITE    250
 #define MSP_API_VERSION     1
+#define MSP_PID             112
+#define MSP_SET_PID         202
+#define MSP_RC_TUNING       111
+#define MSP_SET_RC_TUNING   204
+#define MSP_FILTER_CONFIG   92
+#define MSP_SET_FILTER_CONFIG 93
+#define MSP_PID_ADVANCED    94
+#define MSP_SET_PID_ADVANCED 95
+#define MSP_MAX_PAYLOAD     200
 
 #define SCENARIO_STEPS      2000     // 2 s at 1 kHz; both traces are one period
 #define WARMUP_PERIODS      3
@@ -408,7 +417,7 @@ static int mspConnect(void)
 
 static void mspSend(uint8_t cmd, const uint8_t *payload, uint8_t len)
 {
-    uint8_t frame[64];
+    uint8_t frame[8 + MSP_MAX_PAYLOAD];
     uint8_t checksum = (uint8_t)(len ^ cmd);
     frame[0] = 0x24; // '$'
     frame[1] = 0x4d; // 'M'
@@ -424,14 +433,19 @@ static void mspSend(uint8_t cmd, const uint8_t *payload, uint8_t len)
 }
 
 // Waits for the reply to `cmd` as a "the FC processed it" handshake, exactly
-// like the configurator does before it sends MSP_REBOOT.
-static int mspWaitReply(uint8_t cmd, int timeoutMs)
+// like the configurator does before it sends MSP_REBOOT. `replyOut` (optional)
+// receives the reply payload, `replyCap` its capacity; the return value is the
+// payload length, or -1 on timeout.
+static int mspRequest(uint8_t cmd, const uint8_t *payload, uint8_t len,
+                      uint8_t *replyOut, size_t replyCap, int timeoutMs)
 {
 #ifdef _WIN32
     const DWORD start = GetTickCount();
 #endif
-    uint8_t buf[512];
+    uint8_t buf[1024];
     size_t used = 0;
+
+    mspSend(cmd, payload, len);
 
     for (;;) {
         fd_set rd;
@@ -455,11 +469,15 @@ static int mspWaitReply(uint8_t cmd, int timeoutMs)
                         break;
                     }
                     const uint8_t repliedCmd = buf[i + 4];
+                    const uint8_t repliedLen = buf[i + 3];
+                    if (replyOut && repliedLen <= replyCap) {
+                        memcpy(replyOut, buf + i + 5, repliedLen);
+                    }
                     memmove(buf, buf + total, used - total);
                     used -= total;
                     i = 0;
                     if (repliedCmd == cmd) {
-                        return 0;
+                        return (replyOut && repliedLen > replyCap) ? -1 : repliedLen;
                     }
                 }
             }
@@ -470,6 +488,102 @@ static int mspWaitReply(uint8_t cmd, int timeoutMs)
         }
 #endif
     }
+}
+
+static int mspWaitReply(uint8_t cmd, int timeoutMs)
+{
+    return mspRequest(cmd, NULL, 0, NULL, 0, timeoutMs) < 0 ? -1 : 0;
+}
+
+// The configurator's Save is not just MSP_EEPROM_WRITE: the page first writes
+// its settings back over MSP. Replay that burst byte-for-byte - read each block,
+// write the very same bytes back - so the harness goes through the same firmware
+// handlers the configurator drives.
+typedef struct {
+    uint8_t getCmd;
+    uint8_t setCmd;
+    const char *name;
+} cfgBlock_t;
+
+static const cfgBlock_t cfgBlocks[] = {
+    { MSP_RC_TUNING,     MSP_SET_RC_TUNING,     "RC_TUNING" },
+    { MSP_FILTER_CONFIG, MSP_SET_FILTER_CONFIG, "FILTER_CONFIG" },
+    { MSP_PID_ADVANCED,  MSP_SET_PID_ADVANCED,  "PID_ADVANCED" },
+    { MSP_PID,           MSP_SET_PID,           "PID" },
+};
+
+// -1 = replay every block; otherwise only that index (bisect).
+static int gCfgOnly = -1;
+
+static void replayConfiguratorWrites(void)
+{
+    for (size_t i = 0; i < sizeof(cfgBlocks) / sizeof(cfgBlocks[0]); i++) {
+        if (gCfgOnly >= 0 && (size_t)gCfgOnly != i) {
+            continue;
+        }
+        uint8_t before[MSP_MAX_PAYLOAD];
+        uint8_t after[MSP_MAX_PAYLOAD];
+
+        const int lenBefore = mspRequest(cfgBlocks[i].getCmd, NULL, 0, before,
+                                        sizeof(before), 2000);
+        if (lenBefore < 0) {
+            fprintf(stderr, "[cfg] %s: no reply to the read, skipped\n", cfgBlocks[i].name);
+            continue;
+        }
+
+        (void)mspRequest(cfgBlocks[i].setCmd, before, (uint8_t)lenBefore, NULL, 0, 2000);
+
+        const int lenAfter = mspRequest(cfgBlocks[i].getCmd, NULL, 0, after,
+                                        sizeof(after), 2000);
+        const bool same = lenAfter == lenBefore
+                          && memcmp(before, after, (size_t)lenBefore) == 0;
+        fprintf(stderr, "[cfg] %s: read %d bytes, wrote them back, config %s\n",
+                cfgBlocks[i].name, lenBefore, same ? "unchanged" : "CHANGED (abort)");
+        if (!same) {
+            fprintf(stderr, "[cfg] aborting: the replayed write changed the config\n");
+            exit(3);
+        }
+    }
+}
+
+// Functional check for the change-gated rebuilds: flip one byte of the filter
+// block and write it back. The config now really differs, so the firmware has to
+// rebuild the filter chain and the response must change - otherwise the gate
+// would have broken filter tuning. The original bytes are written back
+// afterwards and verified byte for byte. Nothing is persisted (no EEPROM write).
+static uint8_t gCfgOriginal[MSP_MAX_PAYLOAD];
+static int gCfgOriginalLen = -1;
+
+static void applyFilterConfigVariant(void)
+{
+    gCfgOriginalLen = mspRequest(MSP_FILTER_CONFIG, NULL, 0, gCfgOriginal,
+                                 sizeof(gCfgOriginal), 2000);
+    if (gCfgOriginalLen < 20) {
+        fprintf(stderr, "[cfg-change] filter config read failed (%d bytes)\n",
+                gCfgOriginalLen);
+        exit(3);
+    }
+
+    uint8_t changed[MSP_MAX_PAYLOAD];
+    memcpy(changed, gCfgOriginal, (size_t)gCfgOriginalLen);
+    const int at = gCfgOriginalLen / 2;      // inside the cutoff fields
+    changed[at] ^= 0x01;
+    (void)mspRequest(MSP_SET_FILTER_CONFIG, changed, (uint8_t)gCfgOriginalLen,
+                     NULL, 0, 2000);
+    fprintf(stderr, "[cfg-change] filter byte %d flipped (0x%02X -> 0x%02X) - the "
+                    "filters must be rebuilt now\n",
+            at, gCfgOriginal[at], changed[at]);
+}
+
+static void restoreFilterConfig(void)
+{
+    uint8_t now[MSP_MAX_PAYLOAD];
+    (void)mspRequest(MSP_SET_FILTER_CONFIG, gCfgOriginal, (uint8_t)gCfgOriginalLen,
+                     NULL, 0, 2000);
+    const int len = mspRequest(MSP_FILTER_CONFIG, NULL, 0, now, sizeof(now), 2000);
+    const bool same = len == gCfgOriginalLen
+                      && memcmp(gCfgOriginal, now, (size_t)gCfgOriginalLen) == 0;
+    fprintf(stderr, "[cfg-change] filter config restored: %s\n", same ? "yes" : "NO");
 }
 
 static void saveConfig(const char *mode)
@@ -601,6 +715,10 @@ int main(int argc, char **argv)
     // everything here goes to stderr - unbuffered, so nothing is lost.
     setvbuf(stderr, NULL, _IONBF, 0);
     fprintf(stderr, "[harness] mode=%s\n", mode);
+    if (argc > 2) {
+        gCfgOnly = atoi(argv[2]);
+        fprintf(stderr, "[harness] configurator block filter = %d\n", gCfgOnly);
+    }
 
     if (sitl_local_init() != 0) {
         fprintf(stderr, "sitl_local_init() failed\n");
@@ -663,6 +781,10 @@ int main(int argc, char **argv)
     const bool sensitivityMode = strcmp(mode, "sensitivity") == 0;
     const bool controlMode = strcmp(mode, "control") == 0;
     const bool apiOnlyMode = strcmp(mode, "api-only") == 0;
+    const bool cfgSetsMode = strcmp(mode, "cfg-sets") == 0;
+    const bool cfgSaveMode = strcmp(mode, "cfg-save") == 0;
+    const bool cfgSaveRebootMode = strcmp(mode, "cfg-save-reboot") == 0;
+    const bool cfgChangeMode = strcmp(mode, "cfg-change") == 0;
     if (controlMode) {
         fprintf(stderr, "[control] no save, no MSP traffic - repeats the same "
                         "sequence to show what the harness measures without a save\n");
@@ -671,6 +793,17 @@ int main(int argc, char **argv)
         mspSend(MSP_API_VERSION, NULL, 0);
         (void)mspWaitReply(MSP_API_VERSION, 1500);
         fprintf(stderr, "[api-only] MSP_API_VERSION round trip, no EEPROM write\n");
+    } else if (cfgSetsMode) {
+        fprintf(stderr, "[cfg] configurator SET burst only (no EEPROM write)\n");
+        replayConfiguratorWrites();
+    } else if (cfgSaveMode || cfgSaveRebootMode) {
+        fprintf(stderr, "[cfg] configurator SET burst + %s\n",
+                cfgSaveRebootMode ? "save and reboot" : "save");
+        replayConfiguratorWrites();
+        saveConfig(cfgSaveRebootMode ? "save-reboot" : "save-only");
+    } else if (cfgChangeMode) {
+        fprintf(stderr, "[cfg-change] real filter change (must still take effect)\n");
+        applyFilterConfigVariant();
     } else if (sensitivityMode) {
         fprintf(stderr, "[sensitivity] no save: the second trace doubles the gyro "
                         "noise instead, to prove a loop change is visible\n");
@@ -710,6 +843,9 @@ int main(int argc, char **argv)
     uint8_t motorCountC = 0;
     bool armedC = false;
     float rangeC[2] = {0, 0};
+    if (cfgChangeMode) {
+        restoreFilterConfig();
+    }
     if (!settleAndRearm()) {
         fprintf(stderr, "[arm] FAILED to re-arm for the stability trace.\n");
         sitl_local_shutdown();
@@ -718,8 +854,13 @@ int main(int argc, char **argv)
     padToFrameGrid();
     runSteps(SCENARIO_STEPS * WARMUP_PERIODS, TRACE_THROTTLE, true);
     runTrace(traceC, &motorCountC, &armedC, rangeC);
-    fprintf(stderr, "\n=== %s: after-save trace repeated (stability check) ===\n", mode);
-    compare("after-vs-after", traceB, traceC);
+    if (cfgChangeMode) {
+        fprintf(stderr, "\n=== cfg-change: after writing the original filter bytes back ===\n");
+        compare("change-reverted", traceA, traceC);
+    } else {
+        fprintf(stderr, "\n=== %s: after-save trace repeated (stability check) ===\n", mode);
+        compare("after-vs-after", traceB, traceC);
+    }
 
     sitl_local_shutdown();
     return 0;

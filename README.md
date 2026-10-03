@@ -618,27 +618,41 @@ throttle, roll stick doublet plus a fixed gyro waveform) before and after a save
 on the *same* flight controller and diffs the motor outputs sample by sample:
 
 ```
-sitl_local_save_compare save-only     plain "Save" (MSP_EEPROM_WRITE)
-sitl_local_save_compare save-reboot   "Save and Reboot" (+ MSP_REBOOT)
-sitl_local_save_compare api-only      MSP round trip, no EEPROM write (bisect)
-sitl_local_save_compare control       no MSP traffic at all (baseline)
-sitl_local_save_compare sensitivity   no save; doubles the gyro noise instead
+sitl_local_save_compare save-only       plain "Save" (MSP_EEPROM_WRITE)
+sitl_local_save_compare save-reboot     "Save and Reboot" (+ MSP_REBOOT)
+sitl_local_save_compare cfg-sets        the configurator's MSP_SET_* burst only
+sitl_local_save_compare cfg-save        that burst + MSP_EEPROM_WRITE
+sitl_local_save_compare cfg-save-reboot that burst + MSP_EEPROM_WRITE + MSP_REBOOT
+sitl_local_save_compare cfg-change      flips a real filter byte and writes it back
+sitl_local_save_compare api-only        MSP round trip, no EEPROM write (bisect)
+sitl_local_save_compare control         no MSP traffic at all (baseline)
+sitl_local_save_compare sensitivity     no save; doubles the gyro noise instead
 ```
 
-Measured before the fix below (motor PWM, 1000..2000 us):
+`cfg-*` replays the configurator's writes byte for byte - it reads each settings
+block over MSP and writes the very same bytes back - so the firmware handlers the
+configurator drives are exercised, and every block is read back afterwards to
+prove the config did not change. `cfg-sets 0..3` replays a single block (bisect).
+
+Measured before the fixes below (motor PWM, 1000..2000 us):
 
 | mode | before vs after | after vs after (repeat) |
 | --- | --- | --- |
 | `control` | identical (max 0.0009 us) | identical |
 | `api-only` | identical (max 0.0009 us) | identical |
-| `save-only` | **changed by up to 153 us** | identical |
-| `save-reboot` | **changed by up to 153 us** | identical |
+| `save-only` | changed by up to 153 us | identical |
+| `save-reboot` | changed by up to 153 us | identical |
+| `cfg-sets` | **changed by up to 318 us** | identical |
+| `cfg-sets 0` (`MSP_SET_RC_TUNING`) | changed by up to 153 us | identical |
+| `cfg-sets 1` (`MSP_SET_FILTER_CONFIG`) | **changed by up to 318 us** | identical |
+| `cfg-sets 2/3` (`MSP_SET_PID_ADVANCED` / `MSP_SET_PID`) | identical | identical |
 | `sensitivity` (2x gyro noise) | changes by 10.6 us | identical |
 
 A Save did **not** change the steady state - the traces were bit-identical while
 the stick was still - but the response to a stick input was different afterwards:
 the difference started exactly at the stick step, peaked at ~153 us (~15% of the
-output range) and decayed as the transient settled. Repeating the after-trace
+output range, 318 us for the filter block) and decayed as the transient settled.
+Repeating the after-trace
 reproduced the new response exactly, so a save left the loop on a *different but
 stable* operating point rather than on a transient that just needed longer
 settling: after any Save the aircraft responded differently to the sticks until
@@ -663,6 +677,15 @@ reacts to stick input. Steady-state behaviour, PID/rate/filter settings and ever
 value in the `state` fingerprint of `sitl-audit.log` stay identical - the change
 lives in the stick-transient state that fingerprint does not cover.
 
+The bigger share comes from the configurator's own `MSP_SET_*` burst, which runs
+*before* the EEPROM write. Two of those handlers rebuild stateful chains in the
+firmware:
+
+```c
+case MSP_SET_RC_TUNING:      ... initRcProcessing();                      // 153 us
+case MSP_SET_FILTER_CONFIG:  ... gyroInitFilters(); pidInitFilters(...);  // 318 us
+```
+
 Fixed in the LOCAL build:
 
 - `MSP_EEPROM_WRITE` no longer re-reads the EEPROM (`readEEPROM` is renamed to
@@ -676,12 +699,22 @@ Fixed in the LOCAL build:
   change a value, while everything the config derives is re-applied explicitly
   (mixer/motor/servo, gyro filters when their settings changed, `debugMode`, the
   `initPhase3` profile state) by `localRunPendingReloadInternal(false)`.
+- The three handler calls above are renamed for msp.c in LOCAL builds
+  (`sitlMspInitRcProcessing`, `sitlMspGyroInitFilters`, `sitlMspPidInitFilters`)
+  and rebuild the chain **only when the underlying settings really changed** - the
+  same "snapshot and compare" rule the reload path already used for the gyro
+  filters, extended to the D-term filters and to the rate/RC processing inputs. A
+  genuine filter or rate edit still applies immediately, exactly like a real FC
+  applying it live; a save that changes nothing no longer touches the loop.
 
-Both paths now measure identical (max 0.0009 us - the harness's own noise floor)
-while `sensitivity` still reports a real loop change at 10.6 us, so the check did
-not just go blind. An explicit config reload (`sitl_local_reload_config()`, and
-the per-aircraft EEPROM path switch) still reads the selected file by design: a
-different aircraft *should* start from that file's state.
+After the fixes every save-like mode measures identical (max 0.0009 us - the
+harness's own noise floor), while the controls that must stay sensitive still do:
+`sensitivity` reports a real loop change at 10.6 us, and `cfg-change` shows 235 us
+of change when a filter byte is flipped and returns to the baseline once the
+original bytes are written back. An explicit config reload
+(`sitl_local_reload_config()`, and the per-aircraft EEPROM path switch) still
+reads the selected file by design: a different aircraft *should* start from that
+file's state.
 
 Harness notes: it needs an ARM switch in the EEPROM (it probes every AUX channel
 and both switch positions until the firmware really arms, then turns the runaway

@@ -52,6 +52,8 @@
 #include "sensors/current.h"
 #include "fc/runtime_config.h"
 #include "fc/core.h"
+#include "fc/rc.h"
+#include "fc/rc_controls.h"
 #include "cli/cli.h"
 #include "sim_telemetry.h"
 
@@ -378,6 +380,71 @@ bool sitlLocalGyroFilterConfigChanged(void)
 #endif
 }
 
+// The D-term filter chain (pidInitFilters) and the RC/rate processing
+// (initRcProcessing) have the same problem as the gyro filter chain: they are
+// stateful, and re-deriving them under a live flight loop changes how the
+// aircraft responds to the sticks. Snapshot their inputs as well, so the
+// configurator's SET handlers only rebuild them when the settings really
+// changed.
+static pidProfile_t gPidFilterConfigSnapshot;
+static bool gPidFilterConfigSnapshotValid = false;
+
+void sitlLocalSnapshotPidFilterConfig(void)
+{
+#ifdef SITL_LOCAL
+    gPidFilterConfigSnapshot = *currentPidProfile;
+    gPidFilterConfigSnapshotValid = true;
+#endif
+}
+
+static bool pidFilterConfigChanged(void)
+{
+#ifdef SITL_LOCAL
+    if (!gPidFilterConfigSnapshotValid) {
+        return true;
+    }
+    return memcmp(&gPidFilterConfigSnapshot, currentPidProfile,
+                  sizeof(pidProfile_t)) != 0;
+#else
+    return true;
+#endif
+}
+
+static controlRateConfig_t gRcProcRateSnapshot;
+static rcControlsConfig_t gRcProcControlsSnapshot;
+static rxConfig_t gRcProcRxSnapshot;
+static pidProfile_t gRcProcPidSnapshot;
+static bool gRcProcSnapshotValid = false;
+
+void sitlLocalSnapshotRcProcessingConfig(void)
+{
+#ifdef SITL_LOCAL
+    gRcProcRateSnapshot = *currentControlRateProfile;
+    gRcProcControlsSnapshot = *rcControlsConfig();
+    gRcProcRxSnapshot = *rxConfig();
+    gRcProcPidSnapshot = *currentPidProfile;
+    gRcProcSnapshotValid = true;
+#endif
+}
+
+static bool rcProcessingConfigChanged(void)
+{
+#ifdef SITL_LOCAL
+    if (!gRcProcSnapshotValid) {
+        return true;
+    }
+    return memcmp(&gRcProcRateSnapshot, currentControlRateProfile,
+                  sizeof(controlRateConfig_t)) != 0
+        || memcmp(&gRcProcControlsSnapshot, rcControlsConfig(),
+                  sizeof(rcControlsConfig_t)) != 0
+        || memcmp(&gRcProcRxSnapshot, rxConfig(), sizeof(rxConfig_t)) != 0
+        || memcmp(&gRcProcPidSnapshot, currentPidProfile,
+                  sizeof(pidProfile_t)) != 0;
+#else
+    return true;
+#endif
+}
+
 void sitlLocalRunBootReapply(bool reinitGyroFilters)
 {
 #ifdef SITL_LOCAL
@@ -407,6 +474,14 @@ void sitlLocalRunBootReapply(bool reinitGyroFilters)
     motorPostInit();
     motorEnable();
     sitlLocalSyncDebugMode();
+
+    // Everything above is now built from the current settings: remember them,
+    // so a later configurator write with unchanged settings does not rebuild the
+    // stateful chains for nothing.
+    extern void sitlLocalSnapshotGyroFilterConfig(void);
+    sitlLocalSnapshotGyroFilterConfig();
+    sitlLocalSnapshotPidFilterConfig();
+    sitlLocalSnapshotRcProcessingConfig();
 #endif
 }
 
@@ -489,6 +564,62 @@ void sitlMspWriteEEPROM(void)
 void sitlMspReadEEPROM(void)
 {
     sitlAuditLog("save: EEPROM re-read skipped (runtime state preserved)");
+}
+
+// msp.c's configurator SET handlers re-initialise stateful chains that a real FC
+// only ever rebuilds at boot:
+//
+//   MSP_SET_RC_TUNING     -> initRcProcessing()
+//   MSP_SET_FILTER_CONFIG -> validateAndFixGyroConfig(); gyroInitFilters();
+//                            pidInitFilters(currentPidProfile);
+//
+// This build renames those three calls for msp.c and gates them on "the
+// underlying settings really changed". Measured with
+// tools/sitl_local_save_compare, replaying the configurator's read-modify-write
+// burst byte for byte with the config verified unchanged:
+//
+//   MSP_SET_RC_TUNING     -> up to 153 us different motor output
+//   MSP_SET_FILTER_CONFIG -> up to 318 us
+//
+// while the steady state stayed bit-identical, and the difference was stable -
+// i.e. after a Save the aircraft kept responding differently to the same sticks
+// until the process was restarted. Rebuilding only on a real change keeps a
+// genuine filter or rate edit applying immediately (exactly like a real FC),
+// while a save that changes nothing no longer touches the running control loop.
+void sitlMspInitRcProcessing(void)
+{
+    if (rcProcessingConfigChanged()) {
+        sitlAuditLog("config write: rate/RC settings changed, rc processing re-inited");
+        initRcProcessing();
+        sitlLocalSnapshotRcProcessingConfig();
+    } else {
+        sitlAuditLog("config write: rate/RC settings unchanged, rc processing kept");
+    }
+}
+
+void sitlMspGyroInitFilters(void)
+{
+    extern void sitlLocalSnapshotGyroFilterConfig(void);
+    extern bool sitlLocalGyroFilterConfigChanged(void);
+
+    if (sitlLocalGyroFilterConfigChanged()) {
+        sitlAuditLog("config write: gyro filter settings changed, filters re-inited");
+        gyroInitFilters();
+        sitlLocalSnapshotGyroFilterConfig();
+    } else {
+        sitlAuditLog("config write: gyro filter settings unchanged, chain kept");
+    }
+}
+
+void sitlMspPidInitFilters(const pidProfile_t *pidProfile)
+{
+    if (pidFilterConfigChanged()) {
+        sitlAuditLog("config write: dterm filter settings changed, filters re-inited");
+        pidInitFilters(pidProfile);
+        sitlLocalSnapshotPidFilterConfig();
+    } else {
+        sitlAuditLog("config write: dterm filter settings unchanged, chain kept");
+    }
 }
 #endif
 
