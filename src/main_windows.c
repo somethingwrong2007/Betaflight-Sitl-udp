@@ -265,7 +265,15 @@ void sitlBoot(int argc, char *argv[])
     printfSerialInit();
 #endif
 
-    systemInit();
+    // Only on the first boot: an in-process reboot (LOCAL mode's configurator
+    // Save) re-runs this whole sequence, and the SITL's worker threads cannot
+    // be torn down safely (that path crashes), so they are started once and
+    // kept alive across reboots instead of being duplicated.
+    static bool systemInited = false;
+    if (!systemInited) {
+        systemInited = true;
+        systemInit();
+    }
 
 #ifdef ENABLE_MULTICORE_INIT
     multicoreExecuteBlocking(initPhase1);

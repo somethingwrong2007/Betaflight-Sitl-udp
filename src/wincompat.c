@@ -63,6 +63,32 @@ extern void writeEEPROM(void);
 extern void sitlSystemResetNative(void);
 extern void sitlLocalRebootJump(void);
 void systemReset(void);
+
+// sitl.c's exit() calls are renamed to this by CMakeLists.txt. During an
+// in-process reboot we want systemReset()'s worker-thread cleanup
+// (workerRunning = false + pthread_join) to run and then *return* instead of
+// killing the host; every other exit path still exits for real.
+static volatile LONG gSitlSoftShutdown = 0;
+
+void sitlPlatformExit(int code)
+{
+    if (InterlockedCompareExchange(&gSitlSoftShutdown, 0, 0) != 0) {
+        return;
+    }
+    exit(code);
+}
+
+// Stop the SITL's own worker threads (tcp + udp-gazebo + udp-rc). Reuses
+// sitl.c's systemReset() cleanup, which sets workerRunning = false and joins
+// the tcp/udp handles, under the soft-shutdown flag so the process survives.
+// The udp-rc worker is not joinable; it exits on the same flag within its
+// 100 ms udpRecv timeout (waiters poll sitl_local_can_unload()).
+void sitlLocalStopSitlWorkers(void)
+{
+    InterlockedExchange(&gSitlSoftShutdown, 1);
+    sitlSystemResetNative();
+    InterlockedExchange(&gSitlSoftShutdown, 0);
+}
 #ifdef USE_BLACKBOX
 extern void blackboxFinish(void);
 #endif

@@ -140,6 +140,8 @@ extern void sitlLocalCaptureMotorPacket(const void *data, size_t size);
 extern bool sitlLocalTakeMotorPacket(void *out, size_t size);
 
 static bool gLocalRunning = false;
+// Tick of the last sitl_local_shutdown(), used by sitl_local_can_unload().
+static ULONGLONG gLocalShutdownTick = 0;
 static HANDLE gMspThread = NULL;
 static volatile LONG gMspThreadStop = 0;
 
@@ -1021,12 +1023,12 @@ void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
             // Leave it pending: a reboot drops the motors, so wait for disarm.
         } else {
             InterlockedExchange(&gLocalHardRebootPending, 0);
-            EnterCriticalSection(&gMspCrit);
-            extern void sitlLocalFullFirmwareReboot(void);
-            sitlLocalFullFirmwareReboot();
-            LeaveCriticalSection(&gMspCrit);
-            // sitl_local_init() applies these right after sitlBoot() as well.
-            localApplyLinkOverrides();
+            // Real reboot semantics, in-process: stop every worker thread and
+            // release the ports, then boot from scratch exactly like a process
+            // restart would. sitl_local_init() re-runs sitlBoot() (systemInit +
+            // initPhase1..3 + the LOCAL overrides) and restarts the MSP thread.
+            sitl_local_shutdown();
+            sitl_local_init();
         }
     }
 
@@ -1232,13 +1234,46 @@ uint64_t sitl_local_time_us(void)
 
 void sitl_local_shutdown(void)
 {
+    // Close the virtual EEPROM file: initEEPROM() refuses to (re)open it while
+    // a handle is still held, and a failed read calls failureMode() which spins
+    // forever. Persist first so nothing is lost.
+    writeEEPROM();
+    if (sitlEepromFileIsOpen()) {
+        configLock();
+    }
     if (gMspThread != NULL) {
         InterlockedExchange(&gMspThreadStop, 1);
         WaitForSingleObject(gMspThread, 1000);
         CloseHandle(gMspThread);
         gMspThread = NULL;
     }
+    // Stop the UART/WebSocket layers (releasing 5761/6761 so a reloaded or
+    // rebooted instance can bind them again) and the SITL's own worker threads,
+    // so nothing is left executing code from this module.
+    extern void serialTcpShutdown(void);
+    extern void wsProxyShutdown(void);
+    // UART TCP (5761..) and WebSocket (6761) layers: stop, release the ports.
+    // Verified: the stop finishes in <=15 ms and init() can re-bind afterwards.
+    serialTcpShutdown();
+    wsProxyShutdown();
+    // The SITL's own worker threads (tcp/udp/udp-rc) are deliberately NOT
+    // stopped: in LOCAL mode they only sleep (udpInit() is a no-op, there are
+    // no UDP sockets), and tearing them down through systemReset() crashed in
+    // testing. They keep running across an in-process reboot, which is why
+    // sitlBoot() now only calls systemInit() on the first boot.
+    // Consequence: the module is not unloadable, see sitl_local_can_unload().
+    gLocalShutdownTick = GetTickCount64();
     gLocalRunning = false;
+}
+
+// The listening sockets are closed and our own threads are stopped, but the
+// SITL's worker threads (tcp/udp/udp-rc) intentionally keep running in LOCAL
+// mode - stopping them through systemReset() crashes. So this reports 0 and the
+// host must NOT FreeLibrary() the module yet; use the in-process reboot
+// (configurator Save) instead, which restarts the firmware without unloading.
+int sitl_local_can_unload(void)
+{
+    return 0;
 }
 
 #endif // SITL_LOCAL

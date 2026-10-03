@@ -37,6 +37,10 @@ static pthread_t clientThreads[SERIAL_PORT_COUNT][MAX_TCP_CLIENTS];
 static pthread_mutex_t clientLocks[SERIAL_PORT_COUNT];
 static pthread_t serverThreads[SERIAL_PORT_COUNT];
 static bool tcpStart = false;
+// Set while the UART TCP listeners/clients are being torn down (host reload or
+// in-process reboot). The accept/client loops poll it and exit; the listeners
+// are closed so the reloaded instance can bind the ports again.
+static volatile LONG tcpServerStop = 0;
 
 static const struct serialPortVTable tcpVTable;
 
@@ -98,6 +102,9 @@ static void *tcpClientThread(void *arg)
     uint8_t buf[2048];
 
     for (;;) {
+        if (InterlockedCompareExchange(&tcpServerStop, 0, 0) != 0) {
+            break;
+        }
         fd_set rfds;
         struct timeval tv;
         FD_ZERO(&rfds);
@@ -127,8 +134,14 @@ static void *tcpServerThread(void *arg)
     SOCKET listenSock = listenSockets[id];
 
     for (;;) {
+        if (InterlockedCompareExchange(&tcpServerStop, 0, 0) != 0) {
+            break;
+        }
         SOCKET client = accept(listenSock, NULL, NULL);
         if (client == INVALID_SOCKET) {
+            if (InterlockedCompareExchange(&tcpServerStop, 0, 0) != 0) {
+                break;
+            }
             continue;
         }
         socketNoInherit(client);
@@ -464,6 +477,55 @@ static const struct serialPortVTable tcpVTable = {
 bool tcpIsStart(void)
 {
     return tcpStart;
+}
+
+// --- orderly shutdown (host reload / in-process reboot) ---------------------
+// Closes the listeners (releasing 5761..), stops the accept loops and the
+// client pumps, and waits for all of them to finish so nothing is left running
+// code from this module.
+void serialTcpShutdown(void)
+{
+    if (!tcpStart) {
+        return;
+    }
+    InterlockedExchange(&tcpServerStop, 1);
+
+    for (int id = 0; id < SERIAL_PORT_COUNT; id++) {
+        if (listenSockets[id] != INVALID_SOCKET) {
+            closesocket(listenSockets[id]); // wakes a blocked accept()
+            listenSockets[id] = INVALID_SOCKET;
+        }
+        // Client sockets are NOT closed here: the owned threads close their own
+        // socket in tcpClientDisconnect(); closing it from this thread too would
+        // double-close the handle (the crash this used to cause). They poll the
+        // stop flag with their 50 ms select() timeout and exit by themselves.
+    }
+
+    for (int id = 0; id < SERIAL_PORT_COUNT; id++) {
+        if (tcpPortInitialized[id]) {
+            pthread_join(serverThreads[id], NULL);
+            tcpPortInitialized[id] = false;
+        }
+    }
+    tcpStart = false;
+}
+
+// True when every TCP worker has stopped. The client pumps are detached, so
+// this checks the slot they clear on exit (tcpClientDisconnect()) instead of
+// joining them; give them the ~50 ms select() tick to notice the stop flag.
+bool serialTcpCanUnload(void)
+{
+    for (int id = 0; id < SERIAL_PORT_COUNT; id++) {
+        pthread_mutex_lock(&clientLocks[id]);
+        for (int i = 0; i < MAX_TCP_CLIENTS; i++) {
+            if (clientSockets[id][i] != INVALID_SOCKET) {
+                pthread_mutex_unlock(&clientLocks[id]);
+                return false;
+            }
+        }
+        pthread_mutex_unlock(&clientLocks[id]);
+    }
+    return true;
 }
 
 bool *tcpGetUsed(void)

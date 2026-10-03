@@ -214,6 +214,13 @@ SITL_LOCAL_API void sitl_local_shutdown(void);
  */
 SITL_LOCAL_API int sitl_local_take_reload_request(void);
 
+/**
+ * 1 = every worker thread has stopped and the listening sockets are closed, so
+ * the host may safely FreeLibrary() this module (then LoadLibrary() + init for
+ * a true reload). Poll it after sitl_local_shutdown(); it never blocks.
+ */
+SITL_LOCAL_API int sitl_local_can_unload(void);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
