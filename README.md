@@ -582,6 +582,18 @@ The gyro calibration a real boot performs is kept (`gyroStartCalibration()`),
 but the virtual gyro reports it as complete immediately, so it never delays
 arming here.
 
+**Configurator writes cannot break the LOCAL link.** The configurator's Save
+writes settings over MSP (feature bitset, battery/ESC meters, motor config,
+mixer, board alignment, ...) without rebooting, which can undo the runtime
+state the LOCAL link pins at boot: the virtual receiver takeover,
+`FEATURE_RX_UDP`, the ADC battery meter sources, the virtual PWM motor protocol
+and the DShot-telemetry flag. Every `MSP_EEPROM_WRITE` therefore re-pins those
+overrides on the next `sitl_local_step()` (flags/mode sources only - no mixer,
+motor or filter state, so it is safe while armed) and logs a before/after
+fingerprint of the runtime state to
+`%LOCALAPPDATA%\Betaflight-SITL\sitl-audit.log` (`save state: ...` followed by
+`re-pin after config write: ...` when something had to be restored).
+
 ### Tuning note: configurator shows 999/333
 
 The Setup page computes `pidHz = 1e6 / cycleTime` and `gyroHz = pidHz *

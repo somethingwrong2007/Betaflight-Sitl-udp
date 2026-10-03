@@ -211,6 +211,23 @@ void sitlLocalPreMotorInit(void)
 // record, so they must be re-applied afterwards or the FC would start running
 // the stored hardware settings (e.g. DSHOT600, whose device init is a stub in
 // this build, so the motors would stop).
+// Install the virtual receiver: seed the UDP provider's channel count (rxInit()
+// snapshots it into rx.c's file-static rxChannelCount, which the channel loops
+// use as their bound - if it stays 0 no channel is ever read) and take over the
+// provider callbacks with the local cache.
+static void localTakeOverRcProvider(void)
+{
+    uint16_t initRc[SITL_LOCAL_MAX_RC_CHANNELS];
+    for (int i = 0; i < SITL_LOCAL_MAX_RC_CHANNELS; i++) {
+        initRc[i] = 1000;
+    }
+    rxUpdateUdpChannels(initRc, SITL_LOCAL_MAX_RC_CHANNELS);
+    rxInit();
+    rxRuntimeState.rcReadRawFn = localRcReadRaw;
+    rxRuntimeState.rcFrameStatusFn = localRcFrameStatus;
+    rxRuntimeState.channelCount = SITL_LOCAL_MAX_RC_CHANNELS;
+}
+
 static void localApplyLinkOverrides(void)
 {
     // Simulated motor RPM participates in the firmware (RPM filter, motor
@@ -225,22 +242,7 @@ static void localApplyLinkOverrides(void)
     // Sensor input arrives via sitl_local_step(), not a serial receiver.
     featureEnableImmediate(FEATURE_RX_UDP);
 
-    // Seed the UDP provider's channel count before rxInit() snapshots it into
-    // rx.c's file-static rxChannelCount. After the takeover below the frame
-    // status callback no longer updates rxChannelCount (frameStatusUdp does),
-    // and readRxChannelsApplyRanges()/detectAndApplySignalLossBehaviour()
-    // loop over rxChannelCount - if it stays 0 no channel is ever read.
-    uint16_t initRc[SITL_LOCAL_MAX_RC_CHANNELS];
-    for (int i = 0; i < SITL_LOCAL_MAX_RC_CHANNELS; i++) {
-        initRc[i] = 1000;
-    }
-    rxUpdateUdpChannels(initRc, SITL_LOCAL_MAX_RC_CHANNELS);
-    rxInit();
-
-    // Take over the RC provider functions with the cache semantics above.
-    rxRuntimeState.rcReadRawFn = localRcReadRaw;
-    rxRuntimeState.rcFrameStatusFn = localRcFrameStatus;
-    rxRuntimeState.channelCount = SITL_LOCAL_MAX_RC_CHANNELS;
+    localTakeOverRcProvider();
 
     // Voltage/current arrive as telemetry, not from a real ADC input.
     batteryConfigMutable()->voltageMeterSource = VOLTAGE_METER_ADC;
@@ -254,6 +256,66 @@ static void localApplyLinkOverrides(void)
 // thread (the scheduler may execute systemReset via TASK_SERIAL while the
 // configurator exits the CLI panel). The background thread picks it up.
 static volatile LONG gLocalPendingReset = 0;
+
+// The configurator's Save writes settings over MSP (motor config, features,
+// battery/ESC meters, mixer, board alignment, ...) and does so *without* a
+// reboot, which can undo the runtime state the LOCAL link pins at boot: the
+// virtual receiver takeover, FEATURE_RX_UDP, the ADC battery meter sources, the
+// virtual PWM motor protocol and the DShot-telemetry flag. Everything below is
+// a plain flag/mode write (no mixer, motor, servo or filter state), so it is
+// safe to apply while armed; the request is queued from the MSP write path and
+// executed on the host thread between steps.
+static volatile LONG gLocalRepinPending = 0;
+
+void sitlLocalRequestRepinOverrides(void)
+{
+    InterlockedExchange(&gLocalRepinPending, 1);
+}
+
+bool sitlLocalRcTakeOverActive(void)
+{
+    return gLocalRunning && rxRuntimeState.rcReadRawFn == localRcReadRaw;
+}
+
+static void localRepinOverrides(void)
+{
+    InterlockedExchange(&gLocalRepinPending, 0);
+
+    const uint8_t protocolBefore = motorConfig()->dev.motorProtocol;
+    const uint32_t featuresBefore = featureConfig()->enabledFeatures;
+    const uint8_t voltageBefore = batteryConfig()->voltageMeterSource;
+    const uint8_t currentBefore = batteryConfig()->currentMeterSource;
+    const bool rcOursBefore = (rxRuntimeState.rcReadRawFn == localRcReadRaw);
+    const bool dshotTelemetryBefore = useDshotTelemetry;
+
+    sitlLocalPreMotorInit();
+    featureEnableImmediate(FEATURE_RX_UDP);
+    batteryConfigMutable()->voltageMeterSource = VOLTAGE_METER_ADC;
+    batteryConfigMutable()->currentMeterSource = CURRENT_METER_ADC;
+    useDshotTelemetry = true;
+    if (!rcOursBefore) {
+        // A configurator write re-ran rxInit(): put the virtual receiver back.
+        localTakeOverRcProvider();
+    }
+
+    if (protocolBefore != motorConfig()->dev.motorProtocol
+        || featuresBefore != featureConfig()->enabledFeatures
+        || voltageBefore != batteryConfig()->voltageMeterSource
+        || currentBefore != batteryConfig()->currentMeterSource
+        || !rcOursBefore
+        || !dshotTelemetryBefore) {
+        sitlAuditLog("re-pin after config write: motorProtocol %u->%u features 0x%08X->0x%08X "
+                     "battery %u/%u->%u/%u rcTakeover %u->%u dshotTelemetry %u->%u",
+                     (unsigned)protocolBefore, (unsigned)motorConfig()->dev.motorProtocol,
+                     (unsigned)featuresBefore, (unsigned)featureConfig()->enabledFeatures,
+                     (unsigned)voltageBefore, (unsigned)currentBefore,
+                     (unsigned)batteryConfig()->voltageMeterSource,
+                     (unsigned)batteryConfig()->currentMeterSource,
+                     (unsigned)rcOursBefore,
+                     (unsigned)(rxRuntimeState.rcReadRawFn == localRcReadRaw),
+                     (unsigned)dshotTelemetryBefore, (unsigned)useDshotTelemetry);
+    }
+}
 
 void sitlLocalRequestReset(void)
 {
@@ -833,6 +895,12 @@ void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
     }
     if (!gLocalRunning || !in) {
         return;
+    }
+
+    // A configurator Save may have undone the pinned LOCAL runtime state; this
+    // only rewrites flags/mode sources, so it also runs while armed.
+    if (InterlockedCompareExchange(&gLocalRepinPending, 0, 0) != 0) {
+        localRepinOverrides();
     }
 
     // Deferred config work (firmware reboot, EEPROM reload and/or path switch)

@@ -28,10 +28,14 @@
 #include "flight/failsafe.h"
 #include "flight/position.h"
 #include "flight/autopilot.h"
+#include "config/feature.h"
+#include "sensors/battery.h"
+#include "flight/pid.h"
 #include "sensors/gyro_init.h"
 #include "sensors/gyro.h"
 #include "sensors/boardalignment.h"
 #include "drivers/dshot.h"
+#include "pg/motor.h"
 #include "pg/dyn_notch.h"
 #include "pg/rpm_filter.h"
 
@@ -267,6 +271,31 @@ void sitlMspWriteEEPROM(void)
     sitlAuditLog("MSP writeEEPROM reached (armed=%u)", (unsigned)(ARMING_FLAG(ARMED) != 0));
     writeEEPROM();
     sitlLocalSyncDebugMode();
+#ifdef SITL_LOCAL
+    // A configurator Save writes settings (motor config, features, battery/ESC
+    // meters, mixer, board alignment, ...) that can undo the runtime state the
+    // LOCAL link pins at boot. Log a fingerprint of that state around the write
+    // and queue a re-pin, executed on the host thread between steps.
+    extern bool sitlLocalRcTakeOverActive(void);
+    extern void sitlLocalRequestRepinOverrides(void);
+    sitlAuditLog("save state: motorProtocol=%u maxthrottle=%u mincommand=%u poles=%u "
+                 "dshotTlm(global/config)=%u/%u features=0x%08X batteryMeter=%u/%u "
+                 "rcTakeover=%u mixer(cfg/rt)=%u/%u denom=%u targetLooptime=%u pidDT=%.6f",
+                 (unsigned)motorConfig()->dev.motorProtocol,
+                 (unsigned)motorConfig()->maxthrottle,
+                 (unsigned)motorConfig()->mincommand,
+                 (unsigned)motorConfig()->motorPoleCount,
+                 (unsigned)(useDshotTelemetry ? 1 : 0),
+                 (unsigned)motorConfig()->dev.useDshotTelemetry,
+                 (unsigned)featureConfig()->enabledFeatures,
+                 (unsigned)batteryConfig()->voltageMeterSource,
+                 (unsigned)batteryConfig()->currentMeterSource,
+                 (unsigned)(sitlLocalRcTakeOverActive() ? 1 : 0),
+                 (unsigned)mixerConfig()->mixerMode, (unsigned)getMixerMode(),
+                 (unsigned)pidConfig()->pid_process_denom,
+                 (unsigned)gyro.targetLooptime, (double)pidGetDT());
+    sitlLocalRequestRepinOverrides();
+#endif
 }
 
 #ifdef SITL_LOCAL
