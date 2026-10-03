@@ -291,6 +291,7 @@ void sitlLocalLogStateIfChanged(const char *tag)
                  "rcFrames=%u "
                  "featRt(air/ag/udp/gps/3d/esc)=%u/%u/%u/%u/%u/%u "
                  "lpf=%u/%u-%u/%u notch=%u/%u/%u/%u pidProf=%u ratesType=%u armed=%u armFlags=%08X "
+                 "modes=%04X att=%d/%d/%d gyroADC=%.0f/%.0f/%.0f "
                  "pidR=%u/%u/%u/%u pidP=%u/%u/%u/%u pidY=%u/%u/%u/%u "
                  "dtermLpf=%u/%u-%u/%u itermRelax=%u/%u antiGrav=%u",
                  tag,
@@ -312,6 +313,9 @@ void sitlLocalLogStateIfChanged(const char *tag)
                  (unsigned)now.lpf2, (unsigned)now.notch1Hz, (unsigned)now.notch1Cut,
                  (unsigned)now.notch2Hz, (unsigned)now.notch2Cut, (unsigned)now.pidProfileIdx,
                  (unsigned)now.ratesType, (unsigned)now.armed, now.armDisableFlags,
+                 (unsigned)flightModeFlags,
+                 (int)attitude.values.roll, (int)attitude.values.pitch, (int)attitude.values.yaw,
+                 (double)gyro.gyroADC[0], (double)gyro.gyroADC[1], (double)gyro.gyroADC[2],
                  now.pidP[0], now.pidI[0], now.pidD[0], now.pidF[0],
                  now.pidP[1], now.pidI[1], now.pidD[1], now.pidF[1],
                  now.pidP[2], now.pidI[2], now.pidD[2], now.pidF[2],
