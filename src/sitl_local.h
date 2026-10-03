@@ -204,23 +204,6 @@ SITL_LOCAL_API int sitl_local_reload_config(void);
 /** Stop the background MSP thread. Does not exit the host process. */
 SITL_LOCAL_API void sitl_local_shutdown(void);
 
-/**
- * Returns 1 (and clears the flag) when the FC would like the host to reload
- * this library, i.e. the configurator's Save left state that only a fresh
- * process/DLL load rebuilds. The host can implement that by calling
- * sitl_local_shutdown(), FreeLibrary() + LoadLibrary() and sitl_local_init()
- * again (which is exactly what restarting the engine did). Returns 0 when
- * nothing is pending.
- */
-SITL_LOCAL_API int sitl_local_take_reload_request(void);
-
-/**
- * 1 = every worker thread has stopped and the listening sockets are closed, so
- * the host may safely FreeLibrary() this module (then LoadLibrary() + init for
- * a true reload). Poll it after sitl_local_shutdown(); it never blocks.
- */
-SITL_LOCAL_API int sitl_local_can_unload(void);
-
 #ifdef __cplusplus
 } // extern "C"
 #endif

@@ -31,8 +31,6 @@
 #include "config/feature.h"
 #include "sensors/battery.h"
 #include "flight/pid.h"
-#include "scheduler/scheduler.h"
-#include "fc/tasks.h"
 #include "fc/controlrate_profile.h"
 #include "pg/rx.h"
 #include "sensors/acceleration.h"
@@ -63,32 +61,6 @@ extern void writeEEPROM(void);
 extern void sitlSystemResetNative(void);
 extern void sitlLocalRebootJump(void);
 void systemReset(void);
-
-// sitl.c's exit() calls are renamed to this by CMakeLists.txt. During an
-// in-process reboot we want systemReset()'s worker-thread cleanup
-// (workerRunning = false + pthread_join) to run and then *return* instead of
-// killing the host; every other exit path still exits for real.
-static volatile LONG gSitlSoftShutdown = 0;
-
-void sitlPlatformExit(int code)
-{
-    if (InterlockedCompareExchange(&gSitlSoftShutdown, 0, 0) != 0) {
-        return;
-    }
-    exit(code);
-}
-
-// Stop the SITL's own worker threads (tcp + udp-gazebo + udp-rc). Reuses
-// sitl.c's systemReset() cleanup, which sets workerRunning = false and joins
-// the tcp/udp handles, under the soft-shutdown flag so the process survives.
-// The udp-rc worker is not joinable; it exits on the same flag within its
-// 100 ms udpRecv timeout (waiters poll sitl_local_can_unload()).
-void sitlLocalStopSitlWorkers(void)
-{
-    InterlockedExchange(&gSitlSoftShutdown, 1);
-    sitlSystemResetNative();
-    InterlockedExchange(&gSitlSoftShutdown, 0);
-}
 #ifdef USE_BLACKBOX
 extern void blackboxFinish(void);
 #endif
@@ -472,28 +444,6 @@ void sitlLocalRunBootProfileInit(void)
 #endif
 }
 
-// A configurator Save perturbs the scheduler's own state (its deadline grid
-// anchor, task queue, task ages and periods are all built by
-// tasksInit()/schedulerInit() and only ever at boot; the save path runs
-// schedulerIgnoreTaskStateTime() and re-runs various init routines). The tasks
-// then stop lining up with the host's fixed stepping grid and the craft
-// trembles until a *new process* re-runs tasksInit(). Rebuild it in-process,
-// between steps, and re-pin the three realtime periods to the LOCAL loop time.
-void sitlLocalRunSchedulerRepin(void)
-{
-#ifdef SITL_LOCAL
-    tasksInit();
-    const uint32_t periodUs = (gyro.targetLooptime > 0) ? (uint32_t)gyro.targetLooptime : 1000u;
-    rescheduleTask(TASK_GYRO, periodUs);
-    rescheduleTask(TASK_FILTER, periodUs);
-    rescheduleTask(TASK_PID, periodUs);
-    sitlAuditLog("scheduler re-anchored after config write (tasksInit, period=%u us)", (unsigned)periodUs);
-#else
-    // Only the LOCAL link needs this: the standalone builds own the process, so
-    // a "reboot" really restarts it and re-runs tasksInit() anyway.
-#endif
-}
-
 // msp.c's writeEEPROM() calls are renamed to this in LOCAL mode so a save
 // attempt is visible in the audit log (including whether the FC was armed,
 // which makes MSP_EEPROM_WRITE get rejected before writeEEPROM is reached).
@@ -507,23 +457,8 @@ void sitlMspWriteEEPROM(void)
     // it changed (full control-relevant fingerprint) and queue the re-pin.
     extern void sitlLocalLogStateIfChanged(const char *tag);
     extern void sitlLocalRequestRepinOverrides(void);
-    extern void sitlLocalRequestSchedulerRepin(void);
-    extern void sitlLocalRequestHardReboot(void);
-    extern void sitlLocalRequestHostReload(void);
     sitlLocalLogStateIfChanged("save");
     sitlLocalRequestRepinOverrides();
-    // The save path also perturbs the scheduler's own state (see
-    // sitlLocalRequestSchedulerRepin()); rebuild it like a boot would.
-    sitlLocalRequestSchedulerRepin();
-    // And queue the full in-process firmware reboot: a configurator Save can
-    // leave state that only a boot's initPhase1..3 rebuild (tasksInitData(),
-    // sensor device init, scheduler state), which used to require restarting
-    // the host process. Applied on the next step while disarmed.
-    sitlLocalRequestHardReboot();
-    // Tell the host as well: if the in-process reboot does not clear the
-    // state, the host can reload this library (shutdown + FreeLibrary +
-    // LoadLibrary + init), which is what restarting the engine does.
-    sitlLocalRequestHostReload();
 #endif
 }
 

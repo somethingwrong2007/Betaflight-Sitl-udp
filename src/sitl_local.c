@@ -33,7 +33,6 @@
 #include "drivers/dshot.h"
 #include "io/gps_virtual.h"
 #include "fc/core.h"
-#include "fc/tasks.h"
 #include "fc/controlrate_profile.h"
 #include "fc/rc_controls.h"
 #include "flight/imu.h"
@@ -140,8 +139,6 @@ extern void sitlLocalCaptureMotorPacket(const void *data, size_t size);
 extern bool sitlLocalTakeMotorPacket(void *out, size_t size);
 
 static bool gLocalRunning = false;
-// Tick of the last sitl_local_shutdown(), used by sitl_local_can_unload().
-static ULONGLONG gLocalShutdownTick = 0;
 static HANDLE gMspThread = NULL;
 static volatile LONG gMspThreadStop = 0;
 
@@ -284,45 +281,9 @@ static volatile LONG gLocalPendingReset = 0;
 // executed on the host thread between steps.
 static volatile LONG gLocalRepinPending = 0;
 
-// The scheduler's own state (deadline grid anchor, task queue, task ages and
-// periods) is established by tasksInit() -> schedulerInit() and only ever at
-// boot. The configurator's Save path runs schedulerIgnoreTaskStateTime()
-// (msp.c, MSP_EEPROM_WRITE) and a chain of MSP_SET_* handlers that call
-// initialisation routines, which perturbs that state: the tasks then no longer
-// line up with the host's fixed stepping grid, and the craft trembles until a
-// *new process* re-runs tasksInit(). Re-anchor it in-process instead.
-static volatile LONG gLocalSchedRepinPending = 0;
-// Full firmware reboot request (see sitlLocalFullFirmwareReboot()): applied on
-// the next step while disarmed, with the MSP parser locked out.
-static volatile LONG gLocalHardRebootPending = 0;
-
 void sitlLocalRequestRepinOverrides(void)
 {
     InterlockedExchange(&gLocalRepinPending, 1);
-}
-
-void sitlLocalRequestSchedulerRepin(void)
-{
-    InterlockedExchange(&gLocalSchedRepinPending, 1);
-}
-
-void sitlLocalRequestHardReboot(void)
-{
-    InterlockedExchange(&gLocalHardRebootPending, 1);
-}
-
-// Set when a configurator Save leaves state that only a fresh process/DLL load
-// rebuilds; the host polls it with sitl_local_take_reload_request().
-static volatile LONG gLocalHostReloadRequested = 0;
-
-void sitlLocalRequestHostReload(void)
-{
-    InterlockedExchange(&gLocalHostReloadRequested, 1);
-}
-
-int sitl_local_take_reload_request(void)
-{
-    return InterlockedExchange(&gLocalHostReloadRequested, 0) != 0 ? 1 : 0;
 }
 
 bool sitlLocalRcTakeOverActive(void)
@@ -1007,31 +968,6 @@ void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
         localRepinOverrides();
     }
 
-    // Rebuild the scheduler state a fresh boot would have (grid anchor, task
-    // queue/ages/periods) after a configurator write. Between steps, so it can
-    // never run inside a scheduler pass.
-    if (InterlockedExchange(&gLocalSchedRepinPending, 0) != 0) {
-        extern void sitlLocalRunSchedulerRepin(void);
-        sitlLocalRunSchedulerRepin();
-    }
-
-    // Full in-process firmware reboot (the equivalent of restarting the host
-    // process): applied only while disarmed, with the MSP parser locked out so
-    // the configurator link cannot race the re-init.
-    if (InterlockedCompareExchange(&gLocalHardRebootPending, 0, 0) != 0) {
-        if (ARMING_FLAG(ARMED)) {
-            // Leave it pending: a reboot drops the motors, so wait for disarm.
-        } else {
-            InterlockedExchange(&gLocalHardRebootPending, 0);
-            // Real reboot semantics, in-process: stop every worker thread and
-            // release the ports, then boot from scratch exactly like a process
-            // restart would. sitl_local_init() re-runs sitlBoot() (systemInit +
-            // initPhase1..3 + the LOCAL overrides) and restarts the MSP thread.
-            sitl_local_shutdown();
-            sitl_local_init();
-        }
-    }
-
     // State flight recorder: ~1 Hz, and only writes to the audit log when any
     // control-relevant state actually changed (see wincompat.c). This is what
     // makes "a save left the FC in a different state" visible.
@@ -1234,46 +1170,13 @@ uint64_t sitl_local_time_us(void)
 
 void sitl_local_shutdown(void)
 {
-    // Close the virtual EEPROM file: initEEPROM() refuses to (re)open it while
-    // a handle is still held, and a failed read calls failureMode() which spins
-    // forever. Persist first so nothing is lost.
-    writeEEPROM();
-    if (sitlEepromFileIsOpen()) {
-        configLock();
-    }
     if (gMspThread != NULL) {
         InterlockedExchange(&gMspThreadStop, 1);
         WaitForSingleObject(gMspThread, 1000);
         CloseHandle(gMspThread);
         gMspThread = NULL;
     }
-    // Stop the UART/WebSocket layers (releasing 5761/6761 so a reloaded or
-    // rebooted instance can bind them again) and the SITL's own worker threads,
-    // so nothing is left executing code from this module.
-    extern void serialTcpShutdown(void);
-    extern void wsProxyShutdown(void);
-    // UART TCP (5761..) and WebSocket (6761) layers: stop, release the ports.
-    // Verified: the stop finishes in <=15 ms and init() can re-bind afterwards.
-    serialTcpShutdown();
-    wsProxyShutdown();
-    // The SITL's own worker threads (tcp/udp/udp-rc) are deliberately NOT
-    // stopped: in LOCAL mode they only sleep (udpInit() is a no-op, there are
-    // no UDP sockets), and tearing them down through systemReset() crashed in
-    // testing. They keep running across an in-process reboot, which is why
-    // sitlBoot() now only calls systemInit() on the first boot.
-    // Consequence: the module is not unloadable, see sitl_local_can_unload().
-    gLocalShutdownTick = GetTickCount64();
     gLocalRunning = false;
-}
-
-// The listening sockets are closed and our own threads are stopped, but the
-// SITL's worker threads (tcp/udp/udp-rc) intentionally keep running in LOCAL
-// mode - stopping them through systemReset() crashes. So this reports 0 and the
-// host must NOT FreeLibrary() the module yet; use the in-process reboot
-// (configurator Save) instead, which restarts the firmware without unloading.
-int sitl_local_can_unload(void)
-{
-    return 0;
 }
 
 #endif // SITL_LOCAL

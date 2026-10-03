@@ -439,10 +439,7 @@ if(WIN32)
   # fopen/fclose are renamed so wincompat.c can redirect the virtual EEPROM to
   # BF_SITL_EEPROM and track whether that file is currently open (the LOCAL
   # link needs to know before re-opening it at another path).
-  # exit() is renamed so an in-process reboot can reuse systemReset()'s worker
-  # thread cleanup (workerRunning=false + pthread_join) and then return instead
-  # of terminating the host process.
-  set(SITL_SITL_C_OPTS "-Dmicros64=sitlMicros64;-Dmillis64=sitlMillis64;-Dmicros=sitlMicros;-Dmillis=sitlMillis;-DdelayMicroseconds=sitlDelayMicroseconds;-DgetCycleCounter=sitlGetCycleCounter;-Dfopen=sitlFopen;-Dfclose=sitlFclose;-Dpthread_mutex_trylock=sitlMutexTrylock;-Dpthread_mutex_unlock=sitlMutexUnlock;-DsystemReset=sitlSystemResetNative;-Dexit=sitlPlatformExit")
+  set(SITL_SITL_C_OPTS "-Dmicros64=sitlMicros64;-Dmillis64=sitlMillis64;-Dmicros=sitlMicros;-Dmillis=sitlMillis;-DdelayMicroseconds=sitlDelayMicroseconds;-DgetCycleCounter=sitlGetCycleCounter;-Dfopen=sitlFopen;-Dfclose=sitlFclose;-Dpthread_mutex_trylock=sitlMutexTrylock;-Dpthread_mutex_unlock=sitlMutexUnlock;-DsystemReset=sitlSystemResetNative")
   if(SITL_LINK_MODE STREQUAL "LOCAL")
     # sitl.c's systemResetToBootloader() calls exit(0), which would kill the
     # host process from a DLL ("Enter DFU/bootloader" in the configurator).

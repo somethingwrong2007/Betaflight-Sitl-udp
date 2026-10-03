@@ -27,11 +27,6 @@ extern void sitlAuditLog(const char *fmt, ...);
 #define WS_GUID "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 static SOCKET wsListenSocket = INVALID_SOCKET;
-// Set while the proxy is being torn down (host reload / in-process reboot).
-// The accept loop breaks on it and the client pumps poll it once per select()
-// timeout; wsClientCount tracks the pumps that are still alive.
-static volatile LONG wsStopFlag = 0;
-static volatile LONG wsClientCount = 0;
 static pthread_t wsListenThreadHandle;
 static bool wsStarted = false;
 
@@ -281,7 +276,7 @@ static bool readWsFrame(SOCKET sock, uint8_t *payload, size_t payloadSize, size_
     return !(*close);
 }
 
-static void *wsClientThreadBody(void *arg)
+static void *wsClientThread(void *arg)
 {
     const SOCKET ws = (SOCKET)(intptr_t)arg;
 
@@ -327,9 +322,6 @@ static void *wsClientThreadBody(void *arg)
     bool wsClosed = false;
 
     while (!wsClosed) {
-        if (InterlockedCompareExchange(&wsStopFlag, 0, 0) != 0) {
-            break;
-        }
         fd_set rfds;
         struct timeval tv;
         FD_ZERO(&rfds);
@@ -369,20 +361,12 @@ static void *wsClientThreadBody(void *arg)
     return NULL;
 }
 
-static void *wsClientThread(void *arg);
-
 static void *wsListenThread(void *arg)
 {
     (void)arg;
     for (;;) {
-        if (InterlockedCompareExchange(&wsStopFlag, 0, 0) != 0) {
-            break;
-        }
         SOCKET client = accept(wsListenSocket, NULL, NULL);
         if (client == INVALID_SOCKET) {
-            if (InterlockedCompareExchange(&wsStopFlag, 0, 0) != 0) {
-                break;
-            }
             continue;
         }
         socketNoInherit(client);
@@ -391,36 +375,6 @@ static void *wsListenThread(void *arg)
         pthread_detach(thread);
     }
     return NULL;
-}
-
-// Count the client pumps so a shutdown can tell when they are all gone.
-static void *wsClientThread(void *arg)
-{
-    InterlockedIncrement(&wsClientCount);
-    void *ret = wsClientThreadBody(arg);
-    InterlockedDecrement(&wsClientCount);
-    return ret;
-}
-
-// --- orderly shutdown (host reload / in-process reboot) --------------------
-void wsProxyShutdown(void)
-{
-    InterlockedExchange(&wsStopFlag, 1);
-    if (wsListenSocket != INVALID_SOCKET) {
-        closesocket(wsListenSocket); // wakes a blocked accept()
-        wsListenSocket = INVALID_SOCKET;
-    }
-    if (wsStarted) {
-        pthread_join(wsListenThreadHandle, NULL);
-        wsStarted = false;
-    }
-}
-
-// True once no WebSocket client pump is left (they poll wsStopFlag once per
-// select() timeout, so this turns true within ~1 s of wsProxyShutdown()).
-bool wsProxyCanUnload(void)
-{
-    return InterlockedCompareExchange(&wsClientCount, 0, 0) == 0;
 }
 
 void wsProxyStart(void)
