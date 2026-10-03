@@ -482,11 +482,17 @@ void sitlMspWriteEEPROM(void)
     extern void sitlLocalLogStateIfChanged(const char *tag);
     extern void sitlLocalRequestRepinOverrides(void);
     extern void sitlLocalRequestSchedulerRepin(void);
+    extern void sitlLocalRequestHardReboot(void);
     sitlLocalLogStateIfChanged("save");
     sitlLocalRequestRepinOverrides();
     // The save path also perturbs the scheduler's own state (see
     // sitlLocalRequestSchedulerRepin()); rebuild it like a boot would.
     sitlLocalRequestSchedulerRepin();
+    // And queue the full in-process firmware reboot: a configurator Save can
+    // leave state that only a boot's initPhase1..3 rebuild (tasksInitData(),
+    // sensor device init, scheduler state), which used to require restarting
+    // the host process. Applied on the next step while disarmed.
+    sitlLocalRequestHardReboot();
 #endif
 }
 

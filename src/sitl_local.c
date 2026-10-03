@@ -290,6 +290,9 @@ static volatile LONG gLocalRepinPending = 0;
 // line up with the host's fixed stepping grid, and the craft trembles until a
 // *new process* re-runs tasksInit(). Re-anchor it in-process instead.
 static volatile LONG gLocalSchedRepinPending = 0;
+// Full firmware reboot request (see sitlLocalFullFirmwareReboot()): applied on
+// the next step while disarmed, with the MSP parser locked out.
+static volatile LONG gLocalHardRebootPending = 0;
 
 void sitlLocalRequestRepinOverrides(void)
 {
@@ -299,6 +302,11 @@ void sitlLocalRequestRepinOverrides(void)
 void sitlLocalRequestSchedulerRepin(void)
 {
     InterlockedExchange(&gLocalSchedRepinPending, 1);
+}
+
+void sitlLocalRequestHardReboot(void)
+{
+    InterlockedExchange(&gLocalHardRebootPending, 1);
 }
 
 bool sitlLocalRcTakeOverActive(void)
@@ -989,6 +997,23 @@ void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
     if (InterlockedExchange(&gLocalSchedRepinPending, 0) != 0) {
         extern void sitlLocalRunSchedulerRepin(void);
         sitlLocalRunSchedulerRepin();
+    }
+
+    // Full in-process firmware reboot (the equivalent of restarting the host
+    // process): applied only while disarmed, with the MSP parser locked out so
+    // the configurator link cannot race the re-init.
+    if (InterlockedCompareExchange(&gLocalHardRebootPending, 0, 0) != 0) {
+        if (ARMING_FLAG(ARMED)) {
+            // Leave it pending: a reboot drops the motors, so wait for disarm.
+        } else {
+            InterlockedExchange(&gLocalHardRebootPending, 0);
+            EnterCriticalSection(&gMspCrit);
+            extern void sitlLocalFullFirmwareReboot(void);
+            sitlLocalFullFirmwareReboot();
+            LeaveCriticalSection(&gMspCrit);
+            // sitl_local_init() applies these right after sitlBoot() as well.
+            localApplyLinkOverrides();
+        }
     }
 
     // State flight recorder: ~1 Hz, and only writes to the audit log when any

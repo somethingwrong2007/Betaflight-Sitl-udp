@@ -339,6 +339,37 @@ void sitlBoot(int argc, char *argv[])
 
 }
 
+#ifdef SITL_LOCAL
+// In-process equivalent of restarting the host process for the *firmware*:
+// re-run the same init sequence sitlBoot() runs (initPhase1 -> pin PWM ->
+// initPhase2 -> initPhase3 -> 1 kHz task pin) but without systemInit(), which
+// owns the SITL's process-level worker threads and listening sockets.
+//
+// Needed because a configurator Save perturbs state that only a boot rebuilds -
+// initPhase1's tasksInitData()/initEEPROM()/readEEPROM() and initPhase3's
+// sensorsInit()/tasksInit() (scheduler deadline grid anchor, task queue/ages,
+// task periods, sensor device state) - and the app-level feedback loop then
+// trembles until the process is restarted.
+void sitlLocalFullFirmwareReboot(void)
+{
+    extern void sitlAuditLog(const char *fmt, ...);
+    extern void sitlLocalPreMotorInit(void);
+
+    initPhase1();
+    sitlLocalPreMotorInit();
+    initPhase2();
+    initPhase3();
+
+    const uint32_t gyroPeriodUs = 1000000u / sitlGyroHz();
+    rescheduleTask(TASK_GYRO, gyroPeriodUs);
+    rescheduleTask(TASK_FILTER, gyroPeriodUs);
+    rescheduleTask(TASK_PID, gyroPeriodUs);
+
+    sitlAuditLog("in-process firmware reboot done (initPhase1..3, period=%u us)",
+                 (unsigned)gyroPeriodUs);
+}
+#endif
+
 int main(int argc, char *argv[])
 {
     sitlBoot(argc, argv);
