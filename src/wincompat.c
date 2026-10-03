@@ -161,7 +161,7 @@ static uint32_t fnv32Struct(const void *data, size_t len)
 }
 
 typedef struct {
-    uint32_t hashSystem, hashPid, hashRates, hashGyro, hashMotor, hashBattery,
+    uint32_t hashSystem, hashPid, hashPidProfiles, hashRates, hashGyro, hashMotor, hashBattery,
              hashMixer, hashFeature, hashRx, hashImu, hashAcc;
     uint8_t  protocol, poles, dshotCfg, dshotEdt, bitbang, motorIdle;
     uint16_t maxthrottle, mincommand;
@@ -184,6 +184,10 @@ static void sitlCollectStateFp(sitlLocalStateFp_t *fp)
 
     fp->hashSystem = fnv32Struct(systemConfig(), sizeof(systemConfig_t));
     fp->hashPid = fnv32Struct(pidConfig(), sizeof(pidConfig_t));
+    // The profile contents live in a separate PG array; without this a
+    // configurator Save that overwrites the tuned PIDs (and the advanced PID
+    // settings) with its cached values would be invisible.
+    fp->hashPidProfiles = fnv32Struct(&pidProfiles(0)[0], sizeof(pidProfile_t) * PID_PROFILE_COUNT);
     fp->hashRates = fnv32Struct(&controlRateProfiles(0)[0], sizeof(controlRateConfig_t) * CONTROL_RATE_PROFILE_COUNT);
     fp->hashGyro = fnv32Struct(gyroConfig(), sizeof(gyroConfig_t));
     fp->hashMotor = fnv32Struct(motorConfig(), sizeof(motorConfig_t));
@@ -257,10 +261,10 @@ void sitlLocalLogStateIfChanged(const char *tag)
     last = now;
     haveLast = true;
 
-    sitlAuditLog("%s%s hash sys=%08X pid=%08X rates=%08X gyro=%08X motor=%08X batt=%08X "
+    sitlAuditLog("%s%s hash sys=%08X pid=%08X pidProf=%08X rates=%08X gyro=%08X motor=%08X batt=%08X "
                  "mix=%08X feat=%08X rx=%08X imu=%08X acc=%08X",
                  tag, first ? " (initial)" : "",
-                 now.hashSystem, now.hashPid, now.hashRates, now.hashGyro, now.hashMotor,
+                 now.hashSystem, now.hashPid, now.hashPidProfiles, now.hashRates, now.hashGyro, now.hashMotor,
                  now.hashBattery, now.hashMixer, now.hashFeature, now.hashRx, now.hashImu,
                  now.hashAcc);
     extern void sitlLocalStepStats(uint32_t *maxUs, uint32_t *avgUs, uint32_t *steps,
@@ -282,7 +286,8 @@ void sitlLocalLogStateIfChanged(const char *tag)
                  "mspThread(busyUs/calls)=%u/%u "
                  "featRt(air/ag/udp/gps/3d/esc)=%u/%u/%u/%u/%u/%u "
                  "lpf=%u/%u-%u/%u notch=%u/%u/%u/%u pidProf=%u ratesType=%u armed=%u armFlags=%08X "
-                 "pidR=%u/%u/%u/%u pidP=%u/%u/%u/%u pidY=%u/%u/%u/%u",
+                 "pidR=%u/%u/%u/%u pidP=%u/%u/%u/%u pidY=%u/%u/%u/%u "
+                 "dtermLpf=%u/%u-%u/%u itermRelax=%u/%u antiGrav=%u",
                  tag,
                  (unsigned)now.protocol, (unsigned)now.dshotCfg,
                  (unsigned)now.dshotEdt, (unsigned)now.bitbang, (unsigned)now.motorIdle,
@@ -303,7 +308,14 @@ void sitlLocalLogStateIfChanged(const char *tag)
                  (unsigned)now.ratesType, (unsigned)now.armed, now.armDisableFlags,
                  now.pidP[0], now.pidI[0], now.pidD[0], now.pidF[0],
                  now.pidP[1], now.pidI[1], now.pidD[1], now.pidF[1],
-                 now.pidP[2], now.pidI[2], now.pidD[2], now.pidF[2]);
+                 now.pidP[2], now.pidI[2], now.pidD[2], now.pidF[2],
+                 (unsigned)currentPidProfile->dterm_lpf1_static_hz,
+                 (unsigned)currentPidProfile->dterm_lpf1_dyn_min_hz,
+                 (unsigned)currentPidProfile->dterm_lpf1_dyn_max_hz,
+                 (unsigned)currentPidProfile->dterm_lpf2_static_hz,
+                 (unsigned)currentPidProfile->iterm_relax,
+                 (unsigned)currentPidProfile->iterm_relax_cutoff,
+                 (unsigned)currentPidProfile->anti_gravity_gain);
 #else
     UNUSED(tag);
 #endif
