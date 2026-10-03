@@ -540,18 +540,25 @@ in-process DLL can, what real hardware does:
    arming state machines, drop the CLI mode and the `ARMING_DISABLED_CLI` /
    `ARMING_DISABLED_REBOOT_REQUIRED` flags.
 2. **On the next `sitl_local_step()`**, between scheduler passes: persist the
-   current RAM config, re-read the EEPROM (also applies a pending
-   `sitl_local_set_eeprom_path()`), re-apply every boot-derived setting -
-   `activateConfig()` covers PID/rate/battery profiles, RC processing,
-   failsafe, acc filters, `imuConfigure()`, active box ids; the LOCAL link
-   overrides re-pin the UDP receiver, the ADC battery meters and the virtual
-   PWM motor backend; then mixer/motor/servo, gyro filters and debug mode - and
-   finally re-init the `initPhase3` modules (`blackboxInit()`,
+   current RAM config, apply a pending `sitl_local_set_eeprom_path()` and
+   re-apply every boot-derived setting - the LOCAL link overrides re-pin the UDP
+   receiver, the ADC battery meters and the virtual PWM motor backend; then
+   mixer/motor/servo, gyro filters (rebuilt only when their settings changed) and
+   debug mode - and finally re-init the `initPhase3` modules (`blackboxInit()`,
    `gyroStartCalibration()`) plus the rest of `initPhase3` that the reload
    path cannot cover (`gyroSetTargetLooptime()` + `initDshotTelemetry()`,
    `initBoardAlignment()`, `imuInit()`, `failsafeInit()`, `mixerInitProfile()`
    with its dynamic-idle / VBAT-sag / RPM-limiter / ez-landing runtime,
    `positionInit()`, `autopilotInit()`), exactly like a boot.
+
+   The EEPROM itself is **not** re-read on this path (the file was written from
+   RAM a few lines earlier): re-reading it cannot change a value, but
+   `readEEPROM()` ends in `activateConfig()`, which re-initialises the
+   stick-transient chain (feedforward / setpoint smoothing, PID and RC state)
+   under a live flight loop. That alone made the aircraft respond differently to
+   the same sticks after a "Save and Reboot" - see
+   "What a configurator Save does to a running LOCAL build (measured)" below. An
+   explicit `sitl_local_reload_config()` still reads the file by design.
 3. The configurator connection survives the reboot (the MSP thread is moved
    back to its idle parser state instead of being left in `mspRebootFn()`'s
    `while (true);`). Expect a short RX re-acquisition right after the reboot,
@@ -618,23 +625,24 @@ sitl_local_save_compare control       no MSP traffic at all (baseline)
 sitl_local_save_compare sensitivity   no save; doubles the gyro noise instead
 ```
 
-Measured on this build (motor PWM, 1000..2000 us):
+Measured before the fix below (motor PWM, 1000..2000 us):
 
 | mode | before vs after | after vs after (repeat) |
 | --- | --- | --- |
 | `control` | identical (max 0.0009 us) | identical |
 | `api-only` | identical (max 0.0009 us) | identical |
-| `save-only` | **changes by up to 153 us** | identical |
-| `save-reboot` | **changes by up to 153 us** | identical |
+| `save-only` | **changed by up to 153 us** | identical |
+| `save-reboot` | **changed by up to 153 us** | identical |
 | `sensitivity` (2x gyro noise) | changes by 10.6 us | identical |
 
-A plain Save does **not** change the steady state - the two traces are
-bit-identical while the stick is still - but the response to a stick input is
-different afterwards: the difference starts exactly at the stick step, peaks at
-~153 us (~15% of the output range) and decays as the transient settles.
-Repeating the after-trace reproduces the new response exactly, so a save leaves
-the loop on a *different but stable* operating point rather than on a transient
-that simply needs longer settling.
+A Save did **not** change the steady state - the traces were bit-identical while
+the stick was still - but the response to a stick input was different afterwards:
+the difference started exactly at the stick step, peaked at ~153 us (~15% of the
+output range) and decayed as the transient settled. Repeating the after-trace
+reproduced the new response exactly, so a save left the loop on a *different but
+stable* operating point rather than on a transient that just needed longer
+settling: after any Save the aircraft responded differently to the sticks until
+the process was restarted.
 
 Where it comes from: a configurator Save is `MSP_EEPROM_WRITE`, and the firmware
 handler does
@@ -654,6 +662,26 @@ stream and a live PID loop, which is why a Save can change how the aircraft
 reacts to stick input. Steady-state behaviour, PID/rate/filter settings and every
 value in the `state` fingerprint of `sitl-audit.log` stay identical - the change
 lives in the stick-transient state that fingerprint does not cover.
+
+Fixed in the LOCAL build:
+
+- `MSP_EEPROM_WRITE` no longer re-reads the EEPROM (`readEEPROM` is renamed to
+  `sitlMspReadEEPROM` for msp.c): the config is persisted and the FC keeps flying
+  with the config it already has. PID/rate writes still apply live through their
+  own MSP handlers (`pidInitConfig`), and boot-time settings (filters, mixer,
+  features, ...) apply on "Save and Reboot" or through `sitl_local_reload_config()`
+  - the same split real hardware has.
+- The in-process firmware reboot no longer re-reads the EEPROM either: it was
+  written from RAM a few lines earlier in the same operation, so re-reading cannot
+  change a value, while everything the config derives is re-applied explicitly
+  (mixer/motor/servo, gyro filters when their settings changed, `debugMode`, the
+  `initPhase3` profile state) by `localRunPendingReloadInternal(false)`.
+
+Both paths now measure identical (max 0.0009 us - the harness's own noise floor)
+while `sensitivity` still reports a real loop change at 10.6 us, so the check did
+not just go blind. An explicit config reload (`sitl_local_reload_config()`, and
+the per-aircraft EEPROM path switch) still reads the selected file by design: a
+different aircraft *should* start from that file's state.
 
 Harness notes: it needs an ARM switch in the EEPROM (it probes every AUX channel
 and both switch positions until the firmware really arms, then turns the runaway

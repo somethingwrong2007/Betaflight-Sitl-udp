@@ -426,7 +426,22 @@ int sitl_local_reload_config(void)
 // path switch and/or re-reads the selected file into the flash mirror and then
 // into the PG config, followed by everything the boot path derives from it
 // (LOCAL link overrides, mixer/motor/servo setup, filters, ...).
-static void localRunPendingReload(void)
+//
+// `rereadEeprom` is false for the firmware-reboot path only: there the EEPROM
+// was just written from RAM a few lines above, so re-reading it cannot change a
+// single value - but readEEPROM() ends in activateConfig(), which re-initialises
+// the stick-transient chain (initRcProcessing() -> feedforward / setpoint
+// smoothing, pidInit(), rcControlsInit(), ...) while the flight loop keeps
+// running. Measured with tools/sitl_local_save_compare: that alone made the same
+// roll-stick input produce up to 153 us (~15% of the output range) of different
+// motor output after a "Save and Reboot", on a bit-identical steady state, and
+// the difference was stable rather than settling out. Everything the config
+// derives is re-applied explicitly below anyway (link overrides, mixer/motor/
+// servo, filters when changed, debug mode, initPhase3 profile state), so the
+// reboot keeps the runtime in the operating point it was already flying in - the
+// aircraft behaves the same before and after, which is what the simulator wants
+// from a reboot that never actually restarts the MCU.
+static void localRunPendingReloadInternal(bool rereadEeprom)
 {
     InterlockedExchange(&gLocalReloadPending, 0);
 
@@ -436,7 +451,9 @@ static void localRunPendingReload(void)
     localFlushEepromWrite();
 
     bool freshFile = false;
+    bool pathSwitch = false;
     if (InterlockedExchange(&gLocalPathPending, 0) != 0) {
+        pathSwitch = true;
         // A path that does not exist yet is a brand-new aircraft. sitl.c's
         // loadEEPROMFromFile() creates it from the flash mirror, i.e. it would
         // inherit the aircraft we just left. Clear the mirror (erased flash)
@@ -469,7 +486,11 @@ static void localRunPendingReload(void)
         // defaults and writes them (here into the newly created file).
         ensureEEPROMStructureIsValid();
     }
-    readEEPROM();
+    if (rereadEeprom || pathSwitch) {
+        readEEPROM();
+    } else {
+        sitlAuditLog("reboot: EEPROM re-read skipped (runtime state preserved)");
+    }
     const bool gyroFiltersChanged = sitlLocalGyroFilterConfigChanged();
     const bool forceFullInit = InterlockedExchange(&gLocalForceFullInit, 0) != 0;
     if (forceFullInit) {
@@ -492,6 +513,13 @@ static void localRunPendingReload(void)
     sitlLocalRunBootProfileInit();
 }
 
+// Explicit reload (sitl_local_reload_config(), EEPROM path switch): the file is
+// the source of truth, so read it.
+static void localRunPendingReload(void)
+{
+    localRunPendingReloadInternal(true);
+}
+
 // Deferred half of a firmware reboot; the immediate half (disarm, CLI and
 // arming state, log close) is sitlLocalRequestReboot() in wincompat.c. Queued
 // here for the same reason as the config reload: the EEPROM re-read and every
@@ -508,10 +536,13 @@ static void localRunPendingReboot(void)
 {
     InterlockedExchange(&gLocalRebootPending, 0);
 
-    // Persist + re-read the EEPROM, re-apply the LOCAL link overrides (UDP RX,
-    // ADC battery meters, PWM motor backend) and the derived mixer/motor/
-    // servo/filter/debug state. Also applies a pending EEPROM path switch.
-    localRunPendingReload();
+    // Persist, re-apply the LOCAL link overrides (UDP RX, ADC battery meters,
+    // PWM motor backend) and the derived mixer/motor/servo/filter/debug state,
+    // and apply a pending EEPROM path switch. The EEPROM itself is not re-read:
+    // it was just written from RAM, so nothing can change, while readEEPROM()'s
+    // activateConfig() would re-initialise the stick-transient chain under a
+    // live flight loop (see localRunPendingReloadInternal).
+    localRunPendingReloadInternal(false);
 
 #ifdef USE_BLACKBOX
     // initPhase3 re-inits the blackbox (the log was closed by the reboot), so

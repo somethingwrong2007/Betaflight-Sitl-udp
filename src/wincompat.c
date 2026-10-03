@@ -463,6 +463,36 @@ void sitlMspWriteEEPROM(void)
 }
 
 #ifdef SITL_LOCAL
+// msp.c's MSP_EEPROM_WRITE handler is writeReadEeprom():
+//
+//     writeEEPROM();
+//     readEEPROM();
+//
+// The re-read is there so the RAM copy matches what was actually stored and so
+// the validation/activation path runs again. In this build the virtual EEPROM is
+// a byte copy of the RAM image that was just written, so no config value can
+// change; what the re-read *does* change is runtime state: readEEPROM() ends in
+// activateConfig(), which re-initialises the stick-transient chain
+// (initRcProcessing() -> feedforward / setpoint smoothing, pidInit(),
+// rcControlsInit(), failsafeReset(), accInitFilters(), ...) while the flight loop
+// keeps running. Measured with tools/sitl_local_save_compare: after a plain Save
+// the same roll-stick input produced up to 153 us - about 15% of the 1000..2000
+// output range - of different motor output, on a bit-identical steady state, and
+// the difference was stable (the craft keeps responding differently until the
+// process is restarted). A real FC only re-runs that at boot, with the motors off
+// and the gyro stream restarting.
+//
+// So the Save path persists and keeps flying with the config it already has.
+// PID/rate writes apply live through their own MSP handlers (pidInitConfig), and
+// boot-time settings (filters, mixer, features, ...) apply on "Save and Reboot"
+// or through sitl_local_reload_config(), exactly like real hardware.
+void sitlMspReadEEPROM(void)
+{
+    sitlAuditLog("save: EEPROM re-read skipped (runtime state preserved)");
+}
+#endif
+
+#ifdef SITL_LOCAL
 // Simulated motor RPM bridge. dshot.c's getDshotRpm/getDshotRpmAverage/
 // getDshotErpm/getMotorFrequencyHz/getMinMotorFrequencyHz are renamed to the
 // sitl*Real symbols below; these wrappers return the simulator-provided RPM
