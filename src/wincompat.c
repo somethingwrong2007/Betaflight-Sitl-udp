@@ -276,6 +276,8 @@ void sitlLocalLogStateIfChanged(const char *tag)
     uint32_t stepMaxUs = 0, stepAvgUs = 0, stepCount = 0, zeroArmed = 0;
     uint32_t capPkts = 0, takePkts = 0, missPkts = 0;
     uint32_t mspBusyUs = 0, mspCalls = 0;
+    extern uint32_t sitlLocalRcFrameCount(void);
+    const uint32_t rcFrames = sitlLocalRcFrameCount();
     float motors[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     sitlLocalStepStats(&stepMaxUs, &stepAvgUs, &stepCount, motors, &zeroArmed);
     sitlLocalMotorStreamStats(&capPkts, &takePkts, &missPkts);
@@ -286,6 +288,7 @@ void sitlLocalLogStateIfChanged(const char *tag)
                  "stepUs(max/avg/count)=%u/%u/%u motorPkts(cap/take/miss)=%u/%u/%u "
                  "motors=%.0f/%.0f/%.0f/%.0f zeroWhileArmed=%u "
                  "mspThread(busyUs/calls)=%u/%u "
+                 "rcFrames=%u "
                  "featRt(air/ag/udp/gps/3d/esc)=%u/%u/%u/%u/%u/%u "
                  "lpf=%u/%u-%u/%u notch=%u/%u/%u/%u pidProf=%u ratesType=%u armed=%u armFlags=%08X "
                  "pidR=%u/%u/%u/%u pidP=%u/%u/%u/%u pidY=%u/%u/%u/%u "
@@ -302,6 +305,7 @@ void sitlLocalLogStateIfChanged(const char *tag)
                  (double)motors[0], (double)motors[1], (double)motors[2], (double)motors[3],
                  (unsigned)zeroArmed,
                  (unsigned)mspBusyUs, (unsigned)mspCalls,
+                 (unsigned)rcFrames,
                  (unsigned)now.rtAirMode, (unsigned)now.rtAntiGravity, (unsigned)now.rtRxUdp,
                  (unsigned)now.rtGps, (unsigned)now.rt3d, (unsigned)now.rtEscSensor,
                  (unsigned)now.lpf1, (unsigned)now.lpf1DynMin, (unsigned)now.lpf1DynMax,

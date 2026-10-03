@@ -480,6 +480,108 @@ static void warmUpAndTrace(float trace[SCENARIO_STEPS][4], uint8_t *motorCount,
 // --- MSP over the DLL's own TCP server (what the configurator talks to) ------
 
 static int gSock = -1;
+// Path of the harness's own EEPROM copy (empty = work on the real file).
+static char gHarnessEepromCopy[MAX_PATH] = "";
+
+// --- repairing a persisted test flip -----------------------------------------
+static void mspSend(uint8_t cmd, const uint8_t *payload, uint8_t len);
+static int mspRequest(uint8_t cmd, const uint8_t *payload, uint8_t len,
+                      uint8_t *replyOut, size_t replyCap, int timeoutMs);
+
+// The cfg-change-* modes write a flipped byte and save it, then only restore RAM.
+// If a run is interrupted (or the parity is not what you expect) the file keeps
+// the flipped value. `repair <pidProfHash>` walks the 8 combinations of the
+// bytes those modes ever flip, saving after each and comparing the PID-profile
+// hash the firmware logs, so the config can be put back to a known fingerprint.
+typedef struct {
+    uint8_t getCmd;
+    uint8_t setCmd;
+    const char *name;
+    int byteIndex;
+} flipSpec_t;
+
+static const flipSpec_t gFlipSpecs[] = {
+    { MSP_PID,           MSP_SET_PID,           "pid",    1 },
+    { MSP_RC_TUNING,     MSP_SET_RC_TUNING,     "rc",     1 },
+    { MSP_FILTER_CONFIG, MSP_SET_FILTER_CONFIG, "filter", 28 },
+};
+#define FLIP_COUNT ((int)(sizeof(gFlipSpecs) / sizeof(gFlipSpecs[0])))
+static uint8_t gFlipPayload[FLIP_COUNT][MSP_MAX_PAYLOAD];
+static int gFlipLen[FLIP_COUNT];
+
+static void flipToggle(int idx)
+{
+    const flipSpec_t *spec = &gFlipSpecs[idx];
+    gFlipLen[idx] = mspRequest(spec->getCmd, NULL, 0, gFlipPayload[idx],
+                               sizeof(gFlipPayload[idx]), 2000);
+    if (gFlipLen[idx] <= spec->byteIndex) {
+        fprintf(stderr, "[repair] %s: read failed\n", spec->name);
+        exit(3);
+    }
+    const uint8_t was = gFlipPayload[idx][spec->byteIndex];
+    gFlipPayload[idx][spec->byteIndex] ^= 0x01;
+    (void)mspRequest(spec->setCmd, gFlipPayload[idx], (uint8_t)gFlipLen[idx], NULL, 0, 2000);
+    fprintf(stderr, "[repair] %s byte %d: 0x%02X -> 0x%02X\n",
+            spec->name, spec->byteIndex, was, gFlipPayload[idx][spec->byteIndex]);
+}
+
+// Reads one hash field from the newest "state hash" line the firmware logged.
+static bool readLastStateHash(const char *field, char *out, size_t outSize)
+{
+    const char *appData = getenv("LOCALAPPDATA");
+    if (appData == NULL) {
+        return false;
+    }
+    char path[MAX_PATH];
+    _snprintf(path, sizeof(path), "%s\\Betaflight-SITL\\sitl-audit.log", appData);
+
+    FILE *fp = fopen(path, "rb");
+    if (fp == NULL) {
+        return false;
+    }
+    fseek(fp, 0, SEEK_END);
+    const long size = ftell(fp);
+    long start = size - 65536;
+    if (start < 0) {
+        start = 0;
+    }
+    fseek(fp, start, SEEK_SET);
+    char *buf = (char *)malloc((size_t)(size - start) + 1);
+    if (buf == NULL) {
+        fclose(fp);
+        return false;
+    }
+    const size_t got = fread(buf, 1, (size_t)(size - start), fp);
+    buf[got] = '\0';
+    fclose(fp);
+
+    bool found = false;
+    char *line = buf;
+    while (line != NULL && *line != '\0') {
+        char *eol = strchr(line, '\n');
+        if (eol != NULL) {
+            *eol = '\0';
+        }
+        // Only the fingerprint line carries the hashes; the runtime line also
+        // prints "pidProf=" but with the profile *index*.
+        char needle[32];
+        _snprintf(needle, sizeof(needle), " %s=", field);
+        const char *p = (strstr(line, " hash ") != NULL) ? strstr(line, needle) : NULL;
+        if (p != NULL) {
+            p += strlen(needle);
+            size_t n = 0;
+            while (p[n] != '\0' && p[n] != ' ' && n + 1 < outSize) {
+                out[n] = p[n];
+                n++;
+            }
+            out[n] = '\0';
+            found = true;
+        }
+        line = (eol != NULL) ? eol + 1 : NULL;
+    }
+    free(buf);
+    return found;
+}
 
 static int mspConnect(void)
 {
@@ -854,6 +956,49 @@ int main(int argc, char **argv)
         fprintf(stderr, "[harness] configurator block filter=%d\n", gCfgOnly);
     }
 
+    // Never touch the real EEPROM: the harness saves configurations (and the
+    // cfg-change-* modes save a *flipped* byte before restoring it), so every run
+    // works on a copy of the user's config in %TEMP%. The `repair` mode is the
+    // one exception - it is meant to fix the real file.
+    if (strcmp(mode, "repair") != 0) {
+        const char *appData = getenv("LOCALAPPDATA");
+        const char *tempDir = getenv("TEMP");
+        if (appData != NULL && tempDir != NULL) {
+            char src[MAX_PATH];
+            char dst[MAX_PATH];
+            _snprintf(src, sizeof(src), "%s\\Betaflight-SITL\\eeprom.bin", appData);
+            _snprintf(dst, sizeof(dst), "%s\\sitl-harness-eeprom.bin", tempDir);
+
+            FILE *in = fopen(src, "rb");
+            FILE *out = (in != NULL) ? fopen(dst, "wb") : NULL;
+            if (in != NULL && out != NULL) {
+                char copyBuf[4096];
+                size_t n;
+                while ((n = fread(copyBuf, 1, sizeof(copyBuf), in)) > 0) {
+                    fwrite(copyBuf, 1, n, out);
+                }
+            }
+            if (in != NULL) fclose(in);
+            if (out != NULL) fclose(out);
+            if (out != NULL) {
+                _putenv_s("BF_SITL_EEPROM", dst);
+                strncpy(gHarnessEepromCopy, dst, sizeof(gHarnessEepromCopy) - 1);
+                fprintf(stderr, "[harness] EEPROM copy: %s\n", dst);
+            } else {
+                fprintf(stderr, "[harness] WARNING: could not copy the EEPROM, "
+                                "working on the real file\n");
+            }
+        }
+    }
+
+    // Tell the FC to use the copy *before* boot: sitl_local_init() applies a
+    // pre-boot EEPROM path, so the real configuration file is never even opened.
+    if (gHarnessEepromCopy[0] != '\0' && strcmp(mode, "repair") != 0) {
+        if (sitl_local_set_eeprom_path(gHarnessEepromCopy) != 0) {
+            fprintf(stderr, "[harness] WARNING: could not select the EEPROM copy\n");
+        }
+    }
+
     if (sitl_local_init() != 0) {
         fprintf(stderr, "sitl_local_init() failed\n");
         return 1;
@@ -864,6 +1009,54 @@ int main(int argc, char **argv)
         sitl_local_shutdown();
         return 1;
     }
+
+    // Maintenance: put a configuration back to a known PID-profile fingerprint
+    // after one of the byte-flip test runs persisted a flip (see gFlipSpecs).
+    if (strcmp(mode, "repair") == 0) {
+        // usage: repair <field> <targetHash>   (field: pidProf | rates | gyro | ...)
+        const char *field = (argc > 2) ? argv[2] : "pidProf";
+        const char *target = (argc > 3) ? argv[3] : "";
+        char now[32] = "";
+        (void)readLastStateHash(field, now, sizeof(now));
+        fprintf(stderr, "[repair] field %s: target=%s current=%s\n", field, target, now);
+        if (target[0] != '\0' && strcmp(now, target) == 0) {
+            fprintf(stderr, "[repair] already matches, nothing to do\n");
+            sitl_local_shutdown();
+            return 0;
+        }
+        for (int combo = 0; combo < (1 << FLIP_COUNT); combo++) {
+            for (int i = 0; i < FLIP_COUNT; i++) {
+                if (combo & (1 << i)) {
+                    flipToggle(i);
+                }
+            }
+            saveConfig("save-only");
+            char after[32] = "";
+            if (!readLastStateHash(field, after, sizeof(after))) {
+                fprintf(stderr, "[repair] could not read the audit log\n");
+                sitl_local_shutdown();
+                return 3;
+            }
+            fprintf(stderr, "[repair] combo %d -> %s=%s\n", combo, field, after);
+            if (target[0] != '\0' && strcmp(after, target) == 0) {
+                fprintf(stderr, "[repair] SUCCESS with combo %d (bit i = flip gFlipSpecs[i])\n",
+                        combo);
+                sitl_local_shutdown();
+                return 0;
+            }
+            // Undo this attempt before trying the next combination.
+            for (int i = 0; i < FLIP_COUNT; i++) {
+                if (combo & (1 << i)) {
+                    flipToggle(i);
+                }
+            }
+            saveConfig("save-only");
+        }
+        fprintf(stderr, "[repair] no combination matched the target\n");
+        sitl_local_shutdown();
+        return 3;
+    }
+
     if (!findArmSwitch()) {
         fprintf(stderr, "[arm] FAILED: the firmware did not arm on any AUX channel.\n");
         printArmingFlags(sitl_local_get_arming_flags());

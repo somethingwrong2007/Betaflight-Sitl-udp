@@ -187,14 +187,18 @@ static bool gGpsOriginSet = false;
 // lastRcFrameTimeUs is stamped at frame ticks only.
 static uint16_t gLocalRc[SITL_LOCAL_MAX_RC_CHANNELS];
 static bool gLocalRcValid = false;
-// RC frames are presented as a fixed 125 Hz stream: one COMPLETE every 8 steps
-// (8 ms at the 1 kHz host rate), PENDING in between. The cadence is counted in
-// *steps since init* rather than in absolute virtual time so that a host that
-// stops and restarts the FC in one process gets exactly the same frame grid as a
-// fresh process (the virtual clock keeps running across an in-process restart).
-#define SITL_LOCAL_RC_FRAME_STEPS 8
-static uint32_t gLocalRcStepCounter = 0;
-static uint32_t gLocalRcAnnounceStep = 0xFFFFFFFFu;
+// The announce is *self-clocked*: it fires as soon as 8 ms of virtual time have
+// passed since the last frame, whatever step the firmware's frame check happens
+// to run on. A step-indexed grid (announce only when step % 8 == 0) silently
+// skips frames whenever the check does not land on a multiple of 8 - the
+// measured RC rate then drops and rc_smoothing's automatic setpoint cutoff is
+// computed from the wrong rate. The anchor is the init moment, so an in-process
+// restart (where the virtual clock keeps running) still yields the same frame
+// grid as a fresh boot.
+static uint64_t gLocalRcAnnounceUs = 0;
+// Frames announced so far - logged in the audit trail (~125 per second of
+// virtual time at the 1 kHz host rate).
+static uint32_t gLocalRcFrameCount = 0;
 // Last motor values handed to the host (step diagnostics / audit log).
 static float gLocalLastMotors[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 // Mirror of cliMode seen by the MSP thread (a real FC drops the CLI arming
@@ -205,14 +209,19 @@ static bool gCliWasActive = false;
 static uint8_t localRcFrameStatus(rxRuntimeState_t *state)
 {
     (void)state;
-    if (gLocalRcValid
-        && (gLocalRcStepCounter % SITL_LOCAL_RC_FRAME_STEPS) == 0
-        && gLocalRcAnnounceStep != gLocalRcStepCounter) {
-        gLocalRcAnnounceStep = gLocalRcStepCounter;
-        rxRuntimeState.lastRcFrameTimeUs = (timeUs_t)(micros64() & 0xFFFFFFFF);
+    const uint64_t now = micros64();
+    if (gLocalRcValid && (now - gLocalRcAnnounceUs) >= 8000) {
+        gLocalRcAnnounceUs = now;
+        gLocalRcFrameCount++;
+        rxRuntimeState.lastRcFrameTimeUs = (timeUs_t)(now & 0xFFFFFFFF);
         return RX_FRAME_COMPLETE;
     }
     return RX_FRAME_PENDING;
+}
+
+uint32_t sitlLocalRcFrameCount(void)
+{
+    return gLocalRcFrameCount;
 }
 
 static float localRcReadRaw(const rxRuntimeState_t *state, uint8_t channel)
@@ -672,14 +681,27 @@ int sitl_local_init(void)
         return 0;
     }
 
+    // A host may choose the virtual EEPROM before boot (one config per aircraft).
+    // Apply it first, so the boot below opens that file directly instead of the
+    // default one - and so a tool that wants to work on a copy never writes the
+    // real config at all.
+    if (InterlockedExchange(&gLocalPathPending, 0) != 0 && gLocalPendingEepromPath[0] != '\0') {
+        _putenv_s("BF_SITL_EEPROM", gLocalPendingEepromPath);
+        extern void ensureEepromDirectory(void);
+        ensureEepromDirectory();
+        fprintf(stderr, "[SITL] LOCAL mode EEPROM (pre-boot): %s\n", gLocalPendingEepromPath);
+        sitlAuditLog("sitl_local_init: pre-boot eeprom=%s", gLocalPendingEepromPath);
+    }
+
     // A host can stop and start the FC inside one process (level reload, PIE
     // restart). A fresh process starts with these zeroed by the loader, so reset
     // them here as well - otherwise the second boot inherits the previous run's
     // RC frame cadence, CLI flag and pending work, and no longer behaves like a
     // clean start (measured: 315 us difference in the stick response).
     gLocalRcValid = false;
-    gLocalRcStepCounter = 0;
-    gLocalRcAnnounceStep = 0xFFFFFFFFu;
+    // Anchor the frame grid at the init moment (0 for a fresh process).
+    gLocalRcAnnounceUs = micros64();
+    gLocalRcFrameCount = 0;
     memset(gLocalRc, 0, sizeof(gLocalRc));
     gGpsOriginSet = false;
     gCliWasActive = false;
@@ -731,16 +753,21 @@ int sitl_local_init(void)
     // PG record and therefore has to re-apply the same overrides.
     localApplyLinkOverrides();
 
-    // Rebuild the stateful filter/PID/RC chains explicitly. Most of their state
-    // lives in firmware module statics that the loader zeroes once per process:
-    // a fresh process starts from zero, an in-process restart (level reload, PIE
-    // restart) would otherwise inherit whatever the previous run left behind and
-    // end up in a different operating point (measured: 315 us difference in the
-    // stick response). Re-deriving them here makes both paths start from the same
-    // state.
-    gyroInitFilters();
-    pidInitFilters(currentPidProfile);
-    initRcProcessing();
+    // A *second* boot inside the same process (level reload, PIE restart) has to
+    // re-derive the stateful filter/PID/RC chains: their state lives in firmware
+    // module statics that the loader only zeroes once per process, so otherwise
+    // the restart inherits the previous run's state (measured: 315 us difference
+    // in the stick response). The first boot must NOT do this - the boot sequence
+    // has just built those chains, and rebuilding them on top can disturb the
+    // very setpoint/feedforward state a normal boot relies on.
+    static bool gLocalBootedBefore = false;
+    if (gLocalBootedBefore) {
+        sitlAuditLog("sitl_local_init: re-init, re-deriving gyro/dterm/RC chains");
+        gyroInitFilters();
+        pidInitFilters(currentPidProfile);
+        initRcProcessing();
+    }
+    gLocalBootedBefore = true;
 
     // Record the settings the boot path built its stateful chains from (gyro
     // filters, D-term filters, rate/RC processing). The configurator's SET
@@ -1061,10 +1088,6 @@ void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
     }
     extern uint64_t micros64_real(void);
     const uint64_t stepStartUs = micros64_real();
-
-    // RC frame grid: one COMPLETE frame every SITL_LOCAL_RC_FRAME_STEPS steps,
-    // counted from init so an in-process restart reproduces a fresh boot.
-    gLocalRcStepCounter++;
 
     // A configurator Save may have undone the pinned LOCAL runtime state; this
     // only rewrites flags/mode sources, so it also runs while armed.
