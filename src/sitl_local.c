@@ -187,14 +187,29 @@ static bool gGpsOriginSet = false;
 // lastRcFrameTimeUs is stamped at frame ticks only.
 static uint16_t gLocalRc[SITL_LOCAL_MAX_RC_CHANNELS];
 static bool gLocalRcValid = false;
-static uint64_t gLocalRcAnnounceUs = 0;
+// RC frames are presented as a fixed 125 Hz stream: one COMPLETE every 8 steps
+// (8 ms at the 1 kHz host rate), PENDING in between. The cadence is counted in
+// *steps since init* rather than in absolute virtual time so that a host that
+// stops and restarts the FC in one process gets exactly the same frame grid as a
+// fresh process (the virtual clock keeps running across an in-process restart).
+#define SITL_LOCAL_RC_FRAME_STEPS 8
+static uint32_t gLocalRcStepCounter = 0;
+static uint32_t gLocalRcAnnounceStep = 0xFFFFFFFFu;
+// Last motor values handed to the host (step diagnostics / audit log).
+static float gLocalLastMotors[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+// Mirror of cliMode seen by the MSP thread (a real FC drops the CLI arming
+// block on reboot; LOCAL clears it when the CLI is left). File scope so a
+// in-process restart starts with a clean value.
+static bool gCliWasActive = false;
 
 static uint8_t localRcFrameStatus(rxRuntimeState_t *state)
 {
     (void)state;
-    if (gLocalRcValid && (micros64() - gLocalRcAnnounceUs) >= 8000) {
-        gLocalRcAnnounceUs = micros64();
-        rxRuntimeState.lastRcFrameTimeUs = (timeUs_t)(gLocalRcAnnounceUs & 0xFFFFFFFF);
+    if (gLocalRcValid
+        && (gLocalRcStepCounter % SITL_LOCAL_RC_FRAME_STEPS) == 0
+        && gLocalRcAnnounceStep != gLocalRcStepCounter) {
+        gLocalRcAnnounceStep = gLocalRcStepCounter;
+        rxRuntimeState.lastRcFrameTimeUs = (timeUs_t)(micros64() & 0xFFFFFFFF);
         return RX_FRAME_COMPLETE;
     }
     return RX_FRAME_PENDING;
@@ -617,7 +632,6 @@ static DWORD WINAPI localMspThreadProc(LPVOID arg)
 {
     (void)arg;
     gMspThreadId = GetCurrentThreadId();
-    static bool cliWasActive = false;
     while (!gMspThreadStop) {
         if (setjmp(gMspLoopJmp) != 0) {
             sitlAuditLog("MSP thread recovered from reboot jump");
@@ -627,11 +641,11 @@ static DWORD WINAPI localMspThreadProc(LPVOID arg)
         // clears it (real FCs reboot to reset it). Watch cliMode transitions
         // so "exit noreboot" (e.g. configurator closes the panel / disconnect
         // injection) also unblocks arming.
-        if (cliWasActive && !cliMode) {
+        if (gCliWasActive && !cliMode) {
             sitlAuditLog("cliMode cleared by watcher");
             unsetArmingDisabled(ARMING_DISABLED_CLI);
         }
-        cliWasActive = cliMode;
+        gCliWasActive = cliMode;
 
         mspSerialProcess(LOCAL_MSP_EVALUATE_NON_MSP_DATA,
                          mspFcProcessCommand, mspFcProcessReply);
@@ -658,6 +672,27 @@ int sitl_local_init(void)
         return 0;
     }
 
+    // A host can stop and start the FC inside one process (level reload, PIE
+    // restart). A fresh process starts with these zeroed by the loader, so reset
+    // them here as well - otherwise the second boot inherits the previous run's
+    // RC frame cadence, CLI flag and pending work, and no longer behaves like a
+    // clean start (measured: 315 us difference in the stick response).
+    gLocalRcValid = false;
+    gLocalRcStepCounter = 0;
+    gLocalRcAnnounceStep = 0xFFFFFFFFu;
+    memset(gLocalRc, 0, sizeof(gLocalRc));
+    gGpsOriginSet = false;
+    gCliWasActive = false;
+    gLocalPendingReset = 0;
+    gLocalPendingEepromWrite = 0;
+    gLocalReloadPending = 0;
+    gLocalRebootPending = 0;
+    gLocalPathPending = 0;
+    gLocalForceFullInit = 0;
+    gLocalRepinPending = 0;
+    gLocalPendingEepromPath[0] = '\0';
+    memset(gLocalLastMotors, 0, sizeof(gLocalLastMotors));
+
     // Use a stable, writable EEPROM location regardless of the host process's
     // working directory (UE can be launched from anywhere). Respect an
     // explicit BF_SITL_EEPROM override if the host already set one.
@@ -683,6 +718,17 @@ int sitl_local_init(void)
     // telemetry). Shared with the runtime config reload, which replaces every
     // PG record and therefore has to re-apply the same overrides.
     localApplyLinkOverrides();
+
+    // Rebuild the stateful filter/PID/RC chains explicitly. Most of their state
+    // lives in firmware module statics that the loader zeroes once per process:
+    // a fresh process starts from zero, an in-process restart (level reload, PIE
+    // restart) would otherwise inherit whatever the previous run left behind and
+    // end up in a different operating point (measured: 315 us difference in the
+    // stick response). Re-deriving them here makes both paths start from the same
+    // state.
+    gyroInitFilters();
+    pidInitFilters(currentPidProfile);
+    initRcProcessing();
 
     // Record the settings the boot path built its stateful chains from (gyro
     // filters, D-term filters, rate/RC processing). The configurator's SET
@@ -960,7 +1006,6 @@ static uint32_t gLocalStepUsMax = 0;
 static uint32_t gLocalStepUsAvg = 0;
 static uint32_t gLocalStepCount = 0;
 static uint32_t gLocalStepUsSum = 0;
-static float gLocalLastMotors[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 static uint32_t gLocalZeroMotorStepsWhileArmed = 0;
 
 static void localRecordStepStats(uint64_t stepStartUs, const sitl_local_output_t *out)
@@ -1004,6 +1049,10 @@ void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
     }
     extern uint64_t micros64_real(void);
     const uint64_t stepStartUs = micros64_real();
+
+    // RC frame grid: one COMPLETE frame every SITL_LOCAL_RC_FRAME_STEPS steps,
+    // counted from init so an in-process restart reproduces a fresh boot.
+    gLocalRcStepCounter++;
 
     // A configurator Save may have undone the pinned LOCAL runtime state; this
     // only rewrites flags/mode sources, so it also runs while armed.
@@ -1220,6 +1269,20 @@ void sitl_local_shutdown(void)
         gMspThread = NULL;
     }
     gLocalRunning = false;
+
+    // Close the virtual EEPROM. sitl.c keeps its own eepromFd and only clears it
+    // in configLock(); if it is left open, the next FLASH_Unlock() refuses to
+    // start ("[FLASH_Unlock] eepromFd != NULL") and boot hangs - i.e. a host that
+    // restarts the FC in process (level reload, PIE restart) would never come
+    // back. localFlushEepromWrite() writes the flash mirror and closes it.
+    localFlushEepromWrite();
+
+    // Stop the configurator listeners as well, otherwise the next init cannot
+    // bind 5761/6761 again.
+    extern void serialTcpStop(void);
+    extern void wsProxyStop(void);
+    serialTcpStop();
+    wsProxyStop();
 }
 
 #endif // SITL_LOCAL

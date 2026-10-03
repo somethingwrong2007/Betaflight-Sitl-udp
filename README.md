@@ -716,6 +716,41 @@ original bytes are written back. An explicit config reload
 reads the selected file by design: a different aircraft *should* start from that
 file's state.
 
+#### Scenario / operation matrix
+
+`tools/run-save-matrix.ps1` runs the whole grid and prints a PASS/FAIL summary
+(exit code 0 = everything behaved as expected):
+
+```
+pwsh -File tools\run-save-matrix.ps1
+```
+
+It covers six stick scenarios (`roll-step`, `pitch-step`, `yaw-step`, `snap`,
+`throttle`, `combined`) against `save-only`, `save-reboot`, `cfg-save`,
+`cfg-save-reboot`, plus the edit flows (`cfg-change-filter`, `cfg-change-rate`,
+`cfg-change-pid`, `cfg-change`), a double save (`twice`) and an in-process FC
+restart (`reinit`). A no-op save must leave the traces identical; a real edit
+must change them and reverting must return to the baseline. Current state: 36/36
+pass.
+
+Two further problems were found and fixed while building that matrix:
+
+- **An in-process FC restart did not reproduce a fresh boot.** `reinit`
+  (`sitl_local_shutdown()` + `sitl_local_init()`) used to hang -
+  `FLASH_Unlock` refuses to start while sitl.c's `eepromFd` is still open, so the
+  next boot never came back. Shutdown now flushes and closes the virtual EEPROM
+  (`localFlushEepromWrite()` -> `configLock()`) and stops the TCP/WebSocket
+  listeners (`serialTcpStop()` / `wsProxyStop()`), so a later init can bind
+  5761/6761 again.
+- **The restarted FC landed in a different operating point** (315 us difference
+  in the stick response, i.e. restarting the DLL in process was *not* the same as
+  restarting the process - only a new process gave a clean state). The stateful
+  gyro/D-term/RC chains keep their state in firmware module statics that the
+  loader only zeroes once per process, so `sitl_local_init()` now re-derives them
+  explicitly (`gyroInitFilters()`, `pidInitFilters()`, `initRcProcessing()`) and
+  resets the link state a fresh process would start with. `reinit` now measures
+  identical (0.0007 us).
+
 Harness notes: it needs an ARM switch in the EEPROM (it probes every AUX channel
 and both switch positions until the firmware really arms, then turns the runaway
 takeoff protection off the way a real takeoff does), it runs the FC at 1 kHz

@@ -29,6 +29,8 @@ extern void sitlAuditLog(const char *fmt, ...);
 static SOCKET wsListenSocket = INVALID_SOCKET;
 static pthread_t wsListenThreadHandle;
 static bool wsStarted = false;
+// Set by wsProxyStop() so the accept loop leaves and a later init can bind 6761.
+static volatile bool wsStopping = false;
 
 static void sendAll(SOCKET sock, const uint8_t *data, size_t len)
 {
@@ -365,8 +367,14 @@ static void *wsListenThread(void *arg)
 {
     (void)arg;
     for (;;) {
+        if (wsStopping) {
+            break;
+        }
         SOCKET client = accept(wsListenSocket, NULL, NULL);
         if (client == INVALID_SOCKET) {
+            if (wsStopping) {
+                break;
+            }
             continue;
         }
         socketNoInherit(client);
@@ -379,6 +387,7 @@ static void *wsListenThread(void *arg)
 
 void wsProxyStart(void)
 {
+    wsStopping = false;
     if (wsStarted) {
         return;
     }
@@ -418,4 +427,16 @@ void wsProxyStart(void)
 
     wsStarted = true;
     fprintf(stderr, "WebSocket proxy listening on ws://127.0.0.1:%d\n", WS_PORT);
+}
+
+// Stop the listener so a later sitl_local_init() can bind 6761 again.
+void wsProxyStop(void)
+{
+    wsStopping = true;
+    if (wsListenSocket != INVALID_SOCKET) {
+        closesocket(wsListenSocket);
+        wsListenSocket = INVALID_SOCKET;
+    }
+    wsStarted = false;
+    Sleep(100);
 }

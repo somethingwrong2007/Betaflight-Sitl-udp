@@ -59,14 +59,8 @@
 #define WARMUP_PERIODS      3
 #define ARM_CHANNEL_FIRST   4        // rc_channels[]: 0..3 = AETR, 4.. = AUX1..
 
-#define ROLL_STEP_AT        800      // roll doublet: centre -> high -> low -> centre
-#define ROLL_REVERSE_AT     950
-#define ROLL_BACK_AT        1100
-#define ROLL_STICK_HIGH     1800
-#define ROLL_STICK_LOW      1200
-#define TRACE_THROTTLE      1500     // the requested scenario: 1500 throttle
+#define TRACE_THROTTLE      1500     // 1500 throttle in every scenario
 #define ARM_THROTTLE        1000     // firmware only arms at low throttle
-#define ROLL_RATE_TARGET    3.5      // rad/s the stick step asks for (~200 dps)
 
 // --- arming -----------------------------------------------------------------
 
@@ -88,6 +82,9 @@ static double gNoiseScale = 1.0;
 // the same phase of that cadence - otherwise feedforward/smoothing see a
 // shifted frame grid and the difference is a measurement artefact.
 static uint64_t gStepCount = 0;
+// Step counter value at the last sitl_local_init(): the firmware's RC frame grid
+// is anchored to the init, so traces are padded relative to this.
+static uint64_t gStepBase = 0;
 
 static bool rawStep(const sitl_local_input_t *in, sitl_local_output_t *out)
 {
@@ -98,7 +95,7 @@ static bool rawStep(const sitl_local_input_t *in, sitl_local_output_t *out)
 
 static void padToFrameGrid(void)
 {
-    while ((gStepCount % 8) != 0) {
+    while (((gStepCount - gStepBase) % 8) != 0) {
         sitl_local_input_t in;
         makeInput(0, TRACE_THROTTLE, true, &in);
         sitl_local_output_t out;
@@ -106,31 +103,76 @@ static void padToFrameGrid(void)
     }
 }
 
-// The commanded flow follows the stick (a symmetric doublet, so the simulated
-// craft ends up level again): the control loop then tracks its setpoint instead
-// of being pinned against the motor limits, which would hide any change behind
-// the saturation. Keeping the net rotation at zero also keeps the attitude
-// estimate upright, so ANGLE mode cannot block re-arming after the save.
-static uint16_t rollStick(int phase)
+// --- scenarios ---------------------------------------------------------------
+// Each scenario drives a stick doublet per axis (centre -> high -> low ->
+// centre, so the simulated craft ends up level again). The gyro feed follows the
+// commanded rate, i.e. the loop tracks its setpoint instead of being pinned
+// against the motor limits - saturation would hide a change behind the clamp.
+typedef struct {
+    int start;              // phase the doublet starts (< 0 = axis unused)
+    int reverse;            // switch to the low stick
+    int back;               // back to centre
+    uint16_t high;
+    uint16_t low;
+} stickStep_t;
+
+typedef struct {
+    const char *name;
+    stickStep_t roll;
+    stickStep_t pitch;
+    stickStep_t yaw;
+    stickStep_t throttle;
+    double rateScale;       // scales the per-axis rate gains for this scenario
+} scenario_t;
+
+static const scenario_t gScenarios[] = {
+    { "roll-step",  {800,  950, 1100, 1800, 1200}, {-1, 0, 0, 0, 0},
+                    {-1, 0, 0, 0, 0},              {-1, 0, 0, 0, 0}, 1.0 },
+    { "pitch-step", {-1, 0, 0, 0, 0},              {800,  950, 1100, 1800, 1200},
+                    {-1, 0, 0, 0, 0},              {-1, 0, 0, 0, 0}, 1.0 },
+    { "yaw-step",   {-1, 0, 0, 0, 0},              {-1, 0, 0, 0, 0},
+                    {800,  950, 1100, 1700, 1300}, {-1, 0, 0, 0, 0}, 1.0 },
+    { "snap",       {800,  850,  900, 1900, 1100}, {-1, 0, 0, 0, 0},
+                    {-1, 0, 0, 0, 0},              {-1, 0, 0, 0, 0}, 1.0 },
+    { "throttle",   {-1, 0, 0, 0, 0},              {-1, 0, 0, 0, 0},
+                    {-1, 0, 0, 0, 0},              {800,  950, 1100, 1650, 1400}, 1.0 },
+    { "combined",   {800,  950, 1100, 1750, 1250}, {850, 1000, 1150, 1750, 1250},
+                    {900, 1050, 1200, 1650, 1350}, {-1, 0, 0, 0, 0}, 0.55 },
+};
+
+static const scenario_t *gScenario = &gScenarios[0];
+
+// Sticks only move during the warm-up/trace; the arming and settling steps hold
+// them centred (and the throttle at the requested low value) so the firmware's
+// arming rules and the runaway-takeoff deactivation are not disturbed.
+static bool gScenarioActive = false;
+
+static uint16_t stickAt(const stickStep_t *s, int phase)
 {
-    if (phase >= ROLL_STEP_AT && phase < ROLL_REVERSE_AT) {
-        return ROLL_STICK_HIGH;
+    if (s->start < 0 || !gScenarioActive) {
+        return 1500;
     }
-    if (phase >= ROLL_REVERSE_AT && phase < ROLL_BACK_AT) {
-        return ROLL_STICK_LOW;
+    if (phase >= s->start && phase < s->reverse) {
+        return s->high;
+    }
+    if (phase >= s->reverse && phase < s->back) {
+        return s->low;
     }
     return 1500;
 }
 
-static double rollRateTarget(int phase)
+// 300 us of roll/pitch stick = 3.5 rad/s (~200 dps), the slope the original
+// scenario used; yaw gets less because the mixer's yaw authority is smaller and
+// a large yaw rate would just pin the motors against their limits. A throttle
+// doublet gets no rate target (throttle is not a rate axis).
+static double axisRateTarget(int axis, const stickStep_t *s, int phase)
 {
-    if (phase >= ROLL_STEP_AT && phase < ROLL_REVERSE_AT) {
-        return ROLL_RATE_TARGET;
+    static const double gainPerAxis[3] = { 3.5 / 300.0, 3.5 / 300.0, 1.2 / 300.0 };
+
+    if (s->start < 0 || !gScenarioActive || s == &gScenario->throttle) {
+        return 0.0;
     }
-    if (phase >= ROLL_REVERSE_AT && phase < ROLL_BACK_AT) {
-        return -ROLL_RATE_TARGET;
-    }
-    return 0.0;
+    return (stickAt(s, phase) - 1500.0) * gainPerAxis[axis] * gScenario->rateScale;
 }
 
 static void printStoredArmSwitch(void)
@@ -172,32 +214,63 @@ static bool tryArmOnChannel(int channel, uint16_t value, int steps)
     return false;
 }
 
+// Arm with `on`, then confirm the switch really disarms with `off`: a channel
+// that only *looks* like the ARM switch (because another channel happens to sit
+// inside its range) fails here.
+static bool verifyArmSwitch(int channel, uint16_t on, uint16_t off)
+{
+    gArmChannel = channel;
+    gArmHigh = on;
+    gArmLow = off;
+
+    if (!tryArmOnChannel(channel, on, 600)) {
+        return false;
+    }
+    runSteps(400, ARM_THROTTLE, false);
+    if (sitl_local_get_armed()) {
+        sitl_local_disarm();
+        runSteps(200, ARM_THROTTLE, false);
+    }
+    if (sitl_local_get_armed()) {
+        return false;
+    }
+
+    fprintf(stderr, "[arm] ARM switch: rc channel %d, %u us = armed, %u us = disarmed\n",
+            channel, (unsigned)on, (unsigned)off);
+    return true;
+}
+
 static bool findArmSwitch(void)
 {
-    static const uint16_t candidates[] = {2000, 1100, 1000};
-
     printStoredArmSwitch();
 
+    // The EEPROM condition is the most reliable source: arm inside its range,
+    // disarm with the extreme that lies outside it. A plain "probe every channel"
+    // cannot tell which channel did it, because the channels it holds low can sit
+    // inside a low-side range (the ARM switch in this EEPROM is active at
+    // 900..1175 us, i.e. low means armed).
+    uint8_t aux = 0xFF;
+    uint8_t startStep = 0;
+    uint8_t endStep = 0;
+    sitl_local_get_arm_switch(&aux, &startStep, &endStep);
+    if (aux != 0xFF && ARM_CHANNEL_FIRST + aux < SITL_LOCAL_MAX_RC_CHANNELS) {
+        const int lowUs = 900 + startStep * 25;
+        const int highUs = 900 + endStep * 25;
+        int mid = (lowUs + highUs) / 2;
+        if (mid < 1000) mid = 1000;
+        if (mid > 2000) mid = 2000;
+        const uint16_t on = (uint16_t)mid;
+        const uint16_t off = (lowUs > 1100) ? 1000 : 2000;
+        if (verifyArmSwitch(ARM_CHANNEL_FIRST + aux, on, off)) {
+            return true;
+        }
+        fprintf(stderr, "[arm] the EEPROM condition did not verify, scanning instead\n");
+    }
+
+    // Fallback: every AUX channel, both extremes. Each candidate is verified
+    // (must arm in the on-position and disarm in the off-position) before use.
     for (int channel = ARM_CHANNEL_FIRST; channel < SITL_LOCAL_MAX_RC_CHANNELS; channel++) {
-        for (size_t c = 0; c < sizeof(candidates) / sizeof(candidates[0]); c++) {
-            if (!tryArmOnChannel(channel, candidates[c], 600)) {
-                continue;
-            }
-            gArmChannel = channel;
-            gArmHigh = candidates[c];
-            gArmLow = (gArmHigh >= 1500) ? 1000 : 2000;
-            fprintf(stderr, "[arm] firmware arms with rc channel %d = %u us -> "
-                            "using %u us for armed, %u us for disarmed\n",
-                    gArmChannel, (unsigned)gArmHigh, (unsigned)gArmHigh,
-                    (unsigned)gArmLow);
-            // Confirm the off position really disarms before the real phases.
-            runSteps(400, ARM_THROTTLE, false);
-            if (sitl_local_get_armed()) {
-                fprintf(stderr, "[arm] warning: still armed with %u us - disarming via API\n",
-                        (unsigned)gArmLow);
-                sitl_local_disarm();
-                runSteps(200, ARM_THROTTLE, false);
-            }
+        if (verifyArmSwitch(channel, 2000, 1000) || verifyArmSwitch(channel, 1000, 2000)) {
             return true;
         }
     }
@@ -258,18 +331,24 @@ static void makeInput(int phase, uint16_t throttle, bool armHigh,
     }
     in->rc_channels[gArmChannel] = armHigh ? gArmHigh : gArmLow;
 
-    in->rc_channels[2] = throttle;   // throttle
-    in->rc_channels[0] = rollStick(phase);
+    // Throttle: the scenario's own doublet while the scenario runs, otherwise the
+    // low "arming" value.
+    in->rc_channels[2] = gScenarioActive ? stickAt(&gScenario->throttle, phase) : throttle;
+    in->rc_channels[0] = stickAt(&gScenario->roll, phase);
+    in->rc_channels[1] = stickAt(&gScenario->pitch, phase);
+    in->rc_channels[3] = stickAt(&gScenario->yaw, phase);
 
-    // Deterministic body rates: the commanded roll rate (the craft follows its
-    // own setpoint, keeping the loop linear) plus a fast component the gyro and
-    // D-term filters have to reject - a change in filter state, gains or dt
-    // shows up directly in the motor outputs.
+    // Deterministic body rates: the commanded rate (the craft follows its own
+    // setpoint, keeping the loop linear) plus a fast component per axis that the
+    // gyro and D-term filters have to reject - a change in filter state, gains or
+    // dt shows up directly in the motor outputs.
     const double t = phase * 0.001;
-    in->angular_velocity_rpy[0] = rollRateTarget(phase)
+    in->angular_velocity_rpy[0] = axisRateTarget(0, &gScenario->roll, phase)
                                 + gNoiseScale * 0.05 * sin(2.0 * M_PI * 19.0 * t);
-    in->angular_velocity_rpy[1] = 0.05 * sin(2.0 * M_PI * 7.0 * t);
-    in->angular_velocity_rpy[2] = 0.05 * sin(2.0 * M_PI * 11.0 * t);
+    in->angular_velocity_rpy[1] = axisRateTarget(1, &gScenario->pitch, phase)
+                                + gNoiseScale * 0.04 * sin(2.0 * M_PI * 23.0 * t);
+    in->angular_velocity_rpy[2] = axisRateTarget(2, &gScenario->yaw, phase)
+                                + gNoiseScale * 0.03 * sin(2.0 * M_PI * 13.0 * t);
 
     // Plausible telemetry so the RPM bridge has something to work on.
     in->motor_rpm[0] = 12000.0;
@@ -377,6 +456,18 @@ static void runTrace(float trace[SCENARIO_STEPS][4], uint8_t *motorCount,
     rangeOut[1] = hi;
     fprintf(stderr, "   (saturated on at least one motor: %.1f%% of the scenario)\n",
             100.0 * saturated / SCENARIO_STEPS);
+}
+
+// Warm-up and one recorded pass of the scenario, with the scenario's sticks
+// active. Both traces always use this, so they line up phase for phase.
+static void warmUpAndTrace(float trace[SCENARIO_STEPS][4], uint8_t *motorCount,
+                           bool *armedEver, float rangeOut[2])
+{
+    gScenarioActive = true;
+    padToFrameGrid();
+    runSteps(SCENARIO_STEPS * WARMUP_PERIODS, TRACE_THROTTLE, true);
+    runTrace(trace, motorCount, armedEver, rangeOut);
+    gScenarioActive = false;
 }
 
 // --- MSP over the DLL's own TCP server (what the configurator talks to) ------
@@ -553,37 +644,45 @@ static void replayConfiguratorWrites(void)
 // afterwards and verified byte for byte. Nothing is persisted (no EEPROM write).
 static uint8_t gCfgOriginal[MSP_MAX_PAYLOAD];
 static int gCfgOriginalLen = -1;
+static uint8_t gCfgGetCmd = 0;
+static uint8_t gCfgSetCmd = 0;
+static const char *gCfgName = "";
 
-static void applyFilterConfigVariant(void)
+static void applyConfigVariant(uint8_t getCmd, uint8_t setCmd, const char *name,
+                               int byteIndex)
 {
-    gCfgOriginalLen = mspRequest(MSP_FILTER_CONFIG, NULL, 0, gCfgOriginal,
-                                 sizeof(gCfgOriginal), 2000);
-    if (gCfgOriginalLen < 20) {
-        fprintf(stderr, "[cfg-change] filter config read failed (%d bytes)\n",
-                gCfgOriginalLen);
+    gCfgGetCmd = getCmd;
+    gCfgSetCmd = setCmd;
+    gCfgName = name;
+
+    gCfgOriginalLen = mspRequest(getCmd, NULL, 0, gCfgOriginal, sizeof(gCfgOriginal), 2000);
+    if (gCfgOriginalLen < byteIndex + 1) {
+        fprintf(stderr, "[cfg-change] %s: read failed (%d bytes)\n", name, gCfgOriginalLen);
         exit(3);
     }
 
     uint8_t changed[MSP_MAX_PAYLOAD];
     memcpy(changed, gCfgOriginal, (size_t)gCfgOriginalLen);
-    const int at = gCfgOriginalLen / 2;      // inside the cutoff fields
-    changed[at] ^= 0x01;
-    (void)mspRequest(MSP_SET_FILTER_CONFIG, changed, (uint8_t)gCfgOriginalLen,
-                     NULL, 0, 2000);
-    fprintf(stderr, "[cfg-change] filter byte %d flipped (0x%02X -> 0x%02X) - the "
-                    "filters must be rebuilt now\n",
-            at, gCfgOriginal[at], changed[at]);
+    changed[byteIndex] ^= 0x01;
+    (void)mspRequest(setCmd, changed, (uint8_t)gCfgOriginalLen, NULL, 0, 2000);
+
+    uint8_t now[MSP_MAX_PAYLOAD];
+    const int len = mspRequest(getCmd, NULL, 0, now, sizeof(now), 2000);
+    const bool applied = len == gCfgOriginalLen && now[byteIndex] == changed[byteIndex];
+    fprintf(stderr, "[cfg-change] %s byte %d: 0x%02X -> 0x%02X, read back %s - the "
+                    "firmware must rebuild / re-apply now\n",
+            name, byteIndex, gCfgOriginal[byteIndex], changed[byteIndex],
+            applied ? "ok" : "MISMATCH");
 }
 
-static void restoreFilterConfig(void)
+static void restoreConfigVariant(void)
 {
     uint8_t now[MSP_MAX_PAYLOAD];
-    (void)mspRequest(MSP_SET_FILTER_CONFIG, gCfgOriginal, (uint8_t)gCfgOriginalLen,
-                     NULL, 0, 2000);
-    const int len = mspRequest(MSP_FILTER_CONFIG, NULL, 0, now, sizeof(now), 2000);
+    (void)mspRequest(gCfgSetCmd, gCfgOriginal, (uint8_t)gCfgOriginalLen, NULL, 0, 2000);
+    const int len = mspRequest(gCfgGetCmd, NULL, 0, now, sizeof(now), 2000);
     const bool same = len == gCfgOriginalLen
                       && memcmp(gCfgOriginal, now, (size_t)gCfgOriginalLen) == 0;
-    fprintf(stderr, "[cfg-change] filter config restored: %s\n", same ? "yes" : "NO");
+    fprintf(stderr, "[cfg-change] %s restored: %s\n", gCfgName, same ? "yes" : "NO");
 }
 
 static void saveConfig(const char *mode)
@@ -716,14 +815,24 @@ int main(int argc, char **argv)
     setvbuf(stderr, NULL, _IONBF, 0);
     fprintf(stderr, "[harness] mode=%s\n", mode);
     if (argc > 2) {
-        gCfgOnly = atoi(argv[2]);
-        fprintf(stderr, "[harness] configurator block filter = %d\n", gCfgOnly);
+        for (size_t i = 0; i < sizeof(gScenarios) / sizeof(gScenarios[0]); i++) {
+            if (strcmp(argv[2], gScenarios[i].name) == 0) {
+                gScenario = &gScenarios[i];
+                break;
+            }
+        }
+        fprintf(stderr, "[harness] scenario=%s\n", gScenario->name);
+    }
+    if (argc > 3) {
+        gCfgOnly = atoi(argv[3]);
+        fprintf(stderr, "[harness] configurator block filter=%d\n", gCfgOnly);
     }
 
     if (sitl_local_init() != 0) {
         fprintf(stderr, "sitl_local_init() failed\n");
         return 1;
     }
+    gStepBase = gStepCount;
     if (mspConnect() != 0) {
         fprintf(stderr, "could not connect to the MSP server on 127.0.0.1:%d\n", MSP_PORT);
         sitl_local_shutdown();
@@ -762,9 +871,7 @@ int main(int argc, char **argv)
         sitl_local_shutdown();
         return 2;
     }
-    padToFrameGrid();
-    runSteps(SCENARIO_STEPS * WARMUP_PERIODS, TRACE_THROTTLE, true);
-    runTrace(traceA, &motorCountA, &armedA, rangeA);
+    warmUpAndTrace(traceA, &motorCountA, &armedA, rangeA);
     fprintf(stderr, "[trace] before save: armed=%d motors=%u motor range %.0f..%.0f us\n",
             armedA ? 1 : 0, (unsigned)motorCountA, (double)rangeA[0], (double)rangeA[1]);
 
@@ -785,6 +892,11 @@ int main(int argc, char **argv)
     const bool cfgSaveMode = strcmp(mode, "cfg-save") == 0;
     const bool cfgSaveRebootMode = strcmp(mode, "cfg-save-reboot") == 0;
     const bool cfgChangeMode = strcmp(mode, "cfg-change") == 0;
+    const bool cfgChangeFilterMode = strcmp(mode, "cfg-change-filter") == 0;
+    const bool cfgChangeRateMode = strcmp(mode, "cfg-change-rate") == 0;
+    const bool cfgChangePidMode = strcmp(mode, "cfg-change-pid") == 0;
+    const bool twiceMode = strcmp(mode, "twice") == 0;
+    const bool reinitMode = strcmp(mode, "reinit") == 0;
     if (controlMode) {
         fprintf(stderr, "[control] no save, no MSP traffic - repeats the same "
                         "sequence to show what the harness measures without a save\n");
@@ -803,7 +915,25 @@ int main(int argc, char **argv)
         saveConfig(cfgSaveRebootMode ? "save-reboot" : "save-only");
     } else if (cfgChangeMode) {
         fprintf(stderr, "[cfg-change] real filter change (must still take effect)\n");
-        applyFilterConfigVariant();
+        applyConfigVariant(MSP_FILTER_CONFIG, MSP_SET_FILTER_CONFIG, "filter", 28);
+    } else if (cfgChangeFilterMode) {
+        fprintf(stderr, "[cfg-change] real filter change + save (must take effect)\n");
+        applyConfigVariant(MSP_FILTER_CONFIG, MSP_SET_FILTER_CONFIG, "filter", 28);
+        saveConfig("save-only");
+    } else if (cfgChangeRateMode) {
+        fprintf(stderr, "[cfg-change] real rate/expo change + save (must take effect)\n");
+        applyConfigVariant(MSP_RC_TUNING, MSP_SET_RC_TUNING, "rc_tuning", 1);
+        saveConfig("save-only");
+    } else if (cfgChangePidMode) {
+        fprintf(stderr, "[cfg-change] real PID change + save (must take effect)\n");
+        applyConfigVariant(MSP_PID, MSP_SET_PID, "pid", 1);
+        saveConfig("save-only");
+    } else if (twiceMode) {
+        fprintf(stderr, "[twice] save, measure, save again, measure\n");
+        saveConfig("save-only");
+    } else if (reinitMode) {
+        fprintf(stderr, "[reinit] save, measure, then shutdown + init (fresh boot)\n");
+        saveConfig("save-only");
     } else if (sensitivityMode) {
         fprintf(stderr, "[sensitivity] no save: the second trace doubles the gyro "
                         "noise instead, to prove a loop change is visible\n");
@@ -826,13 +956,11 @@ int main(int argc, char **argv)
     if (sensitivityMode) {
         gNoiseScale = 2.0;
     }
-    runSteps(SCENARIO_STEPS * WARMUP_PERIODS, TRACE_THROTTLE, true);
-    runTrace(traceB, &motorCountB, &armedB, rangeB);
+    warmUpAndTrace(traceB, &motorCountB, &armedB, rangeB);
     fprintf(stderr, "[trace] after save: armed=%d motors=%u motor range %.0f..%.0f us\n",
             armedB ? 1 : 0, (unsigned)motorCountB, (double)rangeB[0], (double)rangeB[1]);
 
-    fprintf(stderr, "\n=== %s: 1500 throttle + roll stick step, same input before vs after ===\n",
-            mode);
+    fprintf(stderr, "\n=== %s / %s: same input before vs after ===\n", mode, gScenario->name);
     compare(mode, traceA, traceB);
 
     // Stability check: repeat the after-trace with no further save. If the two
@@ -843,20 +971,48 @@ int main(int argc, char **argv)
     uint8_t motorCountC = 0;
     bool armedC = false;
     float rangeC[2] = {0, 0};
-    if (cfgChangeMode) {
-        restoreFilterConfig();
+    const bool cfgChangedConfig = cfgChangeMode || cfgChangeFilterMode
+                                  || cfgChangeRateMode || cfgChangePidMode;
+    if (cfgChangedConfig) {
+        restoreConfigVariant();
+    }
+    if (twiceMode) {
+        fprintf(stderr, "[twice] second save, nothing changed since the first\n");
+        saveConfig("save-only");
+    }
+    if (reinitMode) {
+        fprintf(stderr, "[reinit] sitl_local_shutdown() + sitl_local_init()\n");
+        sitl_local_shutdown();
+        gSock = -1;
+        if (sitl_local_init() != 0) {
+            fprintf(stderr, "[reinit] sitl_local_init() failed\n");
+            return 1;
+        }
+        gStepBase = gStepCount;
+        if (mspConnect() != 0) {
+            fprintf(stderr, "[reinit] MSP reconnect failed\n");
+            return 1;
+        }
+        if (!findArmSwitch()) {
+            fprintf(stderr, "[reinit] could not arm after the re-init\n");
+            return 2;
+        }
     }
     if (!settleAndRearm()) {
         fprintf(stderr, "[arm] FAILED to re-arm for the stability trace.\n");
         sitl_local_shutdown();
         return 2;
     }
-    padToFrameGrid();
-    runSteps(SCENARIO_STEPS * WARMUP_PERIODS, TRACE_THROTTLE, true);
-    runTrace(traceC, &motorCountC, &armedC, rangeC);
-    if (cfgChangeMode) {
-        fprintf(stderr, "\n=== cfg-change: after writing the original filter bytes back ===\n");
+    warmUpAndTrace(traceC, &motorCountC, &armedC, rangeC);
+    if (cfgChangedConfig) {
+        fprintf(stderr, "\n=== %s: after writing the original bytes back ===\n", mode);
         compare("change-reverted", traceA, traceC);
+    } else if (twiceMode) {
+        fprintf(stderr, "\n=== twice: two saves in a row, second one changed nothing ===\n");
+        compare("after1-vs-after2", traceB, traceC);
+    } else if (reinitMode) {
+        fprintf(stderr, "\n=== reinit: post-save state vs a fresh in-process boot ===\n");
+        compare("after-save-vs-fresh-boot", traceB, traceC);
     } else {
         fprintf(stderr, "\n=== %s: after-save trace repeated (stability check) ===\n", mode);
         compare("after-vs-after", traceB, traceC);

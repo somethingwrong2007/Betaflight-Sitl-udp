@@ -10,6 +10,7 @@
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -37,6 +38,9 @@ static pthread_t clientThreads[SERIAL_PORT_COUNT][MAX_TCP_CLIENTS];
 static pthread_mutex_t clientLocks[SERIAL_PORT_COUNT];
 static pthread_t serverThreads[SERIAL_PORT_COUNT];
 static bool tcpStart = false;
+// Set by serialTcpStop() so the accept loops leave and a later init can bind the
+// port again (a host that restarts the FC in process, e.g. on a level reload).
+static volatile bool tcpStopping = false;
 
 static const struct serialPortVTable tcpVTable;
 
@@ -127,8 +131,14 @@ static void *tcpServerThread(void *arg)
     SOCKET listenSock = listenSockets[id];
 
     for (;;) {
+        if (tcpStopping) {
+            break;
+        }
         SOCKET client = accept(listenSock, NULL, NULL);
         if (client == INVALID_SOCKET) {
+            if (tcpStopping) {
+                break;
+            }
             continue;
         }
         socketNoInherit(client);
@@ -191,6 +201,8 @@ static int tcpReconfigure(tcpPort_t *s, int id)
         return 0;
     }
 
+    tcpStopping = false;
+
     if (pthread_mutex_init(&s->txLock, NULL) != 0) {
         return -1;
     }
@@ -246,6 +258,22 @@ static int tcpReconfigure(tcpPort_t *s, int id)
     fprintf(stderr, "bind port %u for UART%u\n", (unsigned)(BASE_PORT + id + 1), (unsigned)id + 1);
     wsProxyStart();
     return 0;
+}
+
+// Stop every listener so a later sitl_local_init() can bind 5761 again: the
+// accept loops leave as soon as their listen socket is closed.
+void serialTcpStop(void)
+{
+    tcpStopping = true;
+    for (int id = 0; id < SERIAL_PORT_COUNT; id++) {
+        if (listenSockets[id] != INVALID_SOCKET) {
+            closesocket(listenSockets[id]);
+            listenSockets[id] = INVALID_SOCKET;
+        }
+        tcpPortInitialized[id] = false;
+    }
+    tcpStart = false;
+    Sleep(100);
 }
 
 serialPort_t *serTcpOpen(serialPortIdentifier_e identifier, serialReceiveCallbackPtr rxCallback, void *rxCallbackData, uint32_t baudRate, portMode_e mode, portOptions_e options)
