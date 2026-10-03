@@ -571,7 +571,14 @@ void sitlMspWriteEEPROM(void)
 // or through sitl_local_reload_config(), exactly like real hardware.
 void sitlMspReadEEPROM(void)
 {
+#ifdef SITL_SAVE_REREAD
+    // A/B variant: behave like the stock firmware again - the save re-reads the
+    // EEPROM and re-runs activateConfig() under the live flight loop.
+    sitlAuditLog("save: EEPROM re-read (A/B variant)");
+    readEEPROM();
+#else
     sitlAuditLog("save: EEPROM re-read skipped (runtime state preserved)");
+#endif
 }
 
 // msp.c's configurator SET handlers re-initialise stateful chains that a real FC
