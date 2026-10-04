@@ -443,6 +443,10 @@ void sitlLocalRequestEepromWrite(void)
 // aircraft being left" write ahead of the environment change, which is what
 // makes it target the old file (and what makes a brand-new path detectable).
 static volatile LONG gLocalReloadPending = 0;
+// Virtual time of the newest pending reload / EEPROM path switch. Used to bound
+// how long such a request may be held back for a quiet moment (see
+// sitl_local_step).
+static volatile LONG64 gLocalReloadRequestUs = 0;
 static volatile LONG gLocalRebootPending = 0;
 // Set by sitl_local_reload_config(): force the boot-equivalent re-init of the
 // stateful filter chains (gyro LPF/notch/dyn-notch/RPM + PID D-term filters)
@@ -497,6 +501,7 @@ int sitl_local_set_eeprom_path(const char *path)
     // being left, then opens (and, when new, initialises) the requested file.
     strncpy(gLocalPendingEepromPath, resolved, sizeof(gLocalPendingEepromPath) - 1);
     gLocalPendingEepromPath[sizeof(gLocalPendingEepromPath) - 1] = '\0';
+    InterlockedExchange64(&gLocalReloadRequestUs, (LONG64)micros64());
     InterlockedExchange(&gLocalPathPending, 1);
     return 0;
 }
@@ -507,6 +512,7 @@ int sitl_local_reload_config(void)
         return -1;
     }
     InterlockedExchange(&gLocalForceFullInit, 1);
+    InterlockedExchange64(&gLocalReloadRequestUs, (LONG64)micros64());
     InterlockedExchange(&gLocalReloadPending, 1);
     return 0;
 }
@@ -1165,7 +1171,43 @@ void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
             localRunPendingReboot();
         } else if (InterlockedCompareExchange(&gLocalReloadPending, 0, 0) != 0 ||
                    InterlockedCompareExchange(&gLocalPathPending, 0, 0) != 0) {
-            localRunPendingReload();
+            // A reload (or EEPROM path switch) re-initialises the stateful
+            // gyro/D-term/RC chains, and doing that while the host is feeding
+            // rotating rates injects a step the D term turns into a full-authority
+            // oscillation. A host that switches aircraft does it while the new
+            // aircraft is at rest, so the request is held for a quiet moment -
+            // with a timeout, so a reload asked for mid-flight still happens.
+            static uint64_t quietSinceUs = 0;
+            static uint64_t lastDeferLogUs = 0;
+            const double *rpy = in->angular_velocity_rpy;
+            const bool ratesQuiet = fabs(rpy[0]) < 0.2 && fabs(rpy[1]) < 0.2
+                                    && fabs(rpy[2]) < 0.2;
+            const uint64_t now = micros64();
+            const LONG64 requestedUs = InterlockedCompareExchange64(&gLocalReloadRequestUs, 0, 0);
+            const uint64_t ageUs = (requestedUs > 0 && now > (uint64_t)requestedUs)
+                                       ? now - (uint64_t)requestedUs : 0;
+
+            if (ratesQuiet) {
+                if (quietSinceUs == 0) {
+                    quietSinceUs = now;
+                }
+            } else {
+                quietSinceUs = 0;
+            }
+
+            const bool quietLongEnough = quietSinceUs != 0 && (now - quietSinceUs) >= 200000;
+            const bool requestTooOld = requestedUs <= 0 || ageUs > 3000000;
+
+            if (quietLongEnough || requestTooOld) {
+                sitlAuditLog("reload: applying (ratesQuiet=%u, age=%ums)",
+                             ratesQuiet ? 1u : 0u, (unsigned)(ageUs / 1000));
+                quietSinceUs = 0;
+                localRunPendingReload();
+            } else if (now - lastDeferLogUs >= 1000000) {
+                sitlAuditLog("reload: waiting for a quiet moment (age=%ums)",
+                             (unsigned)(ageUs / 1000));
+                lastDeferLogUs = now;
+            }
         }
     }
 
