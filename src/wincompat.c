@@ -331,6 +331,167 @@ void sitlLocalLogStateIfChanged(const char *tag)
 #endif
 }
 
+// A fresh process starts with every firmware module static zeroed (the loader
+// clears .bss before main). An in-process restart re-runs init() on top of the
+// previous run's RAM instead, and Betaflight's init() does NOT rebuild all of
+// that: measured with tools/sitl_local_save_compare's reinit mode, a restarted
+// FC kept the previous flight's PID integrators, part of the PID runtime (D-term
+// / feedforward / anti-gravity history) and the attitude estimate, and then
+// answered the same stick input with a stable ~236 us different motor output -
+// up to 24% of the 1000..2000 us range during the transient. That is the
+// "aircraft shakes after a restart / after saving, a fresh process is fine"
+// symptom: the restart left the control loop on a different operating point.
+//
+// Reset those leftovers *before* init() runs, so the boot derives every chain
+// from a clean slate exactly like the cold start the rest of the pipeline is
+// validated against (a fresh process). Running at boot with the loop stopped,
+// this cannot inject a step into a live filter - unlike the mid-flight reloads
+// that caused the original shake.
+void sitlLocalResetVolatileControlState(void)
+{
+#ifdef SITL_LOCAL
+    memset(&pidRuntime, 0, sizeof(pidRuntime));
+    memset(pidData, 0, sizeof(pidData));
+
+    // Attitude / rotation state: a fresh boot starts from an all-zero
+    // quaternion, which imuComputeRotationMatrix() turns into the identity.
+    memset(&attitude, 0, sizeof(attitude));
+    memset(&rMat, 0, sizeof(rMat));
+    memset(&imuAttitudeQuaternion, 0, sizeof(imuAttitudeQuaternion));
+    // The estimator keeps its own file-static quaternion, which imuInit() reads
+    // to derive rMat - so it has to start at the fresh-boot value as well,
+    // otherwise a restart keeps pointing the OSD/attitude (and angle modes)
+    // along the previous run's last orientation until the filter converges.
+    imuSetAttitudeQuat(1.0f, 0.0f, 0.0f, 0.0f);
+
+    // Gyro sampling state the boot path does not clear (the filter *coeffs* are
+    // rebuilt by gyroInitFilters(), the raw/filtered values are leftovers).
+    memset(gyro.gyroADC, 0, sizeof(gyro.gyroADC));
+    memset(gyro.gyroADCf, 0, sizeof(gyro.gyroADCf));
+    memset(gyro.sampleSum, 0, sizeof(gyro.sampleSum));
+    gyro.sampleCount = 0;
+    memset(gyro.imuGyroFilter, 0, sizeof(gyro.imuGyroFilter));
+
+    sitlAuditLog("boot: volatile control state reset (PID/PID-runtime/attitude/gyro leftovers)");
+#endif
+}
+
+// Boot fingerprint of the *derived* control chains (not the config records).
+//
+// A fresh process starts with every firmware module static zeroed by the
+// loader; an in-process restart re-runs init() on top of the previous run's
+// RAM, so anything init() does not explicitly rebuild keeps the old value.
+// Where the two boots end up deriving different chains, a restarted FC flies
+// differently from a freshly loaded one - the "aircraft shakes after a
+// restart" report (tools/sitl_local_save_compare's reinit mode measures it).
+// Logged at sitl_local_init()/sitl_local_shutdown() so the two boots can be
+// compared value by value in the audit log.
+// Exposes the gyro signals the rate loop runs on to sitl_local.c's
+// sitl_local_get_loop_state() (this file is the only one that may include
+// sensors/gyro.h in the LOCAL build).
+void sitlLocalGetGyroState(float scaled[3], float filtered[3])
+{
+#ifdef SITL_LOCAL
+    for (int axis = 0; axis < 3; axis++) {
+        scaled[axis] = gyro.gyroADC[axis];
+        filtered[axis] = gyro.gyroADCf[axis];
+    }
+#else
+    UNUSED(scaled);
+    UNUSED(filtered);
+#endif
+}
+
+void sitlLocalGetGyroChainState(float sampleSum[3], float *lpf1State, float *lpf2State)
+{
+#ifdef SITL_LOCAL
+    for (int axis = 0; axis < 3; axis++) {
+        sampleSum[axis] = gyro.sampleSum[axis];
+    }
+    if (lpf1State) { *lpf1State = gyro.lowpassFilter[0].pt1FilterState.state; }
+    if (lpf2State) { *lpf2State = gyro.lowpass2Filter[0].pt1FilterState.state; }
+#else
+    UNUSED(sampleSum);
+    UNUSED(lpf1State);
+    UNUSED(lpf2State);
+#endif
+}
+
+// Diagnostic: which profile object does the loop read, and what does the PG
+// array hold? MSP writes land in the PG record; if these disagree, a config
+// write is going somewhere the loop never looks.
+void sitlLocalGetPidProfileInfo(uint32_t *curPtr, uint32_t *pgPtr, uint8_t *idx,
+                                uint8_t *pgRollP)
+{
+#ifdef SITL_LOCAL
+    if (curPtr)  { *curPtr = (uint32_t)(uintptr_t)currentPidProfile; }
+    if (pgPtr)   { *pgPtr = (uint32_t)(uintptr_t)&pidProfiles(0)[0]; }
+    if (idx)     { *idx = (uint8_t)systemConfig()->pidProfileIndex; }
+    if (pgRollP) { *pgRollP = (uint8_t)pidProfiles(0)[0].pid[0].P; }
+#else
+    UNUSED(curPtr); UNUSED(pgPtr); UNUSED(idx); UNUSED(pgRollP);
+#endif
+}
+
+void sitlLocalGetGyroLpfConfig(float *lpf1K, uint8_t *dynFilter, uint16_t *dynMin,
+                               uint16_t *dynMax, uint8_t *dynExpo)
+{
+#ifdef SITL_LOCAL
+    if (lpf1K)    { *lpf1K = gyro.lowpassFilter[0].pt1FilterState.k; }
+    if (dynFilter){ *dynFilter = gyro.dynLpfFilter; }
+    if (dynMin)   { *dynMin = gyro.dynLpfMin; }
+    if (dynMax)   { *dynMax = gyro.dynLpfMax; }
+    if (dynExpo)  { *dynExpo = gyro.dynLpfCurveExpo; }
+#else
+    UNUSED(lpf1K); UNUSED(dynFilter); UNUSED(dynMin); UNUSED(dynMax); UNUSED(dynExpo);
+#endif
+}
+
+void sitlLocalLogControlState(const char *tag)
+{
+#ifdef SITL_LOCAL
+    sitlAuditLog("ctrl %s: gyro(sr=%u sl=%u tl=%u scale=%.6f down=%u) denom=%u dT=%.9g f=%.6f "
+                 "lpf1k=%.9g ntc1a1=%.9g ntc1fq=%.9g dtermLpfK=%.9g itermRelaxCut=%u",
+                 tag,
+                 (unsigned)gyro.sampleRateHz, (unsigned)gyro.sampleLooptime,
+                 (unsigned)gyro.targetLooptime, (double)gyro.scale,
+                 (unsigned)(gyro.downsampleFilterEnabled ? 1 : 0),
+                 (unsigned)activePidLoopDenom,
+                 (double)pidRuntime.dT, (double)pidRuntime.pidFrequency,
+                 (double)gyro.lowpassFilter[0].pt1FilterState.k,
+                 (double)gyro.notchFilter1[0].a1,
+                 (double)gyro.notchFilter1[0].fq,
+                 (double)pidRuntime.dtermLowpass[0].pt1Filter.k,
+                 (unsigned)pidRuntime.itermRelaxCutoff);
+    sitlAuditLog("ctrl %s: h(gyroLpf1=%08X lpf2=%08X ntc1=%08X ntc2=%08X imuG=%08X) "
+                 "h(pidRuntime=%08X pidData=%08X att=%08X rMat=%08X quat=%08X) "
+                 "fn(lpf1=%p lpf2=%p ntc1=%p ntc2=%p)",
+                 tag,
+                 fnv32Struct(&gyro.lowpassFilter, sizeof(gyro.lowpassFilter)),
+                 fnv32Struct(&gyro.lowpass2Filter, sizeof(gyro.lowpass2Filter)),
+                 fnv32Struct(&gyro.notchFilter1, sizeof(gyro.notchFilter1)),
+                 fnv32Struct(&gyro.notchFilter2, sizeof(gyro.notchFilter2)),
+                 fnv32Struct(&gyro.imuGyroFilter, sizeof(gyro.imuGyroFilter)),
+                 fnv32Struct(&pidRuntime, sizeof(pidRuntime)),
+                 fnv32Struct(&pidData, sizeof(pidData)),
+                 fnv32Struct(&attitude, sizeof(attitude)),
+                 fnv32Struct(&rMat, sizeof(rMat)),
+                 fnv32Struct(&imuAttitudeQuaternion, sizeof(imuAttitudeQuaternion)),
+                 (void *)gyro.lowpassFilterApplyFn, (void *)gyro.lowpass2FilterApplyFn,
+                 (void *)gyro.notchFilter1ApplyFn, (void *)gyro.notchFilter2ApplyFn);
+    sitlAuditLog("ctrl %s: gyroADC=%.3f/%.3f/%.3f gyroADCf=%.3f/%.3f/%.3f "
+                 "pidData(P=%.3f/%.3f/%.3f I=%.3f/%.3f/%.3f D=%.3f/%.3f/%.3f)",
+                 tag,
+                 (double)gyro.gyroADC[0], (double)gyro.gyroADC[1], (double)gyro.gyroADC[2],
+                 (double)gyro.gyroADCf[0], (double)gyro.gyroADCf[1], (double)gyro.gyroADCf[2],
+                 (double)pidData[0].P, (double)pidData[1].P, (double)pidData[2].P,
+                 (double)pidData[0].I, (double)pidData[1].I, (double)pidData[2].I,
+                 (double)pidData[0].D, (double)pidData[1].D, (double)pidData[2].D);
+#else
+    UNUSED(tag);
+#endif
+}
+
 // The gyro filter chain (LPF1/LPF2, notches, dynamic notch, RPM filter) is
 // stateful, and zeroing that state while the host keeps feeding gyro samples
 // injects a step into the filtered rate: the PID's D-term (delta/dt) turns it

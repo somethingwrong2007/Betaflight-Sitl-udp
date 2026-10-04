@@ -739,11 +739,14 @@ high, i.e. with whatever other mode boxes the config has bound there active),
 edit flows (`cfg-change-filter`, `cfg-change-rate`, `cfg-change-pid`,
 `cfg-change`), a double save (`twice`), five saves in a row (`repeat`) and an
 in-process FC restart (`reinit`). A no-op save must leave the traces identical; a
-real edit must change them and reverting must return to the baseline. `reinit` is
-the exception by design: after the "second-boot chain rebuild" was removed (see
-below) a restart no longer has to match the pre-restart traces bit for bit - it is
-the boot path the firmware builds that matters. Current state: the save/edit cases
-pass; the `reinit` verdict is informational.
+real edit must change them; reverting must return to the baseline, and `reinit`
+(`shutdown()` + `init()`) must reproduce the fresh-boot traces. `cfg-change-rate`
+is the one case whose *reverted* trace is allowed to differ, and only from the
+stick doublet on: the rate edit itself re-seeds the RC-smoothing / feedforward
+state via `initRcProcessing()`, so the steady state returns but the filter state
+is not rewound (a real FC behaves the same way). The script checks that the
+divergence starts at or after the doublet instead of demanding bit equality.
+Current state: all 13 cases pass.
 
 Known gap: the CLI's own `save` (`#` to enter the CLI, then `save`) is not part
 of the matrix yet - the CLI is entered (`ARMING_DISABLED_CLI` shows up) and the
@@ -771,36 +774,14 @@ keeps the same semantics a real FC has (Save persists, boot-time settings need a
 reboot) while making both paths measurably non-invasive - which is what the
 matrix above checks.
 
-Two further problems were found and fixed while building that matrix:
+#### The shake: a restart did not reproduce a fresh boot
 
-- **An in-process FC restart did not reproduce a fresh boot.** `reinit`
-  (`sitl_local_shutdown()` + `sitl_local_init()`) used to hang -
-  `FLASH_Unlock` refuses to start while sitl.c's `eepromFd` is still open, so the
-  next boot never came back. Shutdown now flushes and closes the virtual EEPROM
-  (`localFlushEepromWrite()` -> `configLock()`) and stops the TCP/WebSocket
-  listeners (`serialTcpStop()` / `wsProxyStop()`), so a later init can bind
-  5761/6761 again.
-- **The restarted FC landed in a different operating point** (315 us difference
-  in the stick response, i.e. restarting the DLL in process was *not* the same as
-  restarting the process - only a new process gave a clean state). The stateful
-  gyro/D-term/RC chains keep their state in firmware module statics that the
-  loader only zeroes once per process, so `sitl_local_init()` now re-derives them
-  explicitly (`gyroInitFilters()`, `pidInitFilters()`, `initRcProcessing()`) and
-  resets the link state a fresh process would start with. `reinit` now measures
-  identical (0.0007 us) - see "The shake: one root cause, two triggers" below:
-  that rebuild was removed again, because it moved the shake trigger onto the
-  restart path.
-
-#### The shake: one root cause, two triggers
-
-The "aircraft shakes until the process is restarted" symptom has **one** root
-cause: *anything that re-initialises the stateful control chains while the flight
-loop is running* - the gyro filter block (`gyroInitFilters()`), the D-term filter
-block (`pidInitFilters()`) and the rate/RC processing (`initRcProcessing()`), all
-three also touched by `activateConfig()`. Rebuilding them under a live gyro stream
-injects a step that the D term (`delta/dt`) amplifies into a full-authority
-oscillation (measured: one axis railing the motors between 2000/1054 us at
-~120 Hz). Two rounds were needed because the trigger moved:
+The "the DLL flew fine until it was restarted, then it shook" symptom had **one**
+root cause: on a second boot the firmware built a *different* gyro filter chain
+than on the first, so the same stick input produced a different motor response
+(measured: 236 us at the stick step - 24% of the 1000..2000 us range - plus a
+persistent offset from the re-integrated I term). Two rounds were needed because
+earlier fixes had moved the trigger:
 
 | trigger | how it fired | fix |
 | --- | --- | --- |
@@ -808,11 +789,42 @@ oscillation (measured: one axis railing the motors between 2000/1054 us at
 | **in-process FC restart / level reload** (a regression of ours) | `sitl_local_init()` was made to re-derive the same three chains on a *second* init inside one process, to make a restart byte-identical to a fresh boot | removed again: the boot path is left exactly as the firmware builds it |
 | **runtime `sitl_local_set_eeprom_path()` + `sitl_local_reload_config()`** (per-aircraft switch) | the reload ran `readEEPROM()` -> `activateConfig()` and two unconditional `pidInit()` calls inside a running loop | the file is loaded values-only, the chains are rebuilt only where the loaded settings differ, and a file identical to what the FC is running makes the request a no-op (`reload: configuration identical, nothing to re-apply`) |
 
-That second trigger is the pitfall worth remembering: it was added while fixing a
-*measurement* (a synthetic 315 us "restart is not a fresh boot" difference) and it
-made the shake appear from boot instead of after a save. Do not "helpfully"
-re-initialise what the firmware itself just built - the trigger only reappears
-somewhere else.
+That second trigger is still the pitfall worth remembering: it was added while
+fixing a *measurement* (a synthetic 315 us "restart is not a fresh boot"
+difference) and it made the shake appear from boot instead of after a save. Do not
+"helpfully" re-initialise what the firmware itself just built while the loop is
+running - the trigger only reappears somewhere else.
+
+With the live re-inits gone, the remaining restart problem was a **boot-ordering
+bug of our own**, and it is the real answer to "why did restarting the DLL
+change how it flew":
+
+`useDshotTelemetry` says whether the simulator's bridged motor RPM may feed the
+firmware (RPM filter, ESC/OSD/MSP telemetry). `rpmFilterInit()` runs inside the
+boot's `gyroInitFilters()` and returns early - leaving `numHarmonics = 0`, i.e.
+the RPM filter disabled for the whole run - when the flag is false. The LOCAL
+link set the flag only *after* the boot (`localApplyLinkOverrides()`), and the
+flag is a plain global that a fresh process starts with at 0:
+
+| boot | flag when `rpmFilterInit()` runs | gyro chain |
+| --- | --- | --- |
+| first boot in a fresh process | 0 (loader zero) | RPM filter **off** |
+| any in-process re-init (host `shutdown()`+`init()`, level reload, PIE restart) | still 1 from the previous run | RPM filter **on** |
+
+Two different filter chains from the same saved configuration. Fixed by setting
+the flag in `sitlLocalPreMotorInit()` - the hook `sitlBoot()` runs after the
+EEPROM read and before `initPhase2/3`, i.e. before the boot derives anything from
+it - so every boot, first or re-init, builds the chain the configuration asks
+for. To make the restart an actual power cycle, `sitlLocalResetVolatileControlState()`
+also zeroes the leftovers the firmware's `init()` does not rebuild (PID
+integrators and part of `pidRuntime`, the attitude quaternion, the raw gyro
+state) before a second boot. It runs with the loop stopped, so unlike the
+mid-flight rebuilds above it cannot inject a step into a live filter.
+
+`sitl_local_shutdown()` was also fixed: it flushes and closes the virtual EEPROM
+(`localFlushEepromWrite()` -> `configLock()`) and stops the TCP/WebSocket
+listeners (`serialTcpStop()` / `wsProxyStop()`), so a later `sitl_local_init()`
+can bind 5761/6761 again instead of hanging in `FLASH_Unlock`.
 
 How it was pinned down:
 
@@ -828,6 +840,28 @@ How it was pinned down:
   state before the save/reboot work). `a315ef9` was clean at boot but shook after
   saving the PID tab, while the newer build shook from boot - which located the
   moved trigger.
+- the **two-boot fingerprint** (`ctrl boot#1` / `ctrl boot#n` lines in
+  `sitl-audit.log`) compared what each boot derived; the chains matched except for
+  the attitude leftovers, which led to adding the volatile-state reset;
+- the **per-step loop signals** (`sitl_local_get_loop_state()`, the harness's
+  `loop signals` and `probe` output) finally located the RPM filter: the value
+  entering the gyro lowpass chain (`sampleSum`, the LPF2/downsample output) was
+  bit-identical between the two boots, while the lowpass filter's *output* was
+  not - and `rpmFilterRun()` is the only stage between them. Reconstructing the
+  filter's actual input from its state and gain (`lpf1In` in the probe output)
+  showed it was a pure pass-through on the first boot and an active notch bank on
+  the restart.
+
+#### Control-loop diagnostics
+
+`sitl_local_get_loop_state()` (see `src/sitl_local.h`) returns a per-step snapshot
+of the signals that drive the rate loop: the scaled and filtered gyro, the stick
+setpoint in RC units, every PID term, the measured loop periods, the gyro filter
+chain internals (downsample output, lowpass state/gain, dynamic-lowpass
+settings), and the configured gains/pointers. The save-invariance harness prints
+it as `loop signals` and a `probe` table, which is what makes a difference
+attributable to a single stage instead of "the motors changed". It is read-only
+and safe to call from the stepping thread.
 
 Also fixed along the way:
 

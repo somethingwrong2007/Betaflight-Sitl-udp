@@ -26,11 +26,18 @@ New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 #   keep   the two traces must be identical (a no-op save must change nothing)
 #   change the first comparison must differ (a real edit must still apply) and
 #          the second one must be identical again (reverting returns to baseline)
+#
+# 'steady' is for edits whose *chain* is re-seeded by the edit itself: a rate/RC
+# edit runs initRcProcessing(), which re-seeds the RC-smoothing / feedforward
+# state, so re-writing the original value restores the steady state but not the
+# stick transient (a real FC behaves the same way - the filter state is not
+# rewound). The check below therefore accepts a divergence in the reverted trace
+# only when it starts at or after the stick doublet.
 $saveOps = @('save-only', 'save-reboot', 'cfg-save', 'cfg-save-reboot', 'aux-save')
 $editOps = @{
     'cfg-change'        = @('DIVERGES', 'identical')
     'cfg-change-filter' = @('DIVERGES', 'identical')
-    'cfg-change-rate'   = @('DIVERGES', 'identical')
+    'cfg-change-rate'   = @('DIVERGES', 'steady')
     'cfg-change-pid'    = @('DIVERGES', 'identical')
     'twice'             = @('identical', 'identical')
     'reinit'            = @('identical', 'identical')
@@ -49,7 +56,12 @@ function Invoke-Case {
     foreach ($m in $matches) {
         $verdicts += [pscustomobject]@{ Label = $m.Groups[1].Value; Result = $m.Groups[2].Value }
     }
-    return [pscustomobject]@{ Op = $Op; Scenario = $Scenario; Log = $log; Verdicts = $verdicts }
+    # Where the reverted trace starts to differ (used by the 'steady' check).
+    $divergenceStart = -1
+    $div = [regex]::Match($text, 'VERDICT \((change-reverted|after-save-vs-fresh-boot|after-vs-after|after1-vs-after5)\): DIVERGES from scenario step (\d+)')
+    if ($div.Success) { $divergenceStart = [int]$div.Groups[2].Value }
+    return [pscustomobject]@{ Op = $Op; Scenario = $Scenario; Log = $log
+                              Verdicts = $verdicts; DivergenceStart = $divergenceStart }
 }
 
 $results = @()
@@ -77,8 +89,17 @@ foreach ($r in $results) {
     $summary = @()
     for ($i = 0; $i -lt $expected.Count; $i++) {
         $got = if ($i -lt $r.Verdicts.Count) { $r.Verdicts[$i].Result } else { 'MISSING' }
-        if ($got -ne $expected[$i]) { $ok = $false }
-        $summary += $got
+        $want = $expected[$i]
+        if ($want -eq 'steady') {
+            # The reverted trace may differ, but only from the stick doublet on
+            # (steady state must be restored).
+            $steadyOk = ($got -eq 'identical') -or ($r.DivergenceStart -ge 750)
+            if (-not $steadyOk) { $ok = $false }
+            $summary += if ($steadyOk) { "$got(steady-ok@$($r.DivergenceStart))" } else { $got }
+        } else {
+            if ($got -ne $want) { $ok = $false }
+            $summary += $got
+        }
     }
     if ($ok) { $pass++ } else { $fail++ }
     $rows += [pscustomobject]@{

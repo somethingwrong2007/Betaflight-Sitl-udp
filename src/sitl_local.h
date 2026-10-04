@@ -55,6 +55,35 @@ typedef struct {
     float servo_output_raw[SITL_LOCAL_MAX_SERVOS]; // 1000..2000 (raw PWM)
 } sitl_local_output_t;
 
+// Per-step snapshot of the signals that drive the rate loop. Test harnesses use
+// it to tell *which* part of the loop moved when a save or a restart changes the
+// motor response (stick setpoint, filtered gyro, a single PID term), instead of
+// only seeing the final motor mix. Read-only, call from the stepping thread.
+typedef struct {
+    float gyroADC[3];        // scaled, unfiltered gyro (the simulator feed)
+    float gyroADCf[3];       // filtered gyro, what the PID actually sees
+    float rcCommand[4];      // roll/pitch/yaw setpoint (rc units) + throttle
+    float pidP[3], pidI[3], pidD[3], pidF[3], pidSum[3];
+    uint32_t pidDeltaUs;     // last measured PID loop period
+    uint32_t gyroDeltaUs;    // last measured gyro loop period
+    // Gyro filter chain internals: sampleSum is the downsampled (LPF2) value
+    // that feeds the rest of the chain, lpf1State/lpf2State are the two
+    // lowpass filter states (0 when that filter is not in use).
+    float sampleSum[3];
+    float lpf1State, lpf2State;
+    // LPF1 (gyro lowpass 1) runtime configuration, which the dynamic lowpass
+    // re-tunes from the throttle while the loop runs.
+    float lpf1K;
+    uint8_t dynLpfFilter;
+    uint16_t dynLpfMin, dynLpfMax;
+    uint8_t dynLpfExpo;
+    // Configured gains (currentPidProfile), so a test can tell a config write
+    // that never reached the loop from one that did.
+    uint8_t cfgP[3], cfgI[3], cfgD[3], cfgF[3];
+    uint32_t cfgPidPtr, pgPidPtr;   // currentPidProfile vs the PG record
+    uint8_t cfgPidIndex, pgRollP;
+} sitl_local_loop_state_t;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -75,6 +104,9 @@ SITL_LOCAL_API void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
 
 /** Current virtual time in microseconds (the FC clock). */
 SITL_LOCAL_API uint64_t sitl_local_time_us(void);
+
+// Fill `out` with the current control-loop signals (0 on success).
+SITL_LOCAL_API int sitl_local_get_loop_state(sitl_local_loop_state_t *out);
 
 /**
  * Synchronous access to the in-memory flight-controller state, for hosts that

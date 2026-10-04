@@ -142,6 +142,107 @@ static const scenario_t gScenarios[] = {
 
 static const scenario_t *gScenario = &gScenarios[0];
 
+// --- control-loop signal capture ---------------------------------------------
+// The motor sum alone cannot say *which* part of the loop moved. Capture the
+// signals that feed it (stick setpoint, filtered gyro, each PID term) for both
+// traces, so a divergence can be attributed.
+#define TRACE_SIGNALS 23
+static const char *const gSignalNames[TRACE_SIGNALS] = {
+    "gyroADCf[roll]", "gyroADC[roll]", "rcCommand[roll]",
+    "pidP[roll]", "pidI[roll]", "pidD[roll]", "pidF[roll]", "pidSum[roll]",
+    "gyroADCf[pitch]", "rcCommand[pitch]", "pidSum[pitch]", "pidI[pitch]",
+    "pidDeltaUs", "gyroDeltaUs",
+    "sampleSum[roll]", "sampleSum[pitch]", "lpf1State", "lpf2State",
+    "lpf1K",
+    "cfgP[roll]", "cfgI[roll]", "cfgD[roll]", "cfgF[roll]",
+};
+static float gSigA[SCENARIO_STEPS][TRACE_SIGNALS];
+static float gSigB[SCENARIO_STEPS][TRACE_SIGNALS];
+static float gSigC[SCENARIO_STEPS][TRACE_SIGNALS];
+static float (*gSigTarget)[TRACE_SIGNALS] = gSigA;
+
+static void captureSignals(int index)
+{
+    sitl_local_loop_state_t ls;
+    if (sitl_local_get_loop_state(&ls) != 0) {
+        return;
+    }
+    float *row = gSigTarget[index];
+    row[0] = ls.gyroADCf[0];
+    row[1] = ls.gyroADC[0];
+    row[2] = ls.rcCommand[0];
+    row[3] = ls.pidP[0];
+    row[4] = ls.pidI[0];
+    row[5] = ls.pidD[0];
+    row[6] = ls.pidF[0];
+    row[7] = ls.pidSum[0];
+    row[8] = ls.gyroADCf[1];
+    row[9] = ls.rcCommand[1];
+    row[10] = ls.pidSum[1];
+    row[11] = ls.pidI[1];
+    row[12] = (float)ls.pidDeltaUs;
+    row[13] = (float)ls.gyroDeltaUs;
+    row[14] = ls.sampleSum[0];
+    row[15] = ls.sampleSum[1];
+    row[16] = ls.lpf1State;
+    row[17] = ls.lpf2State;
+    row[18] = ls.lpf1K;
+    row[19] = (float)ls.cfgP[0];
+    row[20] = (float)ls.cfgI[0];
+    row[21] = (float)ls.cfgD[0];
+    row[22] = (float)ls.cfgF[0];
+}
+
+// Which loop signal moved first? The motor mix is the last stage; the signal
+// that diverges first is the one the save/restart actually changed.
+static void compareSignals(const char *label, float a[][TRACE_SIGNALS],
+                           float b[][TRACE_SIGNALS],
+                           float ma[][4], float mb[][4])
+{
+    fprintf(stderr, "  loop signals (%s):\n", label);
+    for (int s = 0; s < TRACE_SIGNALS; s++) {
+        double maxDiff = 0.0;
+        int first = -1;
+        double beforeAt = 0.0, afterAt = 0.0;
+        for (int i = 0; i < SCENARIO_STEPS; i++) {
+            const double d = fabs((double)a[i][s] - (double)b[i][s]);
+            if (d > maxDiff) {
+                maxDiff = d;
+                beforeAt = a[i][s];
+                afterAt = b[i][s];
+            }
+            if (first < 0 && d > 1e-4) {
+                first = i;
+            }
+        }
+        fprintf(stderr, "   %-18s first divergence step %4d  max|d|=%10.5f "
+                        "(%.5f vs %.5f)\n",
+                gSignalNames[s], first, maxDiff, beforeAt, afterAt);
+    }
+
+    // Raw probe values, so the loop signals can be related to the motor mix
+    // (they are captured in the same step as the motor packet).
+    {
+        static const int probe[] = {1, 2, 3, 4, 100, 700, 760, 800, 801, 802, 850, 1000, 1100, 1400, 1999};
+        fprintf(stderr, "   probe: motor0 | sum (post-LPF2) -> lpf1In (implied, post-RPM) -> lpf1Out | k\n");
+        for (size_t i = 0; i < sizeof(probe) / sizeof(probe[0]); i++) {
+            const int s = probe[i];
+            const double kA = a[s][18] > 0.0001f ? a[s][18] : 1e-9;
+            const double kB = b[s][18] > 0.0001f ? b[s][18] : 1e-9;
+            const double inA = a[s - 1][16] + (a[s][16] - a[s - 1][16]) / kA;
+            const double inB = b[s - 1][16] + (b[s][16] - b[s - 1][16]) / kB;
+            fprintf(stderr, "    %4d A: %8.2f | %9.3f -> %9.3f -> %9.3f | %.6f | cfgP/I/D/F %.0f/%.0f/%.0f/%.0f\n",
+                    s, (double)ma[s][0],
+                    (double)a[s][14], inA, (double)a[s][16], kA,
+                    (double)a[s][19], (double)a[s][20], (double)a[s][21], (double)a[s][22]);
+            fprintf(stderr, "         B: %8.2f | %9.3f -> %9.3f -> %9.3f | %.6f | cfgP/I/D/F %.0f/%.0f/%.0f/%.0f\n",
+                    (double)mb[s][0],
+                    (double)b[s][14], inB, (double)b[s][16], kB,
+                    (double)b[s][19], (double)b[s][20], (double)b[s][21], (double)b[s][22]);
+        }
+    }
+}
+
 // Sticks only move during the warm-up/trace; the arming and settling steps hold
 // them centred (and the throttle at the requested low value) so the firmware's
 // arming rules and the runaway-takeoff deactivation are not disturbed.
@@ -444,6 +545,7 @@ static void runTrace(float trace[SCENARIO_STEPS][4], uint8_t *motorCount,
 
     for (int phase = 0; phase < SCENARIO_STEPS; phase++) {
         bool armed = stepWith(phase, TRACE_THROTTLE, true, trace[phase], motorCount);
+        captureSignals(phase);
         if (armed) {
             *armedEver = true;
         }
@@ -757,8 +859,29 @@ static uint8_t gCfgGetCmd = 0;
 static uint8_t gCfgSetCmd = 0;
 static const char *gCfgName = "";
 
+// What the *loop* sees, straight from currentPidProfile: an MSP write that the
+// firmware stores but never applies shows up here.
+static void printLoopGains(const char *tag)
+{
+    sitl_local_loop_state_t ls;
+    if (sitl_local_get_loop_state(&ls) == 0) {
+        fprintf(stderr, "[cfg-change] loop gains %s: cfgP/I/D/F roll = %u/%u/%u/%u, "
+                        "pidProfIdx=%u, PG P[roll]=%u, curPtr=%08X pgPtr=%08X%s\n",
+                tag, (unsigned)ls.cfgP[0], (unsigned)ls.cfgI[0],
+                (unsigned)ls.cfgD[0], (unsigned)ls.cfgF[0],
+                (unsigned)ls.cfgPidIndex, (unsigned)ls.pgRollP,
+                (unsigned)ls.cfgPidPtr, (unsigned)ls.pgPidPtr,
+                ls.cfgPidPtr == ls.pgPidPtr ? "" : "  <-- currentPidProfile is NOT the PG record");
+    }
+}
+
+// Flip one payload byte and push it back. The mask has to be big enough that
+// the edit is actually visible in the loop: a 1-bit change to an I gain or an
+// expo value moves the motor output by ~0.003 us, i.e. below the comparison's
+// 0.01 us threshold, and dterm_lpf2_type is not applied by this build at all -
+// the case would "pass" only as a false negative.
 static void applyConfigVariant(uint8_t getCmd, uint8_t setCmd, const char *name,
-                               int byteIndex)
+                               int byteIndex, uint8_t mask)
 {
     gCfgGetCmd = getCmd;
     gCfgSetCmd = setCmd;
@@ -772,16 +895,18 @@ static void applyConfigVariant(uint8_t getCmd, uint8_t setCmd, const char *name,
 
     uint8_t changed[MSP_MAX_PAYLOAD];
     memcpy(changed, gCfgOriginal, (size_t)gCfgOriginalLen);
-    changed[byteIndex] ^= 0x01;
+    changed[byteIndex] ^= mask;
     (void)mspRequest(setCmd, changed, (uint8_t)gCfgOriginalLen, NULL, 0, 2000);
 
     uint8_t now[MSP_MAX_PAYLOAD];
     const int len = mspRequest(getCmd, NULL, 0, now, sizeof(now), 2000);
     const bool applied = len == gCfgOriginalLen && now[byteIndex] == changed[byteIndex];
-    fprintf(stderr, "[cfg-change] %s byte %d: 0x%02X -> 0x%02X, read back %s - the "
+    fprintf(stderr, "[cfg-change] %s byte %d: 0x%02X -> 0x%02X (mask 0x%02X), read back %s - the "
                     "firmware must rebuild / re-apply now\n",
-            name, byteIndex, gCfgOriginal[byteIndex], changed[byteIndex],
+            name, byteIndex, gCfgOriginal[byteIndex], changed[byteIndex], mask,
             applied ? "ok" : "MISMATCH");
+
+    printLoopGains("after the SET");
 }
 
 static void restoreConfigVariant(void)
@@ -899,6 +1024,20 @@ static void compare(const char *label, float a[SCENARIO_STEPS][4],
                 seg * 250, (seg + 1) * 250 - 1,
                 sum[0] / 250.0, sum[1] / 250.0, sum[2] / 250.0, sum[3] / 250.0,
                 max[0], max[1], max[2], max[3]);
+    }
+
+    // Sample-level view of motor 0: a constant bias, a phase shift and a
+    // transient all look identical in the segment means above.
+    {
+        static const int probe[] = {0, 1, 2, 100, 200, 300, 400, 500, 600, 700,
+                                    760, 800, 850, 900, 950, 1000, 1050, 1100,
+                                    1200, 1400, 1600, 1800, 1999};
+        fprintf(stderr, "  motor 0 samples (step: before -> after, diff):\n");
+        for (size_t i = 0; i < sizeof(probe) / sizeof(probe[0]); i++) {
+            const int s = probe[i];
+            fprintf(stderr, "    %4d: %9.3f -> %9.3f  (%+7.3f)\n", s,
+                    (double)a[s][0], (double)b[s][0], (double)b[s][0] - (double)a[s][0]);
+        }
     }
 }
 
@@ -1150,19 +1289,28 @@ int main(int argc, char **argv)
         saveConfig(cfgSaveRebootMode ? "save-reboot" : "save-only");
     } else if (cfgChangeMode) {
         fprintf(stderr, "[cfg-change] real filter change (must still take effect)\n");
-        applyConfigVariant(MSP_FILTER_CONFIG, MSP_SET_FILTER_CONFIG, "filter", 28);
+        // Byte 23 is the high byte of gyro_lpf2_static_hz (500 -> 244 Hz): a
+        // real change to the downsampling lowpass, and reverting the byte
+        // restores the exact filter.
+        applyConfigVariant(MSP_FILTER_CONFIG, MSP_SET_FILTER_CONFIG, "filter", 23, 0x01);
     } else if (cfgChangeFilterMode) {
         fprintf(stderr, "[cfg-change] real filter change + save (must take effect)\n");
-        applyConfigVariant(MSP_FILTER_CONFIG, MSP_SET_FILTER_CONFIG, "filter", 28);
+        applyConfigVariant(MSP_FILTER_CONFIG, MSP_SET_FILTER_CONFIG, "filter", 23, 0x01);
         saveConfig("save-only");
+        printLoopGains("after the save");
     } else if (cfgChangeRateMode) {
         fprintf(stderr, "[cfg-change] real rate/expo change + save (must take effect)\n");
-        applyConfigVariant(MSP_RC_TUNING, MSP_SET_RC_TUNING, "rc_tuning", 1);
+        // Byte 0 is rcRates[ROLL] in hundredths (100 -> 108): an 8% rate change
+        // the stick doublet has to react to.
+        applyConfigVariant(MSP_RC_TUNING, MSP_SET_RC_TUNING, "rc_tuning", 0, 0x08);
         saveConfig("save-only");
+        printLoopGains("after the save");
     } else if (cfgChangePidMode) {
         fprintf(stderr, "[cfg-change] real PID change + save (must take effect)\n");
-        applyConfigVariant(MSP_PID, MSP_SET_PID, "pid", 1);
+        // Byte 0 is P[ROLL] in tenths (45 -> 61): a 35% gain change.
+        applyConfigVariant(MSP_PID, MSP_SET_PID, "pid", 0, 0x10);
         saveConfig("save-only");
+        printLoopGains("after the save");
     } else if (twiceMode) {
         fprintf(stderr, "[twice] save, measure, save again, measure\n");
         saveConfig("save-only");
@@ -1223,6 +1371,7 @@ int main(int argc, char **argv)
 
     // --- after the save ------------------------------------------------------
     padToFrameGrid();
+    gSigTarget = gSigB;
     if (sensitivityMode) {
         gNoiseScale = 2.0;
     }
@@ -1232,6 +1381,8 @@ int main(int argc, char **argv)
 
     fprintf(stderr, "\n=== %s / %s: same input before vs after ===\n", mode, gScenario->name);
     compare(mode, traceA, traceB);
+
+    compareSignals("before vs after the save", gSigA, gSigB, traceA, traceB);
 
     // Stability check: repeat the after-trace with no further save. If the two
     // after-traces match while the before/after pair does not, the save left the
@@ -1281,6 +1432,7 @@ int main(int argc, char **argv)
         sitl_local_shutdown();
         return 2;
     }
+    gSigTarget = gSigC;
     warmUpAndTrace(traceC, &motorCountC, &armedC, rangeC);
     if (cfgChangedConfig) {
         fprintf(stderr, "\n=== %s: after writing the original bytes back ===\n", mode);
@@ -1294,6 +1446,7 @@ int main(int argc, char **argv)
     } else if (reinitMode) {
         fprintf(stderr, "\n=== reinit: post-save state vs a fresh in-process boot ===\n");
         compare("after-save-vs-fresh-boot", traceB, traceC);
+        compareSignals("post-save vs fresh in-process boot", gSigB, gSigC, traceB, traceC);
     } else {
         fprintf(stderr, "\n=== %s: after-save trace repeated (stability check) ===\n", mode);
         compare("after-vs-after", traceB, traceC);

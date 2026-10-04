@@ -143,6 +143,9 @@ extern bool sitlLocalTakeMotorPacket(void *out, size_t size);
 static bool gLocalRunning = false;
 static HANDLE gMspThread = NULL;
 static volatile LONG gMspThreadStop = 0;
+// Boots seen by this process: 1 = the loader-zeroed fresh boot, >1 = an
+// in-process restart that re-uses the previous run's RAM.
+static uint32_t gLocalBootCount = 0;
 
 // Reboot recovery for the in-process build. msp.c's mspRebootFn (MSP_SET_REBOOT
 // post-processing) ends with `while (true);` because a real reboot never
@@ -301,9 +304,33 @@ static float localRcReadRaw(const rxRuntimeState_t *state, uint8_t channel)
 // a false-returning stub in this build - the motor device would become the
 // null device and produce no output. The virtual PWM device is the correct
 // motor backend for SITL, so pin the protocol to PWM here.
+//
+// This is also the hook for every other LOCAL link override that the *boot's
+// derived init* reads, because it runs after initPhase1 (the EEPROM read, which
+// would overwrite PG records) and before initPhase2/3 (mixer/motor setup,
+// gyroInitFilters -> rpmFilterInit, pidInit).
+//
+// `useDshotTelemetry` is one of those: rpmFilterInit() returns early - leaving
+// the RPM filter disabled for the whole run, numHarmonics = 0 - when it is
+// false, and the flag is a plain global (a fresh process starts with it at 0;
+// the LOCAL link turns it on so the bridged motor RPM feeds the RPM filter, the
+// OSD and MSP telemetry). Setting it only *after* the boot, as the runtime
+// override used to, meant:
+//
+//   fresh process  -> boot sees 0 -> RPM filter OFF  -> no RPM notches
+//   shutdown+init  -> global still 1 from the last run -> rpmFilterInit enables
+//                     the RPM filter -> the gyro is notched -> the loop answers
+//                     the same stick input with a different (up to 236 us, 24%
+//                     of the range) motor response.
+//
+// That is the "the aircraft was fine, then saving/restarting made it shake, and
+// only reloading the DLL fixes it" bug: the two boots derived different filter
+// chains. Setting the flag here makes every boot - first and re-init - build the
+// same chain, exactly like a real FC whose config enables the RPM filter.
 void sitlLocalPreMotorInit(void)
 {
     motorConfigMutable()->dev.motorProtocol = MOTOR_PROTOCOL_PWM;
+    useDshotTelemetry = true;
 }
 
 // The LOCAL link owns a few settings that the stock firmware would take from
@@ -810,6 +837,7 @@ int sitl_local_init(void)
     if (gLocalRunning) {
         return 0;
     }
+    gLocalBootCount++;
 
     // A host may choose the virtual EEPROM before boot (one config per aircraft).
     // Apply it first, so the boot below opens that file directly instead of the
@@ -844,6 +872,17 @@ int sitl_local_init(void)
     gLocalRepinPending = 0;
     gLocalPendingEepromPath[0] = '\0';
     memset(gLocalLastMotors, 0, sizeof(gLocalLastMotors));
+
+    // A fresh process gets every firmware static zeroed by the loader; an
+    // in-process restart re-uses the previous run's RAM, so reset the volatile
+    // control state (PID integrators, PID runtime history, attitude, raw gyro
+    // leftovers) before init() runs. The boot then derives every chain exactly
+    // like a cold start instead of inheriting the last flight's operating
+    // point - see wincompat.c's sitlLocalResetVolatileControlState().
+    if (gLocalBootCount > 1) {
+        extern void sitlLocalResetVolatileControlState(void);
+        sitlLocalResetVolatileControlState();
+    }
 
     // Use a stable, writable EEPROM location regardless of the host process's
     // working directory (UE can be launched from anywhere). Respect an
@@ -894,6 +933,12 @@ int sitl_local_init(void)
     sitlLocalSnapshotGyroFilterConfig();
     sitlLocalSnapshotPidFilterConfig();
     sitlLocalSnapshotRcProcessingConfig();
+
+    // Fingerprint the derived control chains the boot just built, so a
+    // process-internal restart can be compared against a fresh process boot
+    // (see wincompat.c's sitlLocalLogControlState).
+    extern void sitlLocalLogControlState(const char *tag);
+    sitlLocalLogControlState(gLocalBootCount == 1 ? "boot#1" : "boot#n");
 
     gLocalRunning = true;
     gMspThreadStop = 0;
@@ -1430,8 +1475,51 @@ uint64_t sitl_local_time_us(void)
     return micros64();
 }
 
+// Control-loop signal snapshot for the test harnesses (see sitl_local.h).
+// The filtered/scaled gyro lives in wincompat.c, which can include the sensor
+// headers this file cannot (see the LOCAL mpuGyroReadRegister stub).
+int sitl_local_get_loop_state(sitl_local_loop_state_t *out)
+{
+    if (out == NULL || !gLocalRunning) {
+        return -1;
+    }
+    memset(out, 0, sizeof(*out));
+    extern void sitlLocalGetGyroState(float scaled[3], float filtered[3]);
+    sitlLocalGetGyroState(out->gyroADC, out->gyroADCf);
+    extern void sitlLocalGetGyroChainState(float sampleSum[3], float *lpf1State, float *lpf2State);
+    sitlLocalGetGyroChainState(out->sampleSum, &out->lpf1State, &out->lpf2State);
+    extern void sitlLocalGetGyroLpfConfig(float *lpf1K, uint8_t *dynFilter, uint16_t *dynMin,
+                                          uint16_t *dynMax, uint8_t *dynExpo);
+    sitlLocalGetGyroLpfConfig(&out->lpf1K, &out->dynLpfFilter, &out->dynLpfMin,
+                              &out->dynLpfMax, &out->dynLpfExpo);
+    extern void sitlLocalGetPidProfileInfo(uint32_t *curPtr, uint32_t *pgPtr, uint8_t *idx,
+                                           uint8_t *pgRollP);
+    sitlLocalGetPidProfileInfo(&out->cfgPidPtr, &out->pgPidPtr, &out->cfgPidIndex,
+                               &out->pgRollP);
+    for (int axis = 0; axis < 3; axis++) {
+        out->rcCommand[axis] = rcCommand[axis];
+        out->pidP[axis] = pidData[axis].P;
+        out->pidI[axis] = pidData[axis].I;
+        out->pidD[axis] = pidData[axis].D;
+        out->pidF[axis] = pidData[axis].F;
+        out->pidSum[axis] = pidData[axis].Sum;
+        out->cfgP[axis] = currentPidProfile->pid[axis].P;
+        out->cfgI[axis] = currentPidProfile->pid[axis].I;
+        out->cfgD[axis] = currentPidProfile->pid[axis].D;
+        out->cfgF[axis] = currentPidProfile->pid[axis].F;
+    }
+    out->rcCommand[3] = rcCommand[THROTTLE];
+    out->pidDeltaUs = (uint32_t)getTaskDeltaTimeUs(TASK_PID);
+    out->gyroDeltaUs = (uint32_t)getTaskDeltaTimeUs(TASK_GYRO);
+    return 0;
+}
+
 void sitl_local_shutdown(void)
 {
+    if (gLocalRunning) {
+        extern void sitlLocalLogControlState(const char *tag);
+        sitlLocalLogControlState("shutdown");
+    }
     if (gMspThread != NULL) {
         InterlockedExchange(&gMspThreadStop, 1);
         WaitForSingleObject(gMspThread, 1000);
