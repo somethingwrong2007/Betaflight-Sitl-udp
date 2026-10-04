@@ -856,6 +856,38 @@ How it was pinned down:
 
 #### The RPM filter: it works, and what it costs
 
+**Root cause of the "enabling the RPM filter shakes" report: the host's dt.**
+The flight controller's virtual clock is a fixed grid - every filter and the
+PID's dt are designed for one sample period - but Unreal forwards its *jittery*
+async-physics frame time as the step size
+(`Pawn_Drone.cpp` passes `PhysicsDeltaTime` into `StepLocal()`, and the subsystem
+quantises it to 100 us: `DtUs = round(DeltaTimeSeconds * 1e4) * 100`). Wide
+filters tolerate that; the RPM filter's notches do not. Measured with the
+harness's `rpm-tone` mode (a 200 Hz tone at the motor frequency, `BF_SITL_DT_JITTER=1`
+reproduces the host's jitter):
+
+| step dt fed to the FC | RPM filter off | RPM filter on |
+| --- | --- | --- |
+| fixed 1000 us | tone passes (-2.7 dB) | **0.000 counts (-117 dB, a perfect null)** |
+| jittering 1000/1200/800/1100/900 us | tone passes | **9.6 counts (-23 dB, 4% leaks)** |
+
+A Q=5 notch is only +-20% wide, so a jittering sample interval moves it off the
+motor harmonic: it stops removing the vibration and instead sweeps its phase
+across the control band. That is why only the RPM filter trips the aircraft up,
+and why a Q=2.5-5 notch pair looks like a "phase margin" problem.
+
+Two fixes, both now in place:
+
+- **SITL side (default on)**: `sitl_local_step()` snaps a *near-grid* step onto
+  the FC's grid (`gyro.targetLooptime`) before advancing the virtual clock, so
+  host frame jitter cannot modulate the filters. A deliberately different host
+  rate (e.g. 2 kHz feeding 500 us) deviates far more than the 30% window and is
+  passed through untouched; `BF_SITL_DT_SNAP=0` disables the snap. With the snap
+  on, the jittering-dt run above measures -117 dB again.
+- **Host side (recommended)**: pass a fixed `1000` us to `sitl_local_step()` -
+  the FC's clock is its own grid, and the physics delta belongs to the plant.
+  The keep-alive path already does this (`StepLocalKeepAlive(0.001)`).
+
 The RPM filter's master switch is the firmware's `useDshotTelemetry` flag, not
 the filter settings: `rpmFilterInit()` returns early - leaving the filter off
 for the whole run - while it is false, and the configurator *hides the entire

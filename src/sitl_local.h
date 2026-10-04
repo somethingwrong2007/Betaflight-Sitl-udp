@@ -91,8 +91,13 @@ typedef struct {
     uint8_t rpmHarmonics;
     uint8_t rpmMinHz;
     uint16_t rpmQ;
+    uint16_t rpmFadeRangeHz;
+    uint16_t rpmLpfHz;
     uint8_t rpmWeight[3];
     float cycleTimeMultiplier;
+    // The RPM exactly as the host sent it (before the firmware-style lowpass),
+    // so an input-data problem is visible next to what the filter derived.
+    float rpmRawMotorHz[4];
 } sitl_local_loop_state_t;
 
 #ifdef __cplusplus

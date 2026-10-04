@@ -977,6 +977,8 @@ int sitl_local_init(void)
     // (see wincompat.c's sitlLocalLogControlState).
     extern void sitlLocalLogControlState(const char *tag);
     sitlLocalLogControlState(gLocalBootCount == 1 ? "boot#1" : "boot#n");
+    extern void sitlLocalLogRpmLoops(void);
+    sitlLocalLogRpmLoops();
 
     gLocalRunning = true;
     gMspThreadStop = 0;
@@ -1286,6 +1288,44 @@ void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
     extern uint64_t micros64_real(void);
     const uint64_t stepStartUs = micros64_real();
 
+    // The flight controller's virtual clock is a fixed grid: every filter and
+    // the PID's dt are designed for one sample period. A host that forwards its
+    // own *jittery* frame time (Unreal's async physics delta quantised to 100 us
+    // is the case this was found with) modulates the sample interval instead of
+    // running the FC at its configured rate. Wide filters tolerate that; the RPM
+    // filter's Q=5 notches do not - they move off the motor harmonics, so they
+    // stop removing the vibration and sweep across the control band instead
+    // (measured: a 200 Hz tone at the motor frequency is attenuated -117 dB on a
+    // fixed 1 ms grid and only -23 dB with a host-like +/-20% dt jitter).
+    //
+    // Snap a *near-grid* step onto the grid; an intentionally different rate
+    // (e.g. a 2 kHz host feeding 500 us) deviates far more than the window and
+    // is passed through untouched. BF_SITL_DT_SNAP=0 disables it (the A/B knob
+    // the harness uses with BF_SITL_DT_JITTER).
+    uint32_t stepUs = dtUs;
+    extern uint32_t sitlLocalGyroGridUs(void);
+    const uint32_t gridUs = sitlLocalGyroGridUs();
+    {
+        const char *snapEnv = getenv("BF_SITL_DT_SNAP");
+        const bool snapEnabled = (snapEnv == NULL || snapEnv[0] == '\0' || snapEnv[0] != '0');
+        if (snapEnabled && gridUs > 0) {
+            const uint32_t nearest = ((dtUs + gridUs / 2) / gridUs) * gridUs;
+            const uint32_t diff = nearest > dtUs ? nearest - dtUs : dtUs - nearest;
+            if (nearest > 0 && diff * 10 <= gridUs * 3) {
+                if (nearest != dtUs) {
+                    static bool logged = false;
+                    if (!logged) {
+                        logged = true;
+                        sitlAuditLog("step dt %u us snapped to the FC grid (%u us): the host's "
+                                     "frame-time jitter must not modulate the filters",
+                                     (unsigned)dtUs, (unsigned)nearest);
+                    }
+                }
+                stepUs = nearest;
+            }
+        }
+    }
+
     // A configurator Save may have undone the pinned LOCAL runtime state; this
     // only rewrites flags/mode sources, so it also runs while armed.
     if (InterlockedCompareExchange(&gLocalRepinPending, 0, 0) != 0) {
@@ -1462,7 +1502,7 @@ void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
     // which the D term (delta/dt) turns into a high-frequency tremor. Carrying
     // the remainder keeps every step a whole quantum and the grid aligned.
     static uint32_t gStepRemainderUs = 0;
-    uint32_t remainingUs = dtUs + gStepRemainderUs;
+    uint32_t remainingUs = stepUs + gStepRemainderUs;
     const uint32_t quantumUs = 100;
     gStepRemainderUs = remainingUs % quantumUs;
     while (remainingUs >= quantumUs) {
@@ -1540,6 +1580,10 @@ int sitl_local_get_loop_state(sitl_local_loop_state_t *out)
     sitlLocalGetRpmFilterInfo(out->rpmMotorHz, out->rpmNotchHz, &out->rpmHarmonics,
                               &out->rpmMinHz, &out->rpmQ, out->rpmWeight,
                               &out->cycleTimeMultiplier);
+    extern void sitlLocalGetRpmRawMotorHz(float motorHz[4]);
+    extern void sitlLocalGetRpmFilterSettings(uint16_t *fadeRangeHz, uint16_t *lpfHz);
+    sitlLocalGetRpmRawMotorHz(out->rpmRawMotorHz);
+    sitlLocalGetRpmFilterSettings(&out->rpmFadeRangeHz, &out->rpmLpfHz);
     for (int axis = 0; axis < 3; axis++) {
         out->rcCommand[axis] = rcCommand[axis];
         out->pidP[axis] = pidData[axis].P;

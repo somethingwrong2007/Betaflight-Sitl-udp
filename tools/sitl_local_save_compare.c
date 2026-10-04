@@ -103,9 +103,30 @@ static double gRatePkPk = 0.0;    // plant roll rate peak-to-peak, same window
 static double gClosedMin[2] = { 0.0, 0.0 };   // { motor0, plant rate } min
 static double gClosedMax[2] = { 0.0, 0.0 };   // { motor0, plant rate } max
 
+// Step-period jitter: BF_SITL_DT_JITTER=1 feeds the FC a *varying* dt the way a
+// host that forwards its own (jittery) frame time does, instead of the fixed
+// 1 ms grid the LOCAL API is specified around. Every filter in the chain is
+// designed for one dt; the RPM filter's notches in particular are narrow, so a
+// varying sample interval moves them off the motor harmonic.
+static bool gStepDtJitter = false;
+static uint32_t gLastStepDtUs = 1000;
+
+static uint32_t nextStepDtUs(void)
+{
+    if (!gStepDtJitter) {
+        return 1000;
+    }
+    // Deterministic +/-20% pattern; the physics tick of a real engine jitters
+    // around this much and is quantized to 100 us by the host.
+    static const uint32_t pattern[] = { 1000, 1200, 800, 1100, 900, 1000, 1200, 800 };
+    return pattern[gStepCount % (sizeof(pattern) / sizeof(pattern[0]))];
+}
+
 static bool rawStep(const sitl_local_input_t *in, sitl_local_output_t *out)
 {
-    sitl_local_step(in, 1000, out);
+    const uint32_t dtUs = nextStepDtUs();
+    sitl_local_step(in, dtUs, out);
+    gLastStepDtUs = dtUs;
     gStepCount++;
     for (int m = 0; m < 4; m++) {
         gLastMotorsForPlant[m] = out->pwm_output_raw[m];
@@ -503,7 +524,12 @@ static void makeInput(int phase, uint16_t throttle, bool armHigh,
     // Pure-tone probe (RPM filter functional test): replace the roll rate with a
     // single sine, sticks centred, so only the filter chain shapes it.
     if (gToneHz > 0.0 && gToneActive) {
-        in->angular_velocity_rpy[0] = gToneAmp * sin(2.0 * M_PI * gToneHz * t);
+        // Phase it from the *flight controller's* clock, so the tone's frequency
+        // is exact in the FC's sample domain whatever dt the host feeds. A
+        // jittering dt then shows up purely as the filters running at the wrong
+        // rate (they are all designed for one dt).
+        const double fcTime = (double)sitl_local_time_us() * 1e-6;
+        in->angular_velocity_rpy[0] = gToneAmp * sin(2.0 * M_PI * gToneHz * fcTime);
         in->angular_velocity_rpy[1] = 0.0;
         in->angular_velocity_rpy[2] = 0.0;
     }
@@ -520,7 +546,8 @@ static void makeInput(int phase, uint16_t throttle, bool armHigh,
         const double yawTorque   = ((m[0] + m[1] + m[2]) / 3.0 - m[3]) * 0.5;
         const double torque[3] = { rollTorque, pitchTorque, yawTorque };
         for (int axis = 0; axis < 3; axis++) {
-            gPlantRate[axis] += 0.001 * (PLANT_GAIN * torque[axis] - gPlantRate[axis] / PLANT_TAU_S);
+            gPlantRate[axis] += (gLastStepDtUs * 1e-6)
+                              * (PLANT_GAIN * torque[axis] - gPlantRate[axis] / PLANT_TAU_S);
         }
         in->angular_velocity_rpy[0] = gPlantRate[0];
         in->angular_velocity_rpy[1] = gPlantRate[1];
@@ -1241,6 +1268,16 @@ int main(int argc, char **argv)
         }
         fprintf(stderr, "[harness] rpm-tone: %.1f Hz, %.2f rad/s\n", gToneHz, gToneAmp);
     }
+    // BF_SITL_DT_JITTER=1: feed the FC a varying dt (a host that forwards its
+    // own frame time) instead of the fixed 1 ms grid every filter is designed
+    // for. Applies to every mode.
+    {
+        const char *jitter = getenv("BF_SITL_DT_JITTER");
+        gStepDtJitter = (jitter != NULL && jitter[0] != '\0' && jitter[0] != '0');
+        if (gStepDtJitter) {
+            fprintf(stderr, "[harness] step dt JITTER enabled (1000/1200/800/1100/900 us)\n");
+        }
+    }
     // closed-loop: the gyro is the plant's own rate, not the scenario waveform.
     if (strcmp(mode, "closed-loop") == 0) {
         gClosedLoop = true;
@@ -1249,7 +1286,8 @@ int main(int argc, char **argv)
             gPlantGain = atof(gain);
         }
         fprintf(stderr, "[harness] closed-loop mode: gyro comes from the plant "
-                        "(gain %.4f rad/s per us)\n", gPlantGain);
+                        "(gain %.4f rad/s per us), step dt %s\n", gPlantGain,
+                gStepDtJitter ? "JITTERS (1000/1200/800/1100/900 us)" : "fixed 1000 us");
     }
 
     // Never touch the real EEPROM: the harness saves configurations (and the
@@ -1594,15 +1632,21 @@ int main(int argc, char **argv)
     {
         sitl_local_loop_state_t ls;
         if (sitl_local_get_loop_state(&ls) == 0) {
-            fprintf(stderr, "  rpm filter: harmonics=%u minHz=%u q=%u weights=%u/%u/%u "
-                            "motorHz=%.1f/%.1f/%.1f/%.1f notchHz=%.1f/%.1f/%.1f cycleMult=%.4f\n",
+            fprintf(stderr, "  rpm filter: harmonics=%u minHz=%u q=%u fade=%u lpf=%u "
+                            "weights=%u/%u/%u cycleMult=%.4f\n",
                     (unsigned)ls.rpmHarmonics, (unsigned)ls.rpmMinHz, (unsigned)ls.rpmQ,
+                    (unsigned)ls.rpmFadeRangeHz, (unsigned)ls.rpmLpfHz,
                     (unsigned)ls.rpmWeight[0], (unsigned)ls.rpmWeight[1],
                     (unsigned)ls.rpmWeight[2],
+                    (double)ls.cycleTimeMultiplier);
+            fprintf(stderr, "  rpm input : raw rpm/60 = %.1f/%.1f/%.1f/%.1f Hz (host data), "
+                            "filtered = %.1f/%.1f/%.1f/%.1f Hz -> notches %.0f/%.0f/%.0f Hz\n",
+                    (double)ls.rpmRawMotorHz[0], (double)ls.rpmRawMotorHz[1],
+                    (double)ls.rpmRawMotorHz[2], (double)ls.rpmRawMotorHz[3],
                     (double)ls.rpmMotorHz[0], (double)ls.rpmMotorHz[1],
                     (double)ls.rpmMotorHz[2], (double)ls.rpmMotorHz[3],
                     (double)ls.rpmNotchHz[0], (double)ls.rpmNotchHz[1],
-                    (double)ls.rpmNotchHz[2], (double)ls.cycleTimeMultiplier);
+                    (double)ls.rpmNotchHz[2]);
         }
     }
 

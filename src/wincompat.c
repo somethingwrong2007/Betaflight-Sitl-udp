@@ -420,6 +420,70 @@ void sitlLocalGetGyroChainState(float sampleSum[3], float *lpf1State, float *lpf
 // Notch frequencies the RPM filter is using right now (motor 0's harmonics), for
 // the 1 kHz burst recorder: a shake that lines up with one of these, and the RPM
 // behind it, is what tells a filter problem from a tuning problem.
+// The FC's configured gyro/PID grid period, for sitl_local_step's de-jitter snap
+// (sensors/gyro.h is not includable from sitl_local.c).
+uint32_t sitlLocalGyroGridUs(void)
+{
+#ifdef SITL_LOCAL
+    return gyro.targetLooptime ? gyro.targetLooptime : 1000;
+#else
+    return 1000;
+#endif
+}
+
+// The RPM the host actually sent (before the firmware-style lowpass), for the
+// input-data view.
+void sitlLocalGetRpmRawMotorHz(float motorHz[4])
+{
+#ifdef SITL_LOCAL
+    extern float simTelemetryMotorFrequencyHz(uint8_t motorIndex);
+    for (int m = 0; m < 4; m++) {
+        motorHz[m] = simTelemetryMotorFrequencyHz((uint8_t)m);
+    }
+#else
+    UNUSED(motorHz);
+#endif
+}
+
+// RPM filter settings as the firmware has them, for the diagnostics: fade range
+// and weights decide whether a clamped harmonic is applied as a false notch.
+void sitlLocalGetRpmFilterSettings(uint16_t *fadeRangeHz, uint16_t *lpfHz)
+{
+#ifdef SITL_LOCAL
+    if (fadeRangeHz) { *fadeRangeHz = rpmFilterConfig()->rpm_filter_fade_range_hz; }
+    if (lpfHz)       { *lpfHz = rpmFilterConfig()->rpm_filter_lpf_hz; }
+#else
+    UNUSED(fadeRangeHz);
+    UNUSED(lpfHz);
+#endif
+}
+
+// The other firmware loops that consume the bridged RPM and are gated by the
+// same bidirectional-DShot flag: dynamic idle (per profile) and the RPM limiter
+// (mixer config). If either is configured, the *input* RPM drives a feedback
+// loop whose behaviour depends entirely on how realistic that data is.
+void sitlLocalLogRpmLoops(void)
+{
+#ifdef SITL_LOCAL
+#ifdef USE_RPM_LIMIT
+    const unsigned rpmLimit = mixerConfig()->rpm_limit ? 1 : 0;
+    const unsigned rpmLimitValue = mixerConfig()->rpm_limit_value;
+    const unsigned rpmLimitP = mixerConfig()->rpm_limit_p;
+    const unsigned rpmLimitI = mixerConfig()->rpm_limit_i;
+    const unsigned rpmLimitD = mixerConfig()->rpm_limit_d;
+#else
+    const unsigned rpmLimit = 0, rpmLimitValue = 0, rpmLimitP = 0, rpmLimitI = 0, rpmLimitD = 0;
+#endif
+    sitlAuditLog("rpm loops: dyn_idle_min_rpm=%u gains=%u/%u/%u "
+                 "rpm_limit=%u value=%u gains=%u/%u/%u",
+                 (unsigned)currentPidProfile->dyn_idle_min_rpm,
+                 (unsigned)currentPidProfile->dyn_idle_p_gain,
+                 (unsigned)currentPidProfile->dyn_idle_i_gain,
+                 (unsigned)currentPidProfile->dyn_idle_d_gain,
+                 rpmLimit, rpmLimitValue, rpmLimitP, rpmLimitI, rpmLimitD);
+#endif
+}
+
 void sitlLocalGetRpmNotchHz(float notchHz[3])
 {
 #ifdef SITL_LOCAL
@@ -451,6 +515,7 @@ void sitlLocalGetRpmFilterInfo(float motorHz[4], float notchHz[3], uint8_t *harm
 #ifdef SITL_LOCAL
     extern float getMotorFrequencyHz(uint8_t motorIndex);
     extern float schedulerGetCycleTimeMultiplier(void);
+    extern float simTelemetryMotorFrequencyHz(uint8_t motorIndex);
     const rpmFilterConfig_t *cfg = rpmFilterConfig();
     const uint8_t numHarmonics = cfg->rpm_filter_harmonics;
     const float maxHz = 0.48f * 1e6f / (float)gyro.targetLooptime;
