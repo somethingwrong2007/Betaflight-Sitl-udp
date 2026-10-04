@@ -82,6 +82,17 @@ typedef struct {
     uint8_t cfgP[3], cfgI[3], cfgD[3], cfgF[3];
     uint32_t cfgPidPtr, pgPidPtr;   // currentPidProfile vs the PG record
     uint8_t cfgPidIndex, pgRollP;
+    // RPM filter as the firmware sees it: per-motor mechanical frequency that
+    // feeds the notches, the notch frequencies it ends up using (motor 0, all
+    // harmonics), the config it derives them from, and the scheduler's dt
+    // compensation factor.
+    float rpmMotorHz[4];
+    float rpmNotchHz[3];
+    uint8_t rpmHarmonics;
+    uint8_t rpmMinHz;
+    uint16_t rpmQ;
+    uint8_t rpmWeight[3];
+    float cycleTimeMultiplier;
 } sitl_local_loop_state_t;
 
 #ifdef __cplusplus

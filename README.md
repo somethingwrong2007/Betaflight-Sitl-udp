@@ -854,6 +854,77 @@ How it was pinned down:
 
 #### Control-loop diagnostics
 
+#### The RPM filter: it works, and what it costs
+
+The RPM filter is *not* broken - measured with the harness's `rpm-tone` mode,
+which feeds a pure sine at the motor fundamental into the roll gyro and compares
+what feeds the filter chain (the LPF2/downsample output) with what reaches the
+PID (`gyroADCf`):
+
+```
+sitl_local_save_compare rpm-tone roll-step 200      # 200 Hz = 12000 rpm
+
+rpm filter as configured      input 136.486 counts -> pid   0.000 counts (-119.0 dB)
+rpm filter off (harmonics 0)  input 136.486 counts -> pid 100.347 counts (  -2.7 dB)
+rpm filter restored           input 136.486 counts -> pid   0.000 counts (-120.5 dB)
+```
+
+The notch bank sits exactly on the motor harmonic (a perfect null), passes
+everything else with only the normal lowpass attenuation, and follows the
+configurator live (the mode flips `rpm_filter_harmonics` through
+`MSP_SET_FILTER_CONFIG`, i.e. the same path the Filters tab uses). The bridge's
+units are right as well: Betaflight's `getMotorFrequencyHz()` is the *mechanical*
+rotation frequency (`erpmToHz = ERPM_PER_LSB / 60 / (poles/2)`), and the bridge
+feeds `rpm / 60`, so the notches land on `harmonic * motorHz` as intended (the
+loop-state diagnostic prints them: `notchHz=200/400/480` for a 12000 rpm feed).
+
+What the filter costs is phase, and at a 1 kHz loop that is the whole story:
+each notch is a full-depth (weight 100%) band-stop, so a bank of 4 motors x 3
+harmonics sitting at 150..480 Hz eats phase in the 100..200 Hz band where the
+control loop's margin lives. `tools/rpm_notch_response.py` reproduces the exact
+`rpmNotchApply()` recurrence and prints the numbers:
+
+| notch bank (4 motors) | phase at 120 Hz |
+| --- | --- |
+| 12000 rpm feed (200/400/480 Hz per motor) | -67 deg |
+| same, dropping the harmonics BF has to clamp | -66 deg |
+| 15000 rpm (250 Hz) + clamped 480 Hz | -25 deg |
+| 33000 rpm, all harmonics clamped to 480 Hz | -3 deg |
+| RPM filter off | 0 deg |
+
+Two consequences worth knowing:
+
+- At a 1 kHz loop `rpmFilter.maxHz = 0.48/looptimeUs = 480 Hz`, so any harmonic
+  above that is *clamped* to 480 Hz (0.96 Nyquist): it cannot filter anything the
+  1 kHz-sampled gyro can represent, but it still costs phase. Betaflight's
+  configurator warns about exactly this ("RPM filter harmonics above the Nyquist
+  frequency - increase the PID loop frequency"). This is a property of the loop
+  rate, not of the bridge.
+- A real gyro sees motor vibration at those harmonics, which is what the filter
+  removes; a rigid-body simulation's gyro is clean, so the filter has nothing to
+  remove and only the phase cost remains. With a default tune at 1 kHz (about
+  -65 deg of delay-induced phase at 120 Hz) a -25..-67 deg notch bank is enough
+  to tip the loop into a sustained ~100..150 Hz oscillation.
+
+**Bridge gap fixed here:** Betaflight's `getMotorFrequencyHz()` does not return
+the raw RPM - `dshotTelemetryProcess()` lowpass-filters it with
+`rpm_filter_lpf_hz` (default 150 Hz, dt = `gyro.targetLooptime`) before the RPM
+filter, the OSD and the dynamic idle use it. The bridge returned the raw value,
+so the notch frequencies tracked every PID-driven RPM change. The same LPF is now
+applied in the bridge (`sitlSimMotorFreqLpf*` in `src/wincompat.c`, rebuilt
+whenever `gyro.targetLooptime` changes).
+
+To make an RPM-related shake diagnosable from a single flight, the 1 kHz burst
+recorder now also writes `rpm0..rpm3`, the three notch frequencies it derives and
+the filtered gyro (`gyroADCfR/P/Y`) after the PID terms - so the oscillation
+frequency can be matched against the notch bank and the RPM behind it.
+
+The harness also has a `closed-loop` mode that closes the loop around a
+first-order plant (rate = motor differential through a 25 ms lag, with the RPM
+derived from the motor outputs like Unreal's ESC model); at every plant gain
+tried the RPM filter did *not* push that simple loop into a limit cycle, which is
+why the flight-test data above matters for reproducing the reported shake.
+
 `sitl_local_get_loop_state()` (see `src/sitl_local.h`) returns a per-step snapshot
 of the signals that drive the rate loop: the scaled and filtered gyro, the stick
 setpoint in RC units, every PID term, the measured loop periods, the gyro filter

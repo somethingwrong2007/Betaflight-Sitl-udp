@@ -393,8 +393,8 @@ void sitlLocalGetGyroState(float scaled[3], float filtered[3])
 {
 #ifdef SITL_LOCAL
     for (int axis = 0; axis < 3; axis++) {
-        scaled[axis] = gyro.gyroADC[axis];
-        filtered[axis] = gyro.gyroADCf[axis];
+        if (scaled)   { scaled[axis] = gyro.gyroADC[axis]; }
+        if (filtered) { filtered[axis] = gyro.gyroADCf[axis]; }
     }
 #else
     UNUSED(scaled);
@@ -414,6 +414,64 @@ void sitlLocalGetGyroChainState(float sampleSum[3], float *lpf1State, float *lpf
     UNUSED(sampleSum);
     UNUSED(lpf1State);
     UNUSED(lpf2State);
+#endif
+}
+
+// Notch frequencies the RPM filter is using right now (motor 0's harmonics), for
+// the 1 kHz burst recorder: a shake that lines up with one of these, and the RPM
+// behind it, is what tells a filter problem from a tuning problem.
+void sitlLocalGetRpmNotchHz(float notchHz[3])
+{
+#ifdef SITL_LOCAL
+    extern float getMotorFrequencyHz(uint8_t motorIndex);
+    const uint8_t harmonics = rpmFilterConfig()->rpm_filter_harmonics;
+    const float minHz = rpmFilterConfig()->rpm_filter_min_hz;
+    const float maxHz = 0.48f * 1e6f / (float)(gyro.targetLooptime ? gyro.targetLooptime : 1000);
+    const float f0 = getMotorFrequencyHz(0);
+    for (int h = 0; h < 3; h++) {
+        float f = (h < harmonics) ? (float)(h + 1) * f0 : 0.0f;
+        if (f < minHz) { f = minHz; }
+        if (f > maxHz) { f = maxHz; }
+        notchHz[h] = f;
+    }
+#else
+    UNUSED(notchHz);
+#endif
+}
+
+// What the RPM filter actually does: the per-motor mechanical frequency the
+// bridge hands it, the notch frequency it derives (clamped to minHz..0.48*1/dt),
+// the config behind it, and the scheduler's dt compensation. A notch that ends
+// up inside the control band (or all of them clamped to one frequency near
+// Nyquist) is visible here.
+void sitlLocalGetRpmFilterInfo(float motorHz[4], float notchHz[3], uint8_t *harmonics,
+                               uint8_t *minHz, uint16_t *q, uint8_t weight[3],
+                               float *cycleTimeMultiplier)
+{
+#ifdef SITL_LOCAL
+    extern float getMotorFrequencyHz(uint8_t motorIndex);
+    extern float schedulerGetCycleTimeMultiplier(void);
+    const rpmFilterConfig_t *cfg = rpmFilterConfig();
+    const uint8_t numHarmonics = cfg->rpm_filter_harmonics;
+    const float maxHz = 0.48f * 1e6f / (float)gyro.targetLooptime;
+
+    for (int m = 0; m < 4; m++) {
+        motorHz[m] = getMotorFrequencyHz((uint8_t)m);
+    }
+    for (int h = 0; h < 3; h++) {
+        float f = (float)(h + 1) * motorHz[0];
+        if (f < (float)cfg->rpm_filter_min_hz) { f = (float)cfg->rpm_filter_min_hz; }
+        if (f > maxHz) { f = maxHz; }
+        notchHz[h] = f;
+        weight[h] = h < RPM_FILTER_HARMONICS_MAX ? cfg->rpm_filter_weights[h] : 0;
+    }
+    if (harmonics) { *harmonics = numHarmonics; }
+    if (minHz)  { *minHz = cfg->rpm_filter_min_hz; }
+    if (q)      { *q = cfg->rpm_filter_q; }
+    if (cycleTimeMultiplier) { *cycleTimeMultiplier = schedulerGetCycleTimeMultiplier(); }
+#else
+    UNUSED(motorHz); UNUSED(notchHz); UNUSED(harmonics); UNUSED(minHz); UNUSED(q);
+    UNUSED(weight); UNUSED(cycleTimeMultiplier);
 #endif
 }
 
@@ -847,6 +905,31 @@ static float sitlSimMotorHz(uint8_t motorIndex)
     return simTelemetryMotorFrequencyHz(motorIndex);
 }
 
+// The firmware's getMotorFrequencyHz() does not return the raw RPM: dshot.c's
+// dshotTelemetryProcess() lowpass-filters it with rpm_filter_lpf_hz (default
+// 150 Hz, dt = gyro.targetLooptime) before the RPM filter, the OSD and the
+// dynamic idle use it. The bridge used to hand the RPM filter the raw value, so
+// its notch frequencies tracked every PID-driven RPM change instead of the
+// smoothed estimate a real FC works from. Rebuild the same filter here (lazily,
+// because gyro.targetLooptime is only known after the boot's initPhase3).
+static pt1Filter_t gSimMotorFreqLpf[SITL_SIM_MOTOR_COUNT];
+static uint32_t gSimMotorFreqLpfLooptimeUs = 0;
+static bool gSimMotorFreqLpfReady = false;
+
+static void sitlSimMotorFreqLpfInit(void)
+{
+    const uint32_t looptimeUs = gyro.targetLooptime ? gyro.targetLooptime : 1000;
+    if (gSimMotorFreqLpfReady && gSimMotorFreqLpfLooptimeUs == looptimeUs) {
+        return;
+    }
+    const float gain = pt1FilterGain(rpmFilterConfig()->rpm_filter_lpf_hz, looptimeUs * 1e-6f);
+    for (int i = 0; i < SITL_SIM_MOTOR_COUNT; i++) {
+        pt1FilterInit(&gSimMotorFreqLpf[i], gain);
+    }
+    gSimMotorFreqLpfLooptimeUs = looptimeUs;
+    gSimMotorFreqLpfReady = true;
+}
+
 float getDshotRpm(uint8_t motorIndex)
 {
     const float hz = sitlSimMotorHz(motorIndex);
@@ -913,7 +996,12 @@ void sitlLocalApplyDshotTelemetry(void)
 float getMotorFrequencyHz(uint8_t motorIndex)
 {
     const float hz = sitlSimMotorHz(motorIndex);
-    return hz > 0.0f ? hz : sitlMotorFrequencyHzReal(motorIndex);
+    const float raw = hz > 0.0f ? hz : sitlMotorFrequencyHzReal(motorIndex);
+    if (motorIndex >= SITL_SIM_MOTOR_COUNT) {
+        return raw;
+    }
+    sitlSimMotorFreqLpfInit();
+    return pt1FilterApply(&gSimMotorFreqLpf[motorIndex], raw);
 }
 
 float getMinMotorFrequencyHz(void)

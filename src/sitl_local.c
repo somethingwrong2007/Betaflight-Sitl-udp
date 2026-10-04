@@ -241,14 +241,26 @@ static bool localBurstLog(void)
         }
         fprintf(fp, "# t_us gyroR gyroP gyroY pR pP pY iR iP iY dR dP dY fR fP fY "
                     "sumR sumP sumY m0 m1 m2 m3 attR attP attY modes armFlags "
-                    "pidDeltaUs gyroDeltaUs\n");
+                    "pidDeltaUs gyroDeltaUs rpm0 rpm1 rpm2 rpm3 notch1 notch2 notch3 "
+                    "gyroADCfR gyroADCfP gyroADCfY\n");
         stepsSinceBurst = 0;
         burstStep = 0;
     }
 
+    extern void sitlLocalGetRpmNotchHz(float notchHz[3]);
+    float notchHz[3] = { 0.0f, 0.0f, 0.0f };
+    sitlLocalGetRpmNotchHz(notchHz);
+    float rpmHz[4];
+    float gyroADCf[3];
+    extern void sitlLocalGetGyroState(float scaled[3], float filtered[3]);
+    sitlLocalGetGyroState(NULL, gyroADCf);
+    for (int i = 0; i < 4; i++) {
+        rpmHz[i] = getMotorFrequencyHz((uint8_t)i);
+    }
+
     fprintf(fp, "%.0f %.1f %.1f %.1f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f "
                 "%.2f %.2f %.2f %.2f %.2f %.2f %.0f %.0f %.0f %.0f %d %d %d %04X %08X "
-                "%d %d\n",
+                "%d %d %.1f %.1f %.1f %.1f %.0f %.0f %.0f %.2f %.2f %.2f\n",
             (double)micros64(),
             (double)gLocalLastGyroRaw[0], (double)gLocalLastGyroRaw[1],
             (double)gLocalLastGyroRaw[2],
@@ -261,7 +273,10 @@ static bool localBurstLog(void)
             (double)gLocalLastMotors[2], (double)gLocalLastMotors[3],
             (int)attitude.values.roll, (int)attitude.values.pitch, (int)attitude.values.yaw,
             (unsigned)flightModeFlags, (unsigned)getArmingDisableFlags(),
-            (int)getTaskDeltaTimeUs(TASK_PID), (int)getTaskDeltaTimeUs(TASK_GYRO));
+            (int)getTaskDeltaTimeUs(TASK_PID), (int)getTaskDeltaTimeUs(TASK_GYRO),
+            (double)rpmHz[0], (double)rpmHz[1], (double)rpmHz[2], (double)rpmHz[3],
+            (double)notchHz[0], (double)notchHz[1], (double)notchHz[2],
+            (double)gyroADCf[0], (double)gyroADCf[1], (double)gyroADCf[2]);
 
     if (++burstStep >= SITL_BURST_STEPS) {
         fclose(fp);
@@ -1496,6 +1511,12 @@ int sitl_local_get_loop_state(sitl_local_loop_state_t *out)
                                            uint8_t *pgRollP);
     sitlLocalGetPidProfileInfo(&out->cfgPidPtr, &out->pgPidPtr, &out->cfgPidIndex,
                                &out->pgRollP);
+    extern void sitlLocalGetRpmFilterInfo(float motorHz[4], float notchHz[3],
+                                          uint8_t *harmonics, uint8_t *minHz, uint16_t *q,
+                                          uint8_t weight[3], float *cycleTimeMultiplier);
+    sitlLocalGetRpmFilterInfo(out->rpmMotorHz, out->rpmNotchHz, &out->rpmHarmonics,
+                              &out->rpmMinHz, &out->rpmQ, out->rpmWeight,
+                              &out->cycleTimeMultiplier);
     for (int axis = 0; axis < 3; axis++) {
         out->rcCommand[axis] = rcCommand[axis];
         out->pidP[axis] = pidData[axis].P;

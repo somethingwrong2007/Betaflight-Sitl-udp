@@ -86,10 +86,30 @@ static uint64_t gStepCount = 0;
 // is anchored to the init, so traces are padded relative to this.
 static uint64_t gStepBase = 0;
 
+// --- closed-loop plant --------------------------------------------------------
+// `closed-loop` closes the harness around a deliberately simple aircraft model:
+// the body rate is a first-order lag driven by the motor differential (the same
+// differential the firmware's mixer produces), so the FC sees its own motor
+// output instead of a prescribed waveform. That is what turns a phase-margin
+// problem into the visible symptom: a sustained limit cycle.
+#define PLANT_TAU_S      0.025   // 25 ms rate response
+static double gPlantGain = 0.017;   // rad/s per us of motor differential
+#define PLANT_GAIN       gPlantGain
+static bool gClosedLoop = false;
+static double gPlantRate[3] = { 0.0, 0.0, 0.0 };
+static float gLastMotorsForPlant[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+static double gPlantPkPk = 0.0;   // motor 0 peak-to-peak over the last 500 steps
+static double gRatePkPk = 0.0;    // plant roll rate peak-to-peak, same window
+static double gClosedMin[2] = { 0.0, 0.0 };   // { motor0, plant rate } min
+static double gClosedMax[2] = { 0.0, 0.0 };   // { motor0, plant rate } max
+
 static bool rawStep(const sitl_local_input_t *in, sitl_local_output_t *out)
 {
     sitl_local_step(in, 1000, out);
     gStepCount++;
+    for (int m = 0; m < 4; m++) {
+        gLastMotorsForPlant[m] = out->pwm_output_raw[m];
+    }
     return out->armed;
 }
 
@@ -146,7 +166,7 @@ static const scenario_t *gScenario = &gScenarios[0];
 // The motor sum alone cannot say *which* part of the loop moved. Capture the
 // signals that feed it (stick setpoint, filtered gyro, each PID term) for both
 // traces, so a divergence can be attributed.
-#define TRACE_SIGNALS 23
+#define TRACE_SIGNALS 28
 static const char *const gSignalNames[TRACE_SIGNALS] = {
     "gyroADCf[roll]", "gyroADC[roll]", "rcCommand[roll]",
     "pidP[roll]", "pidI[roll]", "pidD[roll]", "pidF[roll]", "pidSum[roll]",
@@ -155,6 +175,7 @@ static const char *const gSignalNames[TRACE_SIGNALS] = {
     "sampleSum[roll]", "sampleSum[pitch]", "lpf1State", "lpf2State",
     "lpf1K",
     "cfgP[roll]", "cfgI[roll]", "cfgD[roll]", "cfgF[roll]",
+    "rpmNotch1Hz", "rpmNotch2Hz", "rpmNotch3Hz", "rpmMotorHz", "cycleMult",
 };
 static float gSigA[SCENARIO_STEPS][TRACE_SIGNALS];
 static float gSigB[SCENARIO_STEPS][TRACE_SIGNALS];
@@ -191,6 +212,11 @@ static void captureSignals(int index)
     row[20] = (float)ls.cfgI[0];
     row[21] = (float)ls.cfgD[0];
     row[22] = (float)ls.cfgF[0];
+    row[23] = ls.rpmNotchHz[0];
+    row[24] = ls.rpmNotchHz[1];
+    row[25] = ls.rpmNotchHz[2];
+    row[26] = ls.rpmMotorHz[0];
+    row[27] = ls.cycleTimeMultiplier;
 }
 
 // Which loop signal moved first? The motor mix is the last stage; the signal
@@ -247,6 +273,18 @@ static void compareSignals(const char *label, float a[][TRACE_SIGNALS],
 // them centred (and the throttle at the requested low value) so the firmware's
 // arming rules and the runaway-takeoff deactivation are not disturbed.
 static bool gScenarioActive = false;
+
+// --- pure-tone probe for the RPM filter --------------------------------------
+// When set, the roll gyro carries a pure sine at this frequency (in Hz) instead
+// of the scenario's rate waveform, and the sticks stay centred. Comparing what
+// reaches the PID (gyroADCf) against what feeds the chain (sampleSum, the
+// downsample output) with the RPM filter enabled and disabled is a direct
+// functional test: the notches must sit on the motor harmonics.
+static double gToneHz = 0.0;
+static double gToneAmp = 3.0;     // rad/s on the roll axis (~170 dps)
+static double gTraceAmpIn = 0.0;  // max |sampleSum[roll]|, second half of a trace
+static double gTraceAmpOut = 0.0; // max |gyroADCf[roll]|, second half of a trace
+
 
 // Set while a save is performed with every non-ARM AUX channel high, i.e. with
 // whatever modes the configurator has bound there active (ANGLE, HORIZON,
@@ -458,11 +496,47 @@ static void makeInput(int phase, uint16_t throttle, bool armHigh,
     in->angular_velocity_rpy[2] = axisRateTarget(2, &gScenario->yaw, phase)
                                 + gNoiseScale * 0.03 * sin(2.0 * M_PI * 13.0 * t);
 
+    // Pure-tone probe (RPM filter functional test): replace the roll rate with a
+    // single sine, sticks centred, so only the filter chain shapes it.
+    if (gToneHz > 0.0) {
+        in->angular_velocity_rpy[0] = gToneAmp * sin(2.0 * M_PI * gToneHz * t);
+        in->angular_velocity_rpy[1] = 0.0;
+        in->angular_velocity_rpy[2] = 0.0;
+    }
+
+    // Closed-loop plant: the gyro is the model's own rate, driven by the motor
+    // differential the FC produced on the previous step.
+    if (gClosedLoop) {
+        // QUADX motor layout (Betaflight mixerQuadX): 0 REAR_R, 1 FRONT_R,
+        // 2 REAR_L, 3 FRONT_L. A positive roll PID demand raises the left
+        // motors, so the resulting roll acceleration is (left - right).
+        const float *m = gLastMotorsForPlant;
+        const double rollTorque  = (m[2] + m[3]) - (m[0] + m[1]);
+        const double pitchTorque = (m[1] + m[2]) - (m[0] + m[3]);
+        const double yawTorque   = ((m[0] + m[1] + m[2]) / 3.0 - m[3]) * 0.5;
+        const double torque[3] = { rollTorque, pitchTorque, yawTorque };
+        for (int axis = 0; axis < 3; axis++) {
+            gPlantRate[axis] += 0.001 * (PLANT_GAIN * torque[axis] - gPlantRate[axis] / PLANT_TAU_S);
+        }
+        in->angular_velocity_rpy[0] = gPlantRate[0];
+        in->angular_velocity_rpy[1] = gPlantRate[1];
+        in->angular_velocity_rpy[2] = gPlantRate[2];
+    }
+
     // Plausible telemetry so the RPM bridge has something to work on.
     in->motor_rpm[0] = 12000.0;
     in->motor_rpm[1] = 11000.0;
     in->motor_rpm[2] = 10000.0;
     in->motor_rpm[3] = 9000.0;
+    // In closed-loop mode the RPM is derived from the motor output the FC just
+    // produced, exactly like Unreal's ESC model (RPM = KV * duty) - so the RPM
+    // filter's notch frequencies track the PID output and jitter with it, which
+    // is what makes the missing RPM lowpass visible.
+    if (gClosedLoop) {
+        for (int i = 0; i < 4; i++) {
+            in->motor_rpm[i] = 24000.0 * (gLastMotorsForPlant[i] - 1000.0f) / 1000.0;
+        }
+    }
     in->motor_temperature[0] = in->motor_temperature[1] = 30.0;
     in->motor_temperature[2] = in->motor_temperature[3] = 30.0;
 }
@@ -542,10 +616,24 @@ static void runTrace(float trace[SCENARIO_STEPS][4], uint8_t *motorCount,
     float lo = 1e9f;
     float hi = -1e9f;
     int saturated = 0;
+    gClosedMin[0] = gClosedMin[1] = 1e9;
+    gClosedMax[0] = gClosedMax[1] = -1e9;
 
     for (int phase = 0; phase < SCENARIO_STEPS; phase++) {
         bool armed = stepWith(phase, TRACE_THROTTLE, true, trace[phase], motorCount);
         captureSignals(phase);
+        if (gToneHz > 0.0 && phase >= SCENARIO_STEPS / 2) {
+            const double inAmp = fabs((double)gSigTarget[phase][14]);
+            const double outAmp = fabs((double)gSigTarget[phase][0]);
+            if (inAmp > gTraceAmpIn) { gTraceAmpIn = inAmp; }
+            if (outAmp > gTraceAmpOut) { gTraceAmpOut = outAmp; }
+        }
+        if (gClosedLoop && phase >= SCENARIO_STEPS - 500) {
+            if (trace[phase][0] < gClosedMin[0]) { gClosedMin[0] = trace[phase][0]; }
+            if (trace[phase][0] > gClosedMax[0]) { gClosedMax[0] = trace[phase][0]; }
+            if (gPlantRate[0] < gClosedMin[1]) { gClosedMin[1] = gPlantRate[0]; }
+            if (gPlantRate[0] > gClosedMax[1]) { gClosedMax[1] = gPlantRate[0]; }
+        }
         if (armed) {
             *armedEver = true;
         }
@@ -563,6 +651,8 @@ static void runTrace(float trace[SCENARIO_STEPS][4], uint8_t *motorCount,
     }
     rangeOut[0] = lo;
     rangeOut[1] = hi;
+    gPlantPkPk = gClosedMax[0] - gClosedMin[0];
+    gRatePkPk = gClosedMax[1] - gClosedMin[1];
     fprintf(stderr, "   (saturated on at least one motor: %.1f%% of the scenario)\n",
             100.0 * saturated / SCENARIO_STEPS);
 }
@@ -859,6 +949,48 @@ static uint8_t gCfgGetCmd = 0;
 static uint8_t gCfgSetCmd = 0;
 static const char *gCfgName = "";
 
+static void printClosedLoopResult(const char *tag)
+{
+    fprintf(stderr, "[closed-loop] %-34s residual motor0 pk-pk %8.2f us, "
+                    "roll rate pk-pk %7.3f rad/s\n",
+            tag, gPlantPkPk, gRatePkPk);
+}
+
+// --- RPM filter functional test -------------------------------------------------
+// `rpm-tone`: feed a pure sine at the motor fundamental into the roll gyro and
+// compare what reaches the PID (gyroADCf) with what feeds the filter chain
+// (sampleSum, the LPF2/downsample output) with the RPM filter enabled and
+// disabled. If the notch bank sits on the motor harmonics the tone must be
+// crushed with the filter on and pass with it off - a direct check of "does the
+// RPM filter do anything", independent of the loop's tuning.
+static void printToneAmps(const char *tag)
+{
+    const double attIn = gTraceAmpIn > 0.01 ? 20.0 * log10(gTraceAmpOut / gTraceAmpIn) : 0.0;
+    fprintf(stderr, "[rpm-tone] %-34s input(chain) %8.3f counts -> pid(gyroADCf) "
+                    "%8.3f counts  (%.1f dB)\n",
+            tag, gTraceAmpIn, gTraceAmpOut, attIn);
+}
+
+// Flip rpm_filter_harmonics through the configurator's own MSP path (the filter
+// config block, byte 43 - see the MSP_FILTER_CONFIG layout in msp.c) so the
+// firmware rebuilds the notch bank exactly like the configurator would.
+static void setRpmHarmonicsViaMsp(int harmonics, const char *tag)
+{
+    uint8_t cfg[MSP_MAX_PAYLOAD];
+    const int len = mspRequest(MSP_FILTER_CONFIG, NULL, 0, cfg, sizeof(cfg), 2000);
+    if (len < 44) {
+        fprintf(stderr, "[rpm-tone] could not read the filter config (%d bytes)\n", len);
+        return;
+    }
+    cfg[43] = (uint8_t)harmonics;
+    (void)mspRequest(MSP_SET_FILTER_CONFIG, cfg, (uint8_t)len, NULL, 0, 2000);
+    sitl_local_loop_state_t ls;
+    if (sitl_local_get_loop_state(&ls) == 0) {
+        fprintf(stderr, "[rpm-tone] %s: rpm_filter_harmonics=%u (config now reports %u)\n",
+                tag, (unsigned)harmonics, (unsigned)ls.rpmHarmonics);
+    }
+}
+
 // What the *loop* sees, straight from currentPidProfile: an MSP write that the
 // firmware stores but never applies shows up here.
 static void printLoopGains(const char *tag)
@@ -1094,6 +1226,25 @@ int main(int argc, char **argv)
         gCfgOnly = atoi(argv[3]);
         fprintf(stderr, "[harness] configurator block filter=%d\n", gCfgOnly);
     }
+    // rpm-tone: optional tone frequency / amplitude (defaults: the motor
+    // fundamental of the RPM the harness feeds, 12000 rpm -> 200 Hz).
+    if (strcmp(mode, "rpm-tone") == 0) {
+        gToneHz = (argc > 4) ? atof(argv[4]) : 200.0;
+        if (argc > 5) {
+            gToneAmp = atof(argv[5]);
+        }
+        fprintf(stderr, "[harness] rpm-tone: %.1f Hz, %.2f rad/s\n", gToneHz, gToneAmp);
+    }
+    // closed-loop: the gyro is the plant's own rate, not the scenario waveform.
+    if (strcmp(mode, "closed-loop") == 0) {
+        gClosedLoop = true;
+        const char *gain = getenv("BF_HARNESS_PLANT_GAIN");
+        if (gain != NULL && gain[0] != '\0') {
+            gPlantGain = atof(gain);
+        }
+        fprintf(stderr, "[harness] closed-loop mode: gyro comes from the plant "
+                        "(gain %.4f rad/s per us)\n", gPlantGain);
+    }
 
     // Never touch the real EEPROM: the harness saves configurations (and the
     // cfg-change-* modes save a *flipped* byte before restoring it), so every run
@@ -1324,6 +1475,54 @@ int main(int argc, char **argv)
     } else if (cliSaveMode) {
         fprintf(stderr, "[cli-save] CLI '#': save (writeEEPROM + reboot)\n");
         cliSave();
+    } else if (strcmp(mode, "closed-loop") == 0) {
+        // traceA above already ran closed-loop with the RPM filter as configured.
+        fprintf(stderr, "[closed-loop] plant: rate = %.0f ms first-order lag driven by "
+                        "the motor differential\n", PLANT_TAU_S * 1000.0);
+        printClosedLoopResult("rpm filter as configured");
+
+        setRpmHarmonicsViaMsp(0, "rpm filter off");
+        gPlantRate[0] = gPlantRate[1] = gPlantRate[2] = 0.0;
+        if (!settleAndRearm()) {
+            fprintf(stderr, "[closed-loop] could not re-arm for the rpm-off run\n");
+            sitl_local_shutdown();
+            return 2;
+        }
+        warmUpAndTrace(traceA, &motorCountA, &armedA, rangeA);
+        printClosedLoopResult("rpm filter off (harmonics 0)");
+
+        setRpmHarmonicsViaMsp(3, "rpm filter restored");
+        gPlantRate[0] = gPlantRate[1] = gPlantRate[2] = 0.0;
+        if (!settleAndRearm()) {
+            fprintf(stderr, "[closed-loop] could not re-arm for the rpm-on run\n");
+            sitl_local_shutdown();
+            return 2;
+        }
+        warmUpAndTrace(traceA, &motorCountA, &armedA, rangeA);
+        printClosedLoopResult("rpm filter restored (harmonics 3)");
+
+        sitl_local_shutdown();
+        return 0;
+    } else if (strcmp(mode, "rpm-tone") == 0) {
+        // traceA above already ran with the RPM filter as configured.
+        fprintf(stderr, "[rpm-tone] %s: roll gyro = %.1f rad/s sine at %.1f Hz\n",
+                gScenario->name, gToneAmp, gToneHz);
+        printToneAmps("rpm filter as configured");
+
+        setRpmHarmonicsViaMsp(0, "rpm filter off");
+        gTraceAmpIn = gTraceAmpOut = 0.0;
+        gSigTarget = gSigA;
+        warmUpAndTrace(traceA, &motorCountA, &armedA, rangeA);
+        printToneAmps("rpm filter off (harmonics 0)");
+
+        setRpmHarmonicsViaMsp(3, "rpm filter restored");
+        gTraceAmpIn = gTraceAmpOut = 0.0;
+        gSigTarget = gSigA;
+        warmUpAndTrace(traceA, &motorCountA, &armedA, rangeA);
+        printToneAmps("rpm filter restored (harmonics 3)");
+
+        sitl_local_shutdown();
+        return 0;
     } else if (repeatMode) {
         fprintf(stderr, "[repeat] five saves in a row\n");
         saveConfig("save-only");
@@ -1383,6 +1582,23 @@ int main(int argc, char **argv)
     compare(mode, traceA, traceB);
 
     compareSignals("before vs after the save", gSigA, gSigB, traceA, traceB);
+
+    // What the RPM filter notch bank is actually tuned to (same for both
+    // traces unless the config changed; the signal table above catches that).
+    {
+        sitl_local_loop_state_t ls;
+        if (sitl_local_get_loop_state(&ls) == 0) {
+            fprintf(stderr, "  rpm filter: harmonics=%u minHz=%u q=%u weights=%u/%u/%u "
+                            "motorHz=%.1f/%.1f/%.1f/%.1f notchHz=%.1f/%.1f/%.1f cycleMult=%.4f\n",
+                    (unsigned)ls.rpmHarmonics, (unsigned)ls.rpmMinHz, (unsigned)ls.rpmQ,
+                    (unsigned)ls.rpmWeight[0], (unsigned)ls.rpmWeight[1],
+                    (unsigned)ls.rpmWeight[2],
+                    (double)ls.rpmMotorHz[0], (double)ls.rpmMotorHz[1],
+                    (double)ls.rpmMotorHz[2], (double)ls.rpmMotorHz[3],
+                    (double)ls.rpmNotchHz[0], (double)ls.rpmNotchHz[1],
+                    (double)ls.rpmNotchHz[2], (double)ls.cycleTimeMultiplier);
+        }
+    }
 
     // Stability check: repeat the after-trace with no further save. If the two
     // after-traces match while the before/after pair does not, the save left the
