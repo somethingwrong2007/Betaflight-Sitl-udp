@@ -1357,8 +1357,15 @@ bool blackboxVirtualOpen(void)
 
 int sitl_local_set_blackbox_dir(const char *path)
 {
-    if (path == NULL || path[0] == '\0' || strlen(path) >= MAX_PATH) {
+    if (path == NULL || strlen(path) >= MAX_PATH) {
         return -1;
+    }
+    if (path[0] == '\0') {
+        // Empty path: back to the default (BF_SITL_BLACKBOX_DIR, else
+        // %LOCALAPPDATA%\Betaflight-SITL\blackbox).
+        gBlackboxDir[0] = '\0';
+        blackboxVirtualOpen();
+        return 0;
     }
     strncpy(gBlackboxDir, path, sizeof(gBlackboxDir) - 1);
     gBlackboxDir[sizeof(gBlackboxDir) - 1] = '\0';

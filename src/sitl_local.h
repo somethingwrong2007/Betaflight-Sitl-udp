@@ -219,8 +219,10 @@ SITL_LOCAL_API int sitl_local_set_arm_switch(uint8_t auxChannel,
  * aircraft in UE). The directory is created if missing, and the log-number
  * scan is re-run for that folder so LOG00001.BFL numbering is correct and
  * existing logs are never overwritten. Returns 0 on success, -1 for a NULL,
- * empty or too-long path. Call it before arming / logging starts; a log that
- * is already in progress keeps writing to its original file.
+ * too-long or invalid path. An *empty* path restores the default
+ * (BF_SITL_BLACKBOX_DIR if set, else %LOCALAPPDATA%\Betaflight-SITL\blackbox).
+ * Call it before arming / logging starts; a log that is already in progress
+ * keeps writing to its original file, and no process/DLL restart is needed.
  */
 SITL_LOCAL_API int sitl_local_set_blackbox_dir(const char *path);
 
