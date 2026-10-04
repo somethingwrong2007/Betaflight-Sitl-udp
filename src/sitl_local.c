@@ -327,12 +327,19 @@ static float localRcReadRaw(const rxRuntimeState_t *state, uint8_t channel)
 //
 // `useDshotTelemetry` is one of those: rpmFilterInit() returns early - leaving
 // the RPM filter disabled for the whole run, numHarmonics = 0 - when it is
-// false. On hardware that flag is assigned once, from the *config*, in
-// dshotPwmDevInit() ("useDshotTelemetry = motorConfig->useDshotTelemetry"), so
-// bidirectional DShot being off in the EEPROM turns the RPM filter off - the
-// configurator even greys the RPM filter out in that case. Our virtual PWM motor
-// backend replaces that function, so the assignment has to happen here, before
-// the boot derives anything from it.
+// false, and the configurator *hides the whole RPM filter page* while it is
+// false (FilterSubTab.vue shows it only for FC.MOTOR_CONFIG.use_dshot_telemetry,
+// which MSP_MOTOR_CONFIG fills from this global). On hardware the flag is
+// assigned once, from the config, in dshotPwmDevInit()
+// ("useDshotTelemetry = motorConfig->useDshotTelemetry").
+//
+// The SITL *is* an FC with simulated bidirectional-DShot telemetry - the host
+// feeds motor RPM - so it presents itself that way: the flag is written into the
+// config as well, so the firmware, the configurator and the saved settings all
+// agree. (The Motors tab's own "Bidirectional DShot" switch stays hidden because
+// the SITL pins the motor protocol to PWM, so the config has to carry the flag.)
+// BF_SITL_DSHOT_TELEMETRY=0/1 overrides it, config included, so an A/B run or a
+// user who does not want the RPM filter stays consistent too.
 //
 // Getting this wrong is what made a restart change the flight: setting the flag
 // *after* the boot meant
@@ -343,27 +350,25 @@ static float localRcReadRaw(const rxRuntimeState_t *state, uint8_t channel)
 //                     the same stick input with a different (up to 236 us, 24%
 //                     of the range) motor response.
 //
-// and forcing it to true (the first version of this fix) enabled an RPM filter
-// that a config without bidirectional DShot never asked for - which is what made
-// "RPM filter off = fine, on = shake" reproducible. Mirroring the config here
-// makes every boot - first and re-init - build the chain the EEPROM asks for.
-//
-// BF_SITL_DSHOT_TELEMETRY=0/1 overrides the mirror (A/B testing, or running the
-// RPM filter without changing the saved config).
+// Setting it here (before initPhase2/3 derive the filter chain) makes every boot
+// - first and re-init - build the same chain.
 void sitlLocalPreMotorInit(void)
 {
     motorConfigMutable()->dev.motorProtocol = MOTOR_PROTOCOL_PWM;
 
-    const bool configWantsTelemetry = motorConfig()->dev.useDshotTelemetry;
-    useDshotTelemetry = configWantsTelemetry;
+    bool wantTelemetry = true;
     const char *env = getenv("BF_SITL_DSHOT_TELEMETRY");
     if (env != NULL && env[0] != '\0') {
-        useDshotTelemetry = (env[0] != '0');
+        wantTelemetry = (env[0] != '0');
     }
-    sitlAuditLog("boot: dshot telemetry config=%u -> useDshotTelemetry=%u "
-                 "(RPM filter %s)", (unsigned)configWantsTelemetry,
-                 (unsigned)useDshotTelemetry,
-                 useDshotTelemetry ? "active" : "gated off by the config");
+    // Keep the *config* in sync as well: MSP_MOTOR_CONFIG reports this global, so
+    // the configurator's RPM filter page follows it, and a save persists it.
+    motorConfigMutable()->dev.useDshotTelemetry = wantTelemetry;
+    useDshotTelemetry = wantTelemetry;
+    sitlAuditLog("boot: dshot telemetry %s (config set to %u)%s",
+                 wantTelemetry ? "on - RPM filter active" : "off - RPM filter disabled",
+                 (unsigned)wantTelemetry,
+                 (env != NULL && env[0] != '\0') ? " [BF_SITL_DSHOT_TELEMETRY]" : "");
 }
 
 // The LOCAL link owns a few settings that the stock firmware would take from

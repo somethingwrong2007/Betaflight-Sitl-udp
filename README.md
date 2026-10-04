@@ -856,28 +856,38 @@ How it was pinned down:
 
 #### The RPM filter: it works, and what it costs
 
-The RPM filter's master switch is the EEPROM's **bidirectional DShot** flag, not
-the filter settings: on hardware `dshotPwmDevInit()` does
-`useDshotTelemetry = motorConfig->useDshotTelemetry`, and `rpmFilterInit()`
-returns early - leaving the filter off for the whole run - when that is false.
-The hardware virtual-PWM backend in this build replaces that function, and the
-LOCAL link used to force the flag to `true` so the bridged RPM would reach the
-telemetry consumers. The side effect was that a config with bidirectional DShot
-*off* (as in this project's EEPROM: `dshot(cfg/edt/bb)=0`) still ran the RPM
-filter - the flight controller did something the saved configuration never asked
-for, which is exactly the "RPM filter off = fine, on = shake" symptom.
+The RPM filter's master switch is the firmware's `useDshotTelemetry` flag, not
+the filter settings: `rpmFilterInit()` returns early - leaving the filter off
+for the whole run - while it is false, and the configurator *hides the entire
+RPM filter page* while it is false (`FilterSubTab.vue` shows it only for
+`FC.MOTOR_CONFIG.use_dshot_telemetry`, which `MSP_MOTOR_CONFIG` fills from that
+global). On hardware the flag is assigned once, from the config, in
+`dshotPwmDevInit()`; this build replaces that function with the virtual PWM
+backend, so the LOCAL link owns the assignment.
 
-Fixed: `sitlLocalPreMotorInit()` now mirrors the config the way
-`dshotPwmDevInit()` does, before the boot derives anything from it, and the
-bidirectional-DShot flag counts as part of the gyro-filter chain state (a change
-to it re-derives the RPM filter on a reboot/reload). `BF_SITL_DSHOT_TELEMETRY=0/1`
-overrides the mirror for A/B testing or for running the filter without touching
-the saved config.
+Getting that wrong produced three different symptoms:
 
-To *use* the RPM filter, enable bidirectional DShot (Motors tab - it is also
-what un-gates the ESC telemetry/RPM/temperature read-outs) or set
-`BF_SITL_DSHOT_TELEMETRY=1`. With the gate open the filter is measurably
-correct: the harness's `rpm-tone` mode feeds a pure sine at the motor
+- assigning it only *after* the boot left the flag at its previous value when a
+  second boot ran, so a restart silently enabled an RPM filter the first boot did
+  not have ("the DLL was fine until it was restarted, then it shook");
+- forcing it to `true` unconditionally enabled an RPM filter that a config
+  without bidirectional DShot never asked for ("RPM filter off = fine, on =
+  shake");
+- mirroring the EEPROM instead made the configurator hide the RPM filter page
+  again, because this project's EEPROM has bidirectional DShot off
+  (`dshot(cfg/edt/bb)=0`) and the Motors tab only offers its "Bidirectional
+  DShot" switch for digital protocols, so there was no way to turn it on.
+
+Settled state: the SITL *is* an FC with simulated bidirectional-DShot telemetry
+(the host feeds motor RPM), so `sitlLocalPreMotorInit()` declares it as such - it
+sets `useDshotTelemetry = true` **in the config as well**, before initPhase2/3
+derive anything from it, so the firmware, the configurator (RPM filter page
+visible) and the saved settings agree, and every boot - first and re-init -
+builds the same chain. `BF_SITL_DSHOT_TELEMETRY=0/1` overrides it (config
+included); `0` is the switch for the no-RPM-filter behaviour.
+
+With the switch on the filter is measurably correct: the harness's `rpm-tone`
+mode feeds a pure sine at the motor
 fundamental into the roll gyro and compares what feeds the filter chain (the
 LPF2/downsample output) with what reaches the PID (`gyroADCf`):
 
@@ -889,8 +899,9 @@ rpm filter off (harmonics 0)  input 136.486 counts -> pid 100.347 counts (  -2.7
 rpm filter restored           input 136.486 counts -> pid   0.000 counts (-120.5 dB)
 ```
 
-With the gate closed (the EEPROM's own setting) the same run shows the tone
-passing untouched in all three cases - the RPM filter is inert, as on hardware.
+With `BF_SITL_DSHOT_TELEMETRY=0` the same run shows the tone passing untouched in
+all three cases - the RPM filter is inert, which is also the state the
+configurator renders (no RPM filter page).
 
 The notch bank sits exactly on the motor harmonic (a perfect null), passes
 everything else with only the normal lowpass attenuation, and follows the
