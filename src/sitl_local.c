@@ -508,9 +508,11 @@ int sitl_local_set_eeprom_path(const char *path)
 
 int sitl_local_reload_config(void)
 {
-    if (!gLocalRunning || ARMING_FLAG(ARMED)) {
+    if (!gLocalRunning) {
         return -1;
     }
+    // No arming check: this is a *restart* (see sitl_local_step), and a real
+    // reboot is allowed at any time - it simply drops the motor output.
     InterlockedExchange(&gLocalForceFullInit, 1);
     InterlockedExchange64(&gLocalReloadRequestUs, (LONG64)micros64());
     InterlockedExchange(&gLocalReloadPending, 1);
@@ -1164,51 +1166,51 @@ void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
     // can never race the flight loop. While armed the requests stay pending and
     // are retried on a later step, so a save/reload never yanks the mixer out
     // from under a flying craft (a reboot disarms first, so it applies at once).
-    if (!ARMING_FLAG(ARMED)) {
-        if (InterlockedCompareExchange(&gLocalRebootPending, 0, 0) != 0) {
+    if (InterlockedCompareExchange(&gLocalRebootPending, 0, 0) != 0) {
+        if (!ARMING_FLAG(ARMED)) {
             // A reboot re-reads the config and re-applies it plus the
             // initPhase3 modules, mirroring a real boot.
             localRunPendingReboot();
-        } else if (InterlockedCompareExchange(&gLocalReloadPending, 0, 0) != 0 ||
-                   InterlockedCompareExchange(&gLocalPathPending, 0, 0) != 0) {
-            // A reload (or EEPROM path switch) re-initialises the stateful
-            // gyro/D-term/RC chains, and doing that while the host is feeding
-            // rotating rates injects a step the D term turns into a full-authority
-            // oscillation. A host that switches aircraft does it while the new
-            // aircraft is at rest, so the request is held for a quiet moment -
-            // with a timeout, so a reload asked for mid-flight still happens.
-            static uint64_t quietSinceUs = 0;
-            static uint64_t lastDeferLogUs = 0;
-            const double *rpy = in->angular_velocity_rpy;
-            const bool ratesQuiet = fabs(rpy[0]) < 0.2 && fabs(rpy[1]) < 0.2
-                                    && fabs(rpy[2]) < 0.2;
-            const uint64_t now = micros64();
-            const LONG64 requestedUs = InterlockedCompareExchange64(&gLocalReloadRequestUs, 0, 0);
-            const uint64_t ageUs = (requestedUs > 0 && now > (uint64_t)requestedUs)
-                                       ? now - (uint64_t)requestedUs : 0;
-
-            if (ratesQuiet) {
-                if (quietSinceUs == 0) {
-                    quietSinceUs = now;
-                }
-            } else {
-                quietSinceUs = 0;
-            }
-
-            const bool quietLongEnough = quietSinceUs != 0 && (now - quietSinceUs) >= 200000;
-            const bool requestTooOld = requestedUs <= 0 || ageUs > 3000000;
-
-            if (quietLongEnough || requestTooOld) {
-                sitlAuditLog("reload: applying (ratesQuiet=%u, age=%ums)",
-                             ratesQuiet ? 1u : 0u, (unsigned)(ageUs / 1000));
-                quietSinceUs = 0;
-                localRunPendingReload();
-            } else if (now - lastDeferLogUs >= 1000000) {
-                sitlAuditLog("reload: waiting for a quiet moment (age=%ums)",
-                             (unsigned)(ageUs / 1000));
-                lastDeferLogUs = now;
-            }
         }
+    } else if (InterlockedCompareExchange(&gLocalReloadPending, 0, 0) != 0 ||
+               InterlockedCompareExchange(&gLocalPathPending, 0, 0) != 0) {
+        // A pending EEPROM path switch / explicit reload is performed as a *real
+        // restart*, the same way the host can do it by hand: persist and close the
+        // aircraft being left, select the requested file, shut the FC down and boot
+        // it again. The new configuration then goes through the firmware's own boot
+        // instead of a live re-init inside a running loop - the latter injects a
+        // step into the stateful gyro/D-term/RC chains that the D term amplifies
+        // into a full-authority oscillation (the "shakes after Save" root cause).
+        //
+        // Like a real reboot this does not wait for anything: it drops the motor
+        // output, so disarm first if the craft was armed.
+        if (ARMING_FLAG(ARMED)) {
+            disarm(DISARM_REASON_ARMING_DISABLED);
+        }
+
+        InterlockedExchange(&gLocalReloadPending, 0);
+        InterlockedExchange(&gLocalForceFullInit, 0);
+        localFlushEepromWrite();
+        if (InterlockedExchange(&gLocalPathPending, 0) != 0
+            && gLocalPendingEepromPath[0] != '\0') {
+            extern void ensureEepromDirectory(void);
+            _putenv_s("BF_SITL_EEPROM", gLocalPendingEepromPath);
+            ensureEepromDirectory();
+            sitlAuditLog("reload: EEPROM -> %s", gLocalPendingEepromPath);
+        }
+
+        sitlAuditLog("reload: restarting the FC (armed was %d)", ARMING_FLAG(ARMED) ? 1 : 0);
+        sitl_local_shutdown();
+        const int restarted = sitl_local_init();
+        sitlAuditLog("reload: restart %s", restarted == 0 ? "done" : "FAILED");
+
+        // The FC has just booted: hand the host motor-stop values for this tick (a
+        // real reboot drops the motor output) and skip the rest of the pass, which
+        // belonged to the previous firmware instance.
+        if (out) {
+            memset(out, 0, sizeof(*out));
+        }
+        return;
     }
 
     // --- virtual gyro (Gazebo bridge axis mapping) ---
