@@ -395,24 +395,37 @@ bool sitlLocalGyroFilterConfigChanged(void)
 // configurator's SET handlers only rebuild them when the settings really
 // changed.
 static pidProfile_t gPidFilterConfigSnapshot;
+// Snapshot of the PID *config* as well (pid_process_denom drives the loop dt, so
+// it decides the D-term filter coefficients).
+static pidConfig_t gPidFilterConfigSnapshotPidCfg;
 static bool gPidFilterConfigSnapshotValid = false;
 
 void sitlLocalSnapshotPidFilterConfig(void)
 {
 #ifdef SITL_LOCAL
     gPidFilterConfigSnapshot = *currentPidProfile;
+    gPidFilterConfigSnapshotPidCfg = *pidConfig();
     gPidFilterConfigSnapshotValid = true;
+#endif
+}
+
+bool sitlLocalPidFilterConfigChanged(void)
+{
+#ifdef SITL_LOCAL
+    if (!gPidFilterConfigSnapshotValid) {
+        return true;
+    }
+    return memcmp(&gPidFilterConfigSnapshot, currentPidProfile, sizeof(pidProfile_t)) != 0
+        || memcmp(&gPidFilterConfigSnapshotPidCfg, pidConfig(), sizeof(pidConfig_t)) != 0;
+#else
+    return true;
 #endif
 }
 
 static bool pidFilterConfigChanged(void)
 {
 #ifdef SITL_LOCAL
-    if (!gPidFilterConfigSnapshotValid) {
-        return true;
-    }
-    return memcmp(&gPidFilterConfigSnapshot, currentPidProfile,
-                  sizeof(pidProfile_t)) != 0;
+    return sitlLocalPidFilterConfigChanged();
 #else
     return true;
 #endif
@@ -466,7 +479,12 @@ void sitlLocalRunBootReapply(bool reinitGyroFilters)
         sitlAuditLog("reload: gyro filter configuration changed, filters re-inited");
         gyroInitFilters();
     }
-    pidInit(currentPidProfile);
+    // Gains can be refreshed cheaply; the D-term filter *chain* is stateful, so it
+    // is only rebuilt when the profile (or the loop dt) really changed - the same
+    // rule the configurator's SET handlers use. Rebuilding it here on every reload
+    // is what changed the stick-transient response (and, in a real flight, what
+    // tipped the rate loop into the 120 Hz limit cycle called "the shake").
+    pidInitConfig(currentPidProfile);
     // Mixer / motor / servo config: re-applies the mixer mode (motor count,
     // fixed-wing surfaces) from the saved setting. motorDevInit leaves the
     // device disabled, so re-enable it like initPhase3 does.
@@ -488,7 +506,6 @@ void sitlLocalRunBootReapply(bool reinitGyroFilters)
     // stateful chains for nothing.
     extern void sitlLocalSnapshotGyroFilterConfig(void);
     sitlLocalSnapshotGyroFilterConfig();
-    sitlLocalSnapshotPidFilterConfig();
     sitlLocalSnapshotRcProcessingConfig();
 #endif
 }
@@ -517,9 +534,17 @@ void sitlLocalRunBootProfileInit(void)
     imuInit();
     failsafeInit();
 
-    // pidInit() already ran in sitlLocalRunBootReapply(); redo it here so the
-    // PID dt matches the looptime derived above, exactly like initPhase3.
-    pidInit(currentPidProfile);
+    // initPhase3 runs pidInit() here so the PID dt matches the looptime derived
+    // above. Refresh the gains (cheap, stateless) always, but only rebuild the
+    // stateful D-term filter chain when the profile or the loop dt really changed -
+    // rebuilding it on every reload disturbed the running control loop (see
+    // sitlLocalRunBootReapply()).
+    pidInitConfig(currentPidProfile);
+    if (sitlLocalPidFilterConfigChanged()) {
+        sitlAuditLog("reload: PID profile/dt changed, D-term filters re-inited");
+        pidInitFilters(currentPidProfile);
+    }
+    sitlLocalSnapshotPidFilterConfig();
     mixerInitProfile();
 
     positionInit();

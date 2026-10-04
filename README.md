@@ -557,8 +557,13 @@ in-process DLL can, what real hardware does:
    stick-transient chain (feedforward / setpoint smoothing, PID and RC state)
    under a live flight loop. That alone made the aircraft respond differently to
    the same sticks after a "Save and Reboot" - see
-   "What a configurator Save does to a running LOCAL build (measured)" below. An
-   explicit `sitl_local_reload_config()` still reads the file by design.
+   "What a configurator Save does to a running LOCAL build (measured)" below.
+   `sitl_local_reload_config()` and a runtime `sitl_local_set_eeprom_path()`
+   follow the same rule: the selected file is read with `loadEEPROM()` (values
+   only - no `activateConfig()`), the chains are rebuilt only where the loaded
+   settings actually differ, and a file that matches the configuration the FC is
+   already running makes the whole request a no-op (the usual "switch to another
+   aircraft" case, which previously shook the aircraft for nothing).
 3. The configurator connection survives the reboot (the MSP thread is moved
    back to its idle parser state instead of being left in `mspRebootFn()`'s
    `while (true);`). Expect a short RX re-acquisition right after the reboot,
@@ -801,6 +806,7 @@ oscillation (measured: one axis railing the motors between 2000/1054 us at
 | --- | --- | --- |
 | configurator **Save** / **Save and Reboot** | the page writes its settings first (`MSP_SET_PID`, `MSP_SET_FILTER_CONFIG`, `MSP_SET_RC_TUNING`), then `MSP_EEPROM_WRITE` -> `writeReadEeprom()` -> `writeEEPROM(); readEEPROM();` -> `activateConfig()`, all under a live loop | the Save no longer re-reads the EEPROM, and those three handlers rebuild only when the settings really changed |
 | **in-process FC restart / level reload** (a regression of ours) | `sitl_local_init()` was made to re-derive the same three chains on a *second* init inside one process, to make a restart byte-identical to a fresh boot | removed again: the boot path is left exactly as the firmware builds it |
+| **runtime `sitl_local_set_eeprom_path()` + `sitl_local_reload_config()`** (per-aircraft switch) | the reload ran `readEEPROM()` -> `activateConfig()` and two unconditional `pidInit()` calls inside a running loop | the file is loaded values-only, the chains are rebuilt only where the loaded settings differ, and a file identical to what the FC is running makes the request a no-op (`reload: configuration identical, nothing to re-apply`) |
 
 That second trigger is the pitfall worth remembering: it was added while fixing a
 *measurement* (a synthetic 315 us "restart is not a fresh boot" difference) and it

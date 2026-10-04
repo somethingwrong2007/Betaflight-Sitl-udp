@@ -331,6 +331,9 @@ static void localTakeOverRcProvider(void)
     rxRuntimeState.channelCount = SITL_LOCAL_MAX_RC_CHANNELS;
 }
 
+// Declared before use: defined next to localRepinOverrides() below.
+bool sitlLocalRcTakeOverActive(void);
+
 static void localApplyLinkOverrides(void)
 {
     // Simulated motor RPM participates in the firmware (RPM filter, motor
@@ -345,7 +348,17 @@ static void localApplyLinkOverrides(void)
     // Sensor input arrives via sitl_local_step(), not a serial receiver.
     featureEnableImmediate(FEATURE_RX_UDP);
 
-    localTakeOverRcProvider();
+    // Only (re)install the virtual receiver when it is not ours any more.
+    // localTakeOverRcProvider() re-runs rxUpdateUdpChannels() + rxInit(), which
+    // resets the RX frame timing/processing state; doing that unconditionally on
+    // every reload changed the stick-transient response (feedforward / rc
+    // smoothing) even when the configuration was identical. The configurator
+    // write path already worked this way (it re-takes over only when the
+    // callbacks were replaced); the reload path uses this same helper, so it gets
+    // the same rule.
+    if (!sitlLocalRcTakeOverActive()) {
+        localTakeOverRcProvider();
+    }
 
     // Voltage/current arrive as telemetry, not from a real ADC input.
     batteryConfigMutable()->voltageMeterSource = VOLTAGE_METER_ADC;
@@ -511,9 +524,10 @@ int sitl_local_reload_config(void)
     if (!gLocalRunning) {
         return -1;
     }
-    // No arming check: this is a *restart* (see sitl_local_step), and a real
-    // reboot is allowed at any time - it simply drops the motor output.
-    InterlockedExchange(&gLocalForceFullInit, 1);
+    // No arming check and no forced filter rebuild: the reload applies the file's
+    // values and then rebuilds only the chains whose settings actually changed
+    // (the same rule the configurator's Save uses). Forcing a rebuild here is what
+    // used to shake the aircraft.
     InterlockedExchange64(&gLocalReloadRequestUs, (LONG64)micros64());
     InterlockedExchange(&gLocalReloadPending, 1);
     return 0;
@@ -538,6 +552,18 @@ int sitl_local_reload_config(void)
 // reboot keeps the runtime in the operating point it was already flying in - the
 // aircraft behaves the same before and after, which is what the simulator wants
 // from a reboot that never actually restarts the MCU.
+// FNV-1a over the virtual flash image: the reload path uses it to tell whether
+// the file it is about to load is actually different from what the FC is running.
+static uint32_t localEepromHash(void)
+{
+    uint32_t hash = 2166136261u;
+    for (size_t i = 0; i < sizeof(eepromData); i++) {
+        hash ^= eepromData[i];
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
 static void localRunPendingReloadInternal(bool rereadEeprom)
 {
     InterlockedExchange(&gLocalReloadPending, 0);
@@ -574,17 +600,48 @@ static void localRunPendingReloadInternal(bool rereadEeprom)
     extern bool sitlLocalGyroFilterConfigChanged(void);
     extern void sitlLocalRunBootReapply(bool reinitGyroFilters);
     sitlLocalSnapshotGyroFilterConfig();
+    // Same idea for the PID/D-term chain: remember the settings the running chain
+    // was built from, so the re-apply below can tell whether the loaded file
+    // really changed them.
+    extern void sitlLocalSnapshotPidFilterConfig(void);
+    sitlLocalSnapshotPidFilterConfig();
 
     // Open the file named by BF_SITL_EEPROM (sitlFopen resolves the env var on
     // every call) and load it into the flash mirror, then into the PG records.
+    // The mirror currently holds exactly the configuration the FC is running
+    // (localFlushEepromWrite() just wrote it), so comparing it with the file that
+    // is about to be loaded tells us whether this reload changes anything at all.
+    const uint32_t runningHash = localEepromHash();
     configUnlock();
+    if (!freshFile && localEepromHash() == runningHash) {
+        // Same configuration: re-applying it would only re-initialise the
+        // stateful gyro/D-term/RC chains, which is what shakes the aircraft when
+        // it happens in a running loop. Nothing to do - the selected file is
+        // already what the FC is flying (the environment variable was switched
+        // above, so the next save targets the new path).
+        sitlAuditLog("reload: configuration identical, nothing to re-apply");
+        return;
+    }
     if (freshFile) {
         // Mirrors fc/init.c: an invalid/erased config resets to the factory
         // defaults and writes them (here into the newly created file).
         ensureEEPROMStructureIsValid();
     }
     if (rereadEeprom || pathSwitch) {
-        readEEPROM();
+        // Load the selected file's *values* without the firmware's readEEPROM().
+        // readEEPROM() ends in activateConfig(), which re-initialises the stateful
+        // gyro/D-term/RC chains (initRcProcessing, pidInit, rcControlsInit, ...)
+        // while the flight loop is running - the same "live re-init" that made the
+        // configurator's Save shake the aircraft, and the one path that
+        // "Save and Reboot" does *not* take (it skips the re-read). Everything the
+        // config derives is re-applied below by the reload's own re-apply, which
+        // rebuilds only the chains whose settings actually changed.
+        extern bool loadEEPROM(void);
+        const bool loaded = loadEEPROM();
+        changePidProfile(systemConfig()->pidProfileIndex);
+        changeControlRateProfile(systemConfig()->activeRateProfile);
+        sitlAuditLog("reload: values-only EEPROM load (no activateConfig), ok=%u",
+                     loaded ? 1u : 0u);
     } else {
         sitlAuditLog("reboot: EEPROM re-read skipped (runtime state preserved)");
     }
@@ -1174,43 +1231,17 @@ void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
         }
     } else if (InterlockedCompareExchange(&gLocalReloadPending, 0, 0) != 0 ||
                InterlockedCompareExchange(&gLocalPathPending, 0, 0) != 0) {
-        // A pending EEPROM path switch / explicit reload is performed as a *real
-        // restart*, the same way the host can do it by hand: persist and close the
-        // aircraft being left, select the requested file, shut the FC down and boot
-        // it again. The new configuration then goes through the firmware's own boot
-        // instead of a live re-init inside a running loop - the latter injects a
-        // step into the stateful gyro/D-term/RC chains that the D term amplifies
-        // into a full-authority oscillation (the "shakes after Save" root cause).
-        //
-        // Like a real reboot this does not wait for anything: it drops the motor
-        // output, so disarm first if the craft was armed.
-        if (ARMING_FLAG(ARMED)) {
-            disarm(DISARM_REASON_ARMING_DISABLED);
-        }
-
-        InterlockedExchange(&gLocalReloadPending, 0);
-        InterlockedExchange(&gLocalForceFullInit, 0);
-        localFlushEepromWrite();
-        if (InterlockedExchange(&gLocalPathPending, 0) != 0
-            && gLocalPendingEepromPath[0] != '\0') {
-            extern void ensureEepromDirectory(void);
-            _putenv_s("BF_SITL_EEPROM", gLocalPendingEepromPath);
-            ensureEepromDirectory();
-            sitlAuditLog("reload: EEPROM -> %s", gLocalPendingEepromPath);
-        }
-
-        sitlAuditLog("reload: restarting the FC (armed was %d)", ARMING_FLAG(ARMED) ? 1 : 0);
-        sitl_local_shutdown();
-        const int restarted = sitl_local_init();
-        sitlAuditLog("reload: restart %s", restarted == 0 ? "done" : "FAILED");
-
-        // The FC has just booted: hand the host motor-stop values for this tick (a
-        // real reboot drops the motor output) and skip the rest of the pass, which
-        // belonged to the previous firmware instance.
-        if (out) {
-            memset(out, 0, sizeof(*out));
-        }
-        return;
+        // A pending EEPROM path switch / explicit reload is applied by the same
+        // rule as the configurator's Save: the selected file's *values* are loaded
+        // (loadEEPROM(), no activateConfig()), the LOCAL link overrides are
+        // re-pinned, and only the stateful chains whose settings actually changed
+        // are rebuilt (see localRunPendingReloadInternal). Running the firmware's
+        // readEEPROM()/activateConfig() here instead re-initialises the gyro
+        // filter, D-term filter and rate/RC chains under a live gyro stream, which
+        // is exactly the step the D term amplifies into the "aircraft shakes"
+        // oscillation - the Save path had the same problem and this is the same
+        // fix.
+        localRunPendingReload();
     }
 
     // --- virtual gyro (Gazebo bridge axis mapping) ---

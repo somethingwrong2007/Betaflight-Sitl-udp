@@ -1189,6 +1189,18 @@ int main(int argc, char **argv)
         gAuxHighOverride = false;
         fprintf(stderr, "[aux-save] AUX back to normal, arming flags now:\n");
         printArmingFlags(sitl_local_get_arming_flags());
+    } else if (strcmp(mode, "reload") == 0) {
+        // Runtime reload of the *same* file: the values cannot change, so the FC
+        // must keep responding identically. Any difference here is the reload
+        // injecting control-loop state (the "shakes after switching aircraft"
+        // mechanism), which is what localRunPendingReloadInternal must avoid.
+        fprintf(stderr, "[reload] sitl_local_set_eeprom_path + sitl_local_reload_config "
+                        "(same file)\n");
+        if (gHarnessEepromCopy[0] != '\0') {
+            (void)sitl_local_set_eeprom_path(gHarnessEepromCopy);
+        }
+        (void)sitl_local_reload_config();
+        runSteps(600, TRACE_THROTTLE, false);
     } else if (sensitivityMode) {
         fprintf(stderr, "[sensitivity] no save: the second trace doubles the gyro "
                         "noise instead, to prove a loop change is visible\n");
