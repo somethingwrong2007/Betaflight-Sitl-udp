@@ -458,6 +458,53 @@ void sitlLocalGetRpmFilterSettings(uint16_t *fadeRangeHz, uint16_t *lpfHz)
 #endif
 }
 
+// 1 Hz record of the RPM *input data* as the FC receives it, next to what the
+// filter derives from it. Only written when the rounded values change, so it
+// costs one line per second while flying and shows immediately whether the host
+// is sending sane per-motor speeds (rpm -> /60 -> mechanical Hz -> notch Hz).
+void sitlLocalLogRpmInput(void)
+{
+#ifdef SITL_LOCAL
+    static int lastKey = -1;
+    extern float simTelemetryMotorFrequencyHz(uint8_t motorIndex);
+
+    float rawHz[4];
+    float filtHz[4];
+    for (int i = 0; i < 4; i++) {
+        rawHz[i] = simTelemetryMotorFrequencyHz((uint8_t)i);
+        extern float getMotorFrequencyHz(uint8_t motorIndex);
+        filtHz[i] = getMotorFrequencyHz((uint8_t)i);
+    }
+    float notch[3];
+    sitlLocalGetRpmNotchHz(notch);
+    const uint8_t harmonics = rpmFilterConfig()->rpm_filter_harmonics;
+    // A clamped harmonic is applied at the loop's Nyquist limit; with the
+    // default fade range it is the harmful case (full-weight notch at ~0.96x
+    // Nyquist). Report how many of the configured harmonics are clamped.
+    const float maxHz = 0.48f * 1e6f / (float)(gyro.targetLooptime ? gyro.targetLooptime : 1000);
+    unsigned clamped = 0;
+    for (int h = 0; h < harmonics && h < 3; h++) {
+        if ((float)(h + 1) * filtHz[0] > maxHz) { clamped++; }
+    }
+
+    const int key = (int)(rawHz[0] + 0.5f) * 1000 + (int)(notch[0] + 0.5f);
+    if (key == lastKey) {
+        return;
+    }
+    lastKey = key;
+
+    sitlAuditLog("rpm input: host rpm=%.0f/%.0f/%.0f/%.0f (%.1f/%.1f/%.1f/%.1f Hz) "
+                 "filtered=%.1f Hz notch=%.0f/%.0f/%.0f Hz harmonics=%u clamped=%u "
+                 "dcut=%.0f Hz",
+                 (double)(rawHz[0] * 60.0f), (double)(rawHz[1] * 60.0f),
+                 (double)(rawHz[2] * 60.0f), (double)(rawHz[3] * 60.0f),
+                 (double)rawHz[0], (double)rawHz[1], (double)rawHz[2], (double)rawHz[3],
+                 (double)filtHz[0],
+                 (double)notch[0], (double)notch[1], (double)notch[2],
+                 (unsigned)harmonics, clamped, (double)maxHz);
+#endif
+}
+
 // The other firmware loops that consume the bridged RPM and are gated by the
 // same bidirectional-DShot flag: dynamic idle (per profile) and the RPM limiter
 // (mixer config). If either is configured, the *input* RPM drives a feedback

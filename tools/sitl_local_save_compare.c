@@ -111,6 +111,27 @@ static double gClosedMax[2] = { 0.0, 0.0 };   // { motor0, plant rate } max
 static bool gStepDtJitter = false;
 static uint32_t gLastStepDtUs = 1000;
 
+// RPM input source: a fixed bench value, or - like Unreal's ESC model - the
+// motor speeds *derived from the motor outputs the FC itself just produced*
+// (RPM = KV * duty), optionally through the motor/prop's physical time constant.
+// This is the "input data" the RPM filter works from; if it carries the PID's
+// own noise, the notches chase the loop.
+static bool gRpmFromMotors = false;
+static double gMotorTauMs = 0.0;   // 0 = instant (an "ideal" ESC model)
+static double gRpmLagged[4] = { 0.0, 0.0, 0.0, 0.0 };
+
+static double sitlHarnessMotorRpm(int index)
+{
+    const double target = 24000.0 * (gLastMotorsForPlant[index] - 1000.0f) / 1000.0;
+    if (gMotorTauMs <= 0.0) {
+        return target;
+    }
+    const double dt = gLastStepDtUs * 1e-6;
+    const double k = dt / (gMotorTauMs * 1e-3 + dt);
+    gRpmLagged[index] += k * (target - gRpmLagged[index]);
+    return gRpmLagged[index];
+}
+
 static uint32_t nextStepDtUs(void)
 {
     if (!gStepDtJitter) {
@@ -563,9 +584,9 @@ static void makeInput(int phase, uint16_t throttle, bool armHigh,
     // produced, exactly like Unreal's ESC model (RPM = KV * duty) - so the RPM
     // filter's notch frequencies track the PID output and jitter with it, which
     // is what makes the missing RPM lowpass visible.
-    if (gClosedLoop) {
+    if (gRpmFromMotors || gClosedLoop) {
         for (int i = 0; i < 4; i++) {
-            in->motor_rpm[i] = 24000.0 * (gLastMotorsForPlant[i] - 1000.0f) / 1000.0;
+            in->motor_rpm[i] = sitlHarnessMotorRpm(i);
         }
     }
     in->motor_temperature[0] = in->motor_temperature[1] = 30.0;
@@ -1276,6 +1297,21 @@ int main(int argc, char **argv)
         gStepDtJitter = (jitter != NULL && jitter[0] != '\0' && jitter[0] != '0');
         if (gStepDtJitter) {
             fprintf(stderr, "[harness] step dt JITTER enabled (1000/1200/800/1100/900 us)\n");
+        }
+    }
+    // BF_HARNESS_RPM_FROM_MOTORS=1 feeds RPM = 24000 * (motor-1000)/1000, i.e.
+    // the speed the FC's own output commands (Unreal's ESC model), optionally
+    // through a motor time constant (BF_HARNESS_MOTOR_TAU_MS, 0 = instant).
+    {
+        const char *fromMotors = getenv("BF_HARNESS_RPM_FROM_MOTORS");
+        gRpmFromMotors = (fromMotors != NULL && fromMotors[0] != '\0' && fromMotors[0] != '0');
+        const char *tau = getenv("BF_HARNESS_MOTOR_TAU_MS");
+        if (tau != NULL && tau[0] != '\0') {
+            gMotorTauMs = atof(tau);
+        }
+        if (gRpmFromMotors) {
+            fprintf(stderr, "[harness] RPM input follows the motor outputs "
+                            "(motor tau %.1f ms)\n", gMotorTauMs);
         }
     }
     // closed-loop: the gyro is the plant's own rate, not the scenario waveform.

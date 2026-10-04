@@ -1339,6 +1339,10 @@ void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
     if (++stepCounter % 1000 == 0) {
         extern void sitlLocalLogStateIfChanged(const char *tag);
         sitlLocalLogStateIfChanged("state");
+        // The RPM input data the filter is working from (once a second, only
+        // when it changes) - see sitlLocalLogRpmInput().
+        extern void sitlLocalLogRpmInput(void);
+        sitlLocalLogRpmInput();
     }
 
     // Deferred config work (firmware reboot, EEPROM reload and/or path switch)

@@ -856,7 +856,35 @@ How it was pinned down:
 
 #### The RPM filter: it works, and what it costs
 
-**Root cause of the "enabling the RPM filter shakes" report: the host's dt.**
+**The RPM notch is razor-thin - it lives and dies by the RPM input data.**
+`rpm_filter_q` defaults to 500 (Q = 5), so a notch's *null* is only a few Hz
+wide: 6 Hz off-centre is already just -3 dB. Measured in the harness's `rpm-tone`
+mode, which feeds a 200 Hz tone at the motor frequency:
+
+| RPM the FC works from | attenuation of the tone |
+| --- | --- |
+| exactly 12000 rpm on all four motors (notch at 200 Hz) | **-88 dB** |
+| motor speeds differing by +-3% (as a real roll command makes them: 11600..12300 rpm) | **-3 dB** (the tone passes) |
+| RPM following the motor outputs with a 25 ms motor time constant | -3 dB |
+
+So the filter only removes vibration while the per-motor speed it is given is
+the *actual* mechanical speed, accurate to roughly 1% and steady. A host that
+derives the "RPM" from the motor *command* (or with a too-short motor time
+constant) hands the filter a frequency that moves with the loop's own output;
+the notch then slides off the harmonic, stops filtering and sweeps its phase
+across the control band. Checking that data is therefore the first thing to do:
+`sitl-audit.log` now gets a 1 Hz `rpm input:` line with the raw rpm the FC
+received, the filtered value and the notch frequencies it derived
+(`BF_HARNESS_RPM_FROM_MOTORS=1` / `BF_HARNESS_MOTOR_TAU_MS` in the harness
+reproduce the command-derived cases).
+
+**A red herring worth recording: the host's dt.** The FC's virtual clock is a
+fixed grid and every filter is designed for one dt, so a host that forwards a
+*jittering* frame time detunes the narrow notches (measured: -117 dB on a fixed
+1 ms grid, -23 dB with a host-like +-20% jitter). Unreal's async physics does
+*not* do that - it is fixed-step - so this was a hypothesis that did not apply
+here; the de-jitter snap in `sitl_local_step()` stays as a cheap safety net
+(`BF_SITL_DT_SNAP=0` disables it) and is a no-op for a fixed-rate host.
 The flight controller's virtual clock is a fixed grid - every filter and the
 PID's dt are designed for one sample period - but Unreal forwards its *jittery*
 async-physics frame time as the step size
