@@ -560,6 +560,11 @@ void sitlLocalLogControlState(const char *tag)
 // never stops. Snapshot the filter configuration around the EEPROM read and
 // re-init only when it actually changed.
 static gyroConfig_t gGyroFilterConfigSnapshot;
+// rpmFilterInit() returns early when useDshotTelemetry is false, so the EEPROM's
+// bidirectional-DShot flag decides whether the RPM filter exists at all - a
+// change to it has to count as a chain change (and re-derive the filter on a
+// reboot/reload, exactly like a real FC after enabling bdshot).
+static uint8_t gGyroFilterDshotConfigSnapshot;
 #ifdef USE_DYN_NOTCH_FILTER
 static dynNotchConfig_t gDynNotchConfigSnapshot;
 #endif
@@ -572,6 +577,7 @@ void sitlLocalSnapshotGyroFilterConfig(void)
 {
 #ifdef SITL_LOCAL
     gGyroFilterConfigSnapshot = *gyroConfig();
+    gGyroFilterDshotConfigSnapshot = motorConfig()->dev.useDshotTelemetry;
 #ifdef USE_DYN_NOTCH_FILTER
     gDynNotchConfigSnapshot = *dynNotchConfig();
 #endif
@@ -589,6 +595,9 @@ bool sitlLocalGyroFilterConfigChanged(void)
         return true;
     }
     if (memcmp(&gGyroFilterConfigSnapshot, gyroConfig(), sizeof(gyroConfig_t)) != 0) {
+        return true;
+    }
+    if (gGyroFilterDshotConfigSnapshot != motorConfig()->dev.useDshotTelemetry) {
         return true;
     }
 #ifdef USE_DYN_NOTCH_FILTER

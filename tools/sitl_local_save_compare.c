@@ -282,6 +282,10 @@ static bool gScenarioActive = false;
 // functional test: the notches must sit on the motor harmonics.
 static double gToneHz = 0.0;
 static double gToneAmp = 3.0;     // rad/s on the roll axis (~170 dps)
+static bool gToneActive = false;  // only during the recorded trace: the arming
+                                  // sequence and the warm-up must not see a
+                                  // 200 Hz roll rate, or the angle-mode arming
+                                  // check never passes
 static double gTraceAmpIn = 0.0;  // max |sampleSum[roll]|, second half of a trace
 static double gTraceAmpOut = 0.0; // max |gyroADCf[roll]|, second half of a trace
 
@@ -498,7 +502,7 @@ static void makeInput(int phase, uint16_t throttle, bool armHigh,
 
     // Pure-tone probe (RPM filter functional test): replace the roll rate with a
     // single sine, sticks centred, so only the filter chain shapes it.
-    if (gToneHz > 0.0) {
+    if (gToneHz > 0.0 && gToneActive) {
         in->angular_velocity_rpy[0] = gToneAmp * sin(2.0 * M_PI * gToneHz * t);
         in->angular_velocity_rpy[1] = 0.0;
         in->angular_velocity_rpy[2] = 0.0;
@@ -618,6 +622,7 @@ static void runTrace(float trace[SCENARIO_STEPS][4], uint8_t *motorCount,
     int saturated = 0;
     gClosedMin[0] = gClosedMin[1] = 1e9;
     gClosedMax[0] = gClosedMax[1] = -1e9;
+    gToneActive = (gToneHz > 0.0);
 
     for (int phase = 0; phase < SCENARIO_STEPS; phase++) {
         bool armed = stepWith(phase, TRACE_THROTTLE, true, trace[phase], motorCount);
@@ -651,6 +656,7 @@ static void runTrace(float trace[SCENARIO_STEPS][4], uint8_t *motorCount,
     }
     rangeOut[0] = lo;
     rangeOut[1] = hi;
+    gToneActive = false;
     gPlantPkPk = gClosedMax[0] - gClosedMin[0];
     gRatePkPk = gClosedMax[1] - gClosedMin[1];
     fprintf(stderr, "   (saturated on at least one motor: %.1f%% of the scenario)\n",

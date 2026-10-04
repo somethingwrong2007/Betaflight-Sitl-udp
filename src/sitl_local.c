@@ -327,10 +327,15 @@ static float localRcReadRaw(const rxRuntimeState_t *state, uint8_t channel)
 //
 // `useDshotTelemetry` is one of those: rpmFilterInit() returns early - leaving
 // the RPM filter disabled for the whole run, numHarmonics = 0 - when it is
-// false, and the flag is a plain global (a fresh process starts with it at 0;
-// the LOCAL link turns it on so the bridged motor RPM feeds the RPM filter, the
-// OSD and MSP telemetry). Setting it only *after* the boot, as the runtime
-// override used to, meant:
+// false. On hardware that flag is assigned once, from the *config*, in
+// dshotPwmDevInit() ("useDshotTelemetry = motorConfig->useDshotTelemetry"), so
+// bidirectional DShot being off in the EEPROM turns the RPM filter off - the
+// configurator even greys the RPM filter out in that case. Our virtual PWM motor
+// backend replaces that function, so the assignment has to happen here, before
+// the boot derives anything from it.
+//
+// Getting this wrong is what made a restart change the flight: setting the flag
+// *after* the boot meant
 //
 //   fresh process  -> boot sees 0 -> RPM filter OFF  -> no RPM notches
 //   shutdown+init  -> global still 1 from the last run -> rpmFilterInit enables
@@ -338,14 +343,27 @@ static float localRcReadRaw(const rxRuntimeState_t *state, uint8_t channel)
 //                     the same stick input with a different (up to 236 us, 24%
 //                     of the range) motor response.
 //
-// That is the "the aircraft was fine, then saving/restarting made it shake, and
-// only reloading the DLL fixes it" bug: the two boots derived different filter
-// chains. Setting the flag here makes every boot - first and re-init - build the
-// same chain, exactly like a real FC whose config enables the RPM filter.
+// and forcing it to true (the first version of this fix) enabled an RPM filter
+// that a config without bidirectional DShot never asked for - which is what made
+// "RPM filter off = fine, on = shake" reproducible. Mirroring the config here
+// makes every boot - first and re-init - build the chain the EEPROM asks for.
+//
+// BF_SITL_DSHOT_TELEMETRY=0/1 overrides the mirror (A/B testing, or running the
+// RPM filter without changing the saved config).
 void sitlLocalPreMotorInit(void)
 {
     motorConfigMutable()->dev.motorProtocol = MOTOR_PROTOCOL_PWM;
-    useDshotTelemetry = true;
+
+    const bool configWantsTelemetry = motorConfig()->dev.useDshotTelemetry;
+    useDshotTelemetry = configWantsTelemetry;
+    const char *env = getenv("BF_SITL_DSHOT_TELEMETRY");
+    if (env != NULL && env[0] != '\0') {
+        useDshotTelemetry = (env[0] != '0');
+    }
+    sitlAuditLog("boot: dshot telemetry config=%u -> useDshotTelemetry=%u "
+                 "(RPM filter %s)", (unsigned)configWantsTelemetry,
+                 (unsigned)useDshotTelemetry,
+                 useDshotTelemetry ? "active" : "gated off by the config");
 }
 
 // The LOCAL link owns a few settings that the stock firmware would take from
@@ -378,10 +396,11 @@ bool sitlLocalRcTakeOverActive(void);
 
 static void localApplyLinkOverrides(void)
 {
-    // Simulated motor RPM participates in the firmware (RPM filter, motor
-    // telemetry, OSD/MSP): mark DSHOT telemetry as active so the RPM filter
-    // and telemetry consumers use the bridged values from the wrappers.
-    useDshotTelemetry = true;
+    // sitlLocalPreMotorInit() already mirrored the EEPROM's bidirectional-DShot
+    // flag; keep that value here (and re-mirror after a config reload replaced
+    // the PG records) so the RPM filter's enable, its latched numHarmonics and
+    // the OSD/MSP telemetry gating all stay consistent.
+    sitlLocalPreMotorInit();
 
     // The FC blocks arming for powerOnArmingGraceTime seconds after every
     // boot; a reload must not re-block a session that is already running.
@@ -450,7 +469,6 @@ static void localRepinOverrides(void)
     featureEnableImmediate(FEATURE_RX_UDP);
     batteryConfigMutable()->voltageMeterSource = VOLTAGE_METER_ADC;
     batteryConfigMutable()->currentMeterSource = CURRENT_METER_ADC;
-    useDshotTelemetry = true;
     if (!rcOursBefore) {
         // A configurator write re-ran rxInit(): put the virtual receiver back.
         localTakeOverRcProvider();
