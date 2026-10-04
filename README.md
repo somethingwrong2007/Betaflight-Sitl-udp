@@ -878,6 +878,31 @@ received, the filtered value and the notch frequencies it derived
 (`BF_HARNESS_RPM_FROM_MOTORS=1` / `BF_HARNESS_MOTOR_TAU_MS` in the harness
 reproduce the command-derived cases).
 
+`tools/rpm_notch_response.py` also shows the lever that keeps the filter *and*
+the margin: `rpm_filter_q` (default 500 = Q 5). For this project's motors
+(2207 1800KV on 4S, hover ~12000-15000 rpm -> 200-250 Hz, 3 harmonics x 4
+motors):
+
+| Q (rpm_filter_q) | phase at 120 Hz | notch depth with a 1% RPM error |
+| --- | --- | --- |
+| 5.0 (default) | -46 deg (200 Hz motor) / -25 deg (250 Hz) | -35 dB / -31 dB |
+| 10.0 | -23 deg / -13 deg | -19 dB / -16 dB |
+| 20.0 | -12 deg / -6 deg | -9 dB / -7 dB |
+
+So doubling Q halves the phase the notch bank takes out of the control band
+while still notching the harmonic hard; it only works if the RPM data is
+accurate to about a percent - which is exactly what the host here provides.
+Betaflight's own help text says the same thing ("higher values make each notch
+narrower and more precise; lower values make them wider ... very low values
+significantly increase filter delay").
+
+Finally, the filter needs the vibration to *exist* in the gyro data to earn its
+keep. The harness can inject it (`BF_HARNESS_VIB_RADPS`, a plausible
+0.5 rad/s per motor harmonic) and then closes the loop around the plant: with the
+vibration present the RPM filter reduces the motor buzz (residual motor pk-pk
+228.8 us with the filter off, 175.3 us with it on), while a rigid-body sim with a
+clean gyro leaves the notches with nothing to remove and only their phase cost.
+
 **A red herring worth recording: the host's dt.** The FC's virtual clock is a
 fixed grid and every filter is designed for one dt, so a host that forwards a
 *jittering* frame time detunes the narrow notches (measured: -117 dB on a fixed

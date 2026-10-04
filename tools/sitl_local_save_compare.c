@@ -120,6 +120,12 @@ static bool gRpmFromMotors = false;
 static double gMotorTauMs = 0.0;   // 0 = instant (an "ideal" ESC model)
 static double gRpmLagged[4] = { 0.0, 0.0, 0.0, 0.0 };
 
+// Motor-induced body vibration in the *gyro input data*: a real gyro sees the
+// motor harmonics, and that is exactly what the RPM filter exists to remove. A
+// rigid-body simulator has none, which is why the notches can only cost phase
+// there. Amplitudes are in rad/s per motor harmonic (BF_HARNESS_VIB_RADPS).
+static double gVibAmp = 0.0;
+
 static double sitlHarnessMotorRpm(int index)
 {
     const double target = 24000.0 * (gLastMotorsForPlant[index] - 1000.0f) / 1000.0;
@@ -573,6 +579,25 @@ static void makeInput(int phase, uint16_t throttle, bool armHigh,
         in->angular_velocity_rpy[0] = gPlantRate[0];
         in->angular_velocity_rpy[1] = gPlantRate[1];
         in->angular_velocity_rpy[2] = gPlantRate[2];
+    }
+
+    // Motor-induced vibration in the gyro data (what a real gyro measures at the
+    // motor harmonics). Present whenever the motors are spinning, so the RPM
+    // filter has something to remove.
+    if (gVibAmp > 0.0) {
+        const double fcT = (double)sitl_local_time_us() * 1e-6;
+        double vib = 0.0;
+        for (int m = 0; m < 4; m++) {
+            const double rpm = sitlHarnessMotorRpm(m);
+            if (rpm <= 0.0) {
+                continue;
+            }
+            const double f = rpm / 60.0;
+            vib += sin(2.0 * M_PI * f * fcT) + 0.5 * sin(2.0 * M_PI * 2.0 * f * fcT);
+        }
+        in->angular_velocity_rpy[0] += gVibAmp * vib / 4.0;
+        in->angular_velocity_rpy[1] += gVibAmp * vib / 4.0 * 0.6;
+        in->angular_velocity_rpy[2] += gVibAmp * vib / 4.0 * 0.3;
     }
 
     // Plausible telemetry so the RPM bridge has something to work on.
@@ -1312,6 +1337,16 @@ int main(int argc, char **argv)
         if (gRpmFromMotors) {
             fprintf(stderr, "[harness] RPM input follows the motor outputs "
                             "(motor tau %.1f ms)\n", gMotorTauMs);
+        }
+    }
+    {
+        const char *vib = getenv("BF_HARNESS_VIB_RADPS");
+        if (vib != NULL && vib[0] != '\0') {
+            gVibAmp = atof(vib);
+        }
+        if (gVibAmp > 0.0) {
+            fprintf(stderr, "[harness] motor vibration in the gyro: %.3f rad/s per "
+                            "motor harmonic\n", gVibAmp);
         }
     }
     // closed-loop: the gyro is the plant's own rate, not the scenario waveform.
