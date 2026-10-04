@@ -225,6 +225,21 @@ SITL_LOCAL_API int sitl_local_set_arm_switch(uint8_t auxChannel,
 SITL_LOCAL_API int sitl_local_set_blackbox_dir(const char *path);
 
 /**
+ * Keep at most `maxLogs` blackbox logs in the log directory (0 = unlimited).
+ * The oldest logs are deleted immediately and again whenever a new log is
+ * opened (default 10; BF_SITL_BLACKBOX_MAX_LOGS overrides the default).
+ * Returns 0 on success, -1 for an out-of-range value.
+ */
+SITL_LOCAL_API int sitl_local_set_blackbox_max_logs(int maxLogs);
+
+/**
+ * Copy the directory the virtual blackbox writes LOG*.BFL into (the platform
+ * default is %LOCALAPPDATA%\Betaflight-SITL\blackbox, overridable with
+ * BF_SITL_BLACKBOX_DIR). Returns 0 on success, -1 if `out` is too small.
+ */
+SITL_LOCAL_API int sitl_local_get_blackbox_dir(char *out, int size);
+
+/**
  * Point the virtual EEPROM at another file (one per aircraft). An empty or
  * NULL path restores the LOCAL default
  * (%LOCALAPPDATA%\Betaflight-SITL\eeprom.bin). The switch is applied by the

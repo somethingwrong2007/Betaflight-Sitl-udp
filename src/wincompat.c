@@ -458,6 +458,8 @@ void sitlLocalGetRpmFilterSettings(uint16_t *fadeRangeHz, uint16_t *lpfHz)
 #endif
 }
 
+extern void sitlLocalGetRpmNotchHz(float notchHz[3]);
+
 // 1 Hz record of the RPM *input data* as the FC receives it, next to what the
 // filter derives from it. Only written when the rounded values change, so it
 // costs one line per second while flying and shows immediately whether the host
@@ -1162,9 +1164,120 @@ void motorShutdown(void)
 // The virtual blackbox writes LOG*.BFL and scans for the next log number in
 // the process working directory. Inside a DLL that is the host engine's CWD,
 // which is unpredictable, so redirect both to a stable folder: the default is
-// the same %LOCALAPPDATA%\Betaflight-SITL as the virtual EEPROM, and the host
-// can override it per aircraft at runtime with sitl_local_set_blackbox_dir().
+// %LOCALAPPDATA%\Betaflight-SITL\blackbox (a dedicated folder next to the
+// virtual EEPROM, so logs never mix with eeprom.bin / the audit logs), and the
+// host can override it per aircraft at runtime with
+// sitl_local_set_blackbox_dir() or BF_SITL_BLACKBOX_DIR.
+//
+// The folder is kept bounded: only the newest BF_SITL_BLACKBOX_MAX_LOGS logs
+// (default 10, 0 = unlimited, also settable through
+// sitl_local_set_blackbox_max_logs()) are kept, oldest first deleted, both when
+// a new log is opened and when the blackbox directory is (re)scanned at boot.
 static char gBlackboxDir[MAX_PATH] = "";
+static int gBlackboxMaxLogs = 10;
+// Upper bound of the folder scan (LOG00000..LOG99999 fits in 5 digits).
+#define SITL_BLACKBOX_MAX_TRACKED 1024
+
+// mkdir -p for the blackbox/Eeprom folders (a single CreateDirectoryA would
+// fail for "%LOCALAPPDATA%\Betaflight-SITL\blackbox" before the parent exists).
+static bool sitlCreateDirChain(char *path)
+{
+    if (path[0] == '\0' || (path[1] == ':' && path[2] == '\0')) {
+        return true;
+    }
+    const DWORD attrs = GetFileAttributesA(path);
+    if (attrs != INVALID_FILE_ATTRIBUTES) {
+        return (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    }
+    char *slash = strrchr(path, '\\');
+    char *fslash = strrchr(path, '/');
+    if (fslash > slash) {
+        slash = fslash;
+    }
+    if (slash != NULL && slash != path && slash[1] != '\0') {
+        const char saved = *slash;
+        *slash = '\0';
+        const bool parentOk = sitlCreateDirChain(path);
+        *slash = saved;
+        if (!parentOk) {
+            return false;
+        }
+    }
+    return CreateDirectoryA(path, NULL) != 0 || GetLastError() == ERROR_ALREADY_EXISTS;
+}
+
+static bool sitlIsBlackboxLogName(const char *name)
+{
+    return strlen(name) == 12
+        && strncmp(name, "LOG", 3) == 0
+        && name[8] == '.'
+        && strncmp(name + 9, "BFL", 3) == 0;
+}
+
+// Keep at most gBlackboxMaxLogs logs in `dir`, deleting the oldest ones (by log
+// number). Runs with the blackbox closed, so it can never delete the log being
+// written.
+static void sitlBlackboxPrune(const char *dir)
+{
+    if (gBlackboxMaxLogs <= 0) {
+        return;
+    }
+    struct {
+        int number;
+        char name[MAX_PATH];
+    } logs[SITL_BLACKBOX_MAX_TRACKED];
+    int count = 0;
+
+    DIR *d = opendir(dir);
+    if (d == NULL) {
+        return;
+    }
+    struct dirent *entry;
+    while ((entry = readdir(d)) != NULL && count < SITL_BLACKBOX_MAX_TRACKED) {
+        if (sitlIsBlackboxLogName(entry->d_name)) {
+            logs[count].number = atoi(entry->d_name + 3);
+            strncpy(logs[count].name, entry->d_name, sizeof(logs[count].name) - 1);
+            logs[count].name[sizeof(logs[count].name) - 1] = '\0';
+            count++;
+        }
+    }
+    closedir(d);
+
+    if (count <= gBlackboxMaxLogs) {
+        return;
+    }
+    // Ascending by log number, so the oldest end up first.
+    for (int i = 1; i < count; i++) {
+        const typeof(logs[0]) key = logs[i];
+        int j = i - 1;
+        while (j >= 0 && logs[j].number > key.number) {
+            logs[j + 1] = logs[j];
+            j--;
+        }
+        logs[j + 1] = key;
+    }
+
+    const int removeCount = count - gBlackboxMaxLogs;
+    for (int i = 0; i < removeCount; i++) {
+        char path[MAX_PATH];
+        _snprintf(path, sizeof(path), "%s\\%s", dir, logs[i].name);
+        if (remove(path) == 0) {
+            sitlAuditLog("blackbox: pruned %s (keeping the newest %d logs in %s)",
+                         logs[i].name, gBlackboxMaxLogs, dir);
+        }
+    }
+}
+
+static void sitlBlackboxReadMaxLogsSetting(void)
+{
+    const char *env = getenv("BF_SITL_BLACKBOX_MAX_LOGS");
+    if (env != NULL && env[0] != '\0') {
+        const long v = strtol(env, NULL, 10);
+        if (v >= 0 && v <= 100000) {
+            gBlackboxMaxLogs = (int)v;
+        }
+    }
+}
 
 static const char *sitlBlackboxDir(char *buf, size_t size)
 {
@@ -1173,12 +1286,21 @@ static const char *sitlBlackboxDir(char *buf, size_t size)
             return NULL;
         }
         memcpy(buf, gBlackboxDir, strlen(gBlackboxDir) + 1);
-        CreateDirectoryA(buf, NULL);
+        sitlCreateDirChain(buf);
+        return buf;
+    }
+    const char *env = getenv("BF_SITL_BLACKBOX_DIR");
+    if (env != NULL && env[0] != '\0') {
+        if (strlen(env) + 1 > size) {
+            return NULL;
+        }
+        memcpy(buf, env, strlen(env) + 1);
+        sitlCreateDirChain(buf);
         return buf;
     }
     if (GetEnvironmentVariableA("LOCALAPPDATA", buf, (DWORD)size) > 0) {
-        _snprintf(buf + strlen(buf), size - strlen(buf), "\\Betaflight-SITL");
-        CreateDirectoryA(buf, NULL);
+        _snprintf(buf + strlen(buf), size - strlen(buf), "\\Betaflight-SITL\\blackbox");
+        sitlCreateDirChain(buf);
         return buf;
     }
     return NULL;
@@ -1190,7 +1312,16 @@ FILE *sitlBlackboxFopen(const char *filename, const char *mode)
     if (sitlBlackboxDir(dir, sizeof(dir)) != NULL) {
         char path[MAX_PATH];
         _snprintf(path, sizeof(path), "%s\\%s", dir, filename);
-        return fopen(path, mode);
+        FILE *fp = fopen(path, mode);
+        // A new log was just created: keep the folder bounded (the file itself
+        // is the newest, so only older logs can be pruned).
+        if (fp != NULL && sitlIsBlackboxLogName(filename)
+            && (mode[0] == 'w') && (mode[1] == '\0' || mode[1] == 'b')) {
+            sitlAuditLog("blackbox: new log %s in %s (max %d)",
+                         filename, dir, gBlackboxMaxLogs);
+            sitlBlackboxPrune(dir);
+        }
+        return fp;
     }
     return fopen(filename, mode);
 }
@@ -1214,6 +1345,13 @@ extern bool sitlBlackboxVirtualOpenReal(void);
 
 bool blackboxVirtualOpen(void)
 {
+    sitlBlackboxReadMaxLogsSetting();
+    char dir[MAX_PATH];
+    if (sitlBlackboxDir(dir, sizeof(dir)) != NULL) {
+        sitlAuditLog("blackbox: directory %s (keeping at most %d logs)",
+                     dir, gBlackboxMaxLogs);
+        sitlBlackboxPrune(dir);
+    }
     return sitlBlackboxVirtualOpenReal();
 }
 
@@ -1224,8 +1362,41 @@ int sitl_local_set_blackbox_dir(const char *path)
     }
     strncpy(gBlackboxDir, path, sizeof(gBlackboxDir) - 1);
     gBlackboxDir[sizeof(gBlackboxDir) - 1] = '\0';
-    CreateDirectoryA(gBlackboxDir, NULL);
+    sitlCreateDirChain(gBlackboxDir);
     blackboxVirtualOpen(); // re-scan for correct numbering in the new folder
+    return 0;
+}
+
+// Keep at most `maxLogs` logs in the blackbox folder (0 = unlimited). The cap is
+// applied immediately (the oldest logs are deleted) and again whenever a new log
+// is opened, so a long session can never fill the disk. Returns 0, or -1 for an
+// out-of-range value.
+int sitl_local_set_blackbox_max_logs(int maxLogs)
+{
+    if (maxLogs < 0 || maxLogs > 100000) {
+        return -1;
+    }
+    gBlackboxMaxLogs = maxLogs;
+    char dir[MAX_PATH];
+    if (sitlBlackboxDir(dir, sizeof(dir)) != NULL) {
+        sitlBlackboxPrune(dir);
+    }
+    return 0;
+}
+
+// Current blackbox directory ("" when the platform default is used), for a host
+// that wants to show or log where the logs land. Returns 0 on success, -1 when
+// the buffer is too small.
+int sitl_local_get_blackbox_dir(char *out, int size)
+{
+    if (out == NULL || size <= 0) {
+        return -1;
+    }
+    char dir[MAX_PATH];
+    if (sitlBlackboxDir(dir, sizeof(dir)) == NULL || (int)strlen(dir) + 1 > size) {
+        return -1;
+    }
+    memcpy(out, dir, strlen(dir) + 1);
     return 0;
 }
 

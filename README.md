@@ -1093,13 +1093,29 @@ standard `.BFL` logs to the working directory:
   `set blackbox_device = VIRTUAL` + `save`.
 - Logs are named `LOG00001.BFL`, `LOG00002.BFL`, ... (auto-incrementing). In
   the standalone build they land in the process working directory; in the
-  LOCAL DLL build they are redirected to the same stable folder as the
-  virtual EEPROM (`%LOCALAPPDATA%\Betaflight-SITL\LOG00001.BFL`), because the
-  host engine's working directory is not under your control. The host can
-  override the folder at runtime per aircraft with
-  `sitl_local_set_blackbox_dir("E:\\MySim\\Aircraft1")` - the directory is
-  created if missing and the log numbering is re-scanned, so existing logs in
-  that folder are never overwritten (call it before arming / logging starts).
+  LOCAL DLL build they get a **dedicated, fixed folder** -
+  `%LOCALAPPDATA%\Betaflight-SITL\blackbox\LOG00001.BFL` - because the host
+  engine's working directory is not under your control and the logs must not mix
+  with `eeprom.bin` / the audit and burst logs. The folder is created
+  automatically, the log numbering is re-scanned at every boot and directory
+  change, so existing logs are never overwritten.
+- **The folder is kept bounded.** Only the newest 10 logs are kept (default
+  `BF_SITL_BLACKBOX_MAX_LOGS=10`, `0` = unlimited); older ones are deleted when a
+  new log is opened *and* when the blackbox directory is scanned at boot, so a
+  folder that already holds hundreds of logs is trimmed to the cap on the next
+  start. Each prune is logged (`blackbox: pruned LOG00007.BFL (keeping the
+  newest 10 logs in ...)`).
+- Settings:
+
+  | setting | effect |
+  | --- | --- |
+  | `BF_SITL_BLACKBOX_DIR` | fixed log folder (default `%LOCALAPPDATA%\Betaflight-SITL\blackbox`) |
+  | `BF_SITL_BLACKBOX_MAX_LOGS` | log count cap, `0` = unlimited (default 10) |
+  | `sitl_local_set_blackbox_dir("E:\\MySim\\Aircraft1")` | per-aircraft folder at runtime (created if missing, numbering re-scanned) |
+  | `sitl_local_set_blackbox_max_logs(n)` | change the cap at runtime; applies immediately (oldest deleted) |
+  | `sitl_local_get_blackbox_dir(buf, size)` | ask the FC where the logs are going |
+
+  Call the setters before arming / logging starts.
 - `blackbox_mode = NORMAL` (default) records while armed; `ALWAYS` records
   from boot without arming; `MOTOR_TEST` records during motor tests.
 - `blackbox_sample_rate` selects 1/1, 1/2, 1/4, 1/8 or 1/16 of the PID rate
@@ -1111,7 +1127,10 @@ Workflow:
 2. Disarm / stop - the log is flushed and closed.
 3. Open the Betaflight Configurator's Blackbox tab and load
    `build-win-cmake\LOG00001.BFL` (standalone), or
-   `%LOCALAPPDATA%\Betaflight-SITL\LOG00001.BFL` (LOCAL DLL).
+   `%LOCALAPPDATA%\Betaflight-SITL\blackbox\LOG00001.BFL` (LOCAL DLL). Logs
+   written before this folder existed stay in
+   `%LOCALAPPDATA%\Betaflight-SITL\` and are not managed (or deleted) by the
+   cap - remove them by hand if you no longer need them.
 
 Recorded fields include loop iteration, gyro (filtered and unfiltered), PID
 terms (P/I/D/F per axis), RC commands, setpoints, battery, motors, and the
