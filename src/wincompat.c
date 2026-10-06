@@ -1251,7 +1251,7 @@ static int sitlBlackboxCollect(const char *dir, sitlBlackboxLog_t *logs, int max
     return count;
 }
 
-// Drop the oldest logs until at most `keep` remain (keep <= 0 = no limit) and
+// Drop the oldest logs until at most `keep` remain (keep < 0 = no limit) and
 // renumber the survivors so the folder is a rolling window LOG00001..LOG0000n
 // with the newest log always at the highest number. Without the renumbering the
 // firmware's own counter (blackbox_virtual.c always uses "largest in folder + 1")
@@ -1268,7 +1268,7 @@ static int sitlBlackboxEnforce(const char *dir, int keep)
     const int count = sitlBlackboxCollect(dir, logs, SITL_BLACKBOX_MAX_TRACKED);
     int first = 0;
 
-    if (keep > 0 && count > keep) {
+    if (keep >= 0 && count > keep) {
         first = count - keep;
         for (int i = 0; i < first; i++) {
             char path[MAX_PATH];
@@ -1347,7 +1347,8 @@ FILE *sitlBlackboxFopen(const char *filename, const char *mode)
             // one the next number: the folder stays a rolling window and the
             // newest log is always the highest number (the firmware's own
             // counter is not used for the name).
-            const int keep = (gBlackboxMaxLogs > 0) ? gBlackboxMaxLogs - 1 : 0;
+            // Keep room for this log: cap 1 means "delete every existing log".
+            const int keep = (gBlackboxMaxLogs > 0) ? gBlackboxMaxLogs - 1 : -1;
             const int existing = sitlBlackboxEnforce(dir, keep);
             _snprintf(path, sizeof(path), "%s\\LOG%05d.BFL", dir, existing + 1);
             FILE *fp = fopen(path, mode);
@@ -1391,7 +1392,7 @@ bool blackboxVirtualOpen(void)
         // Trim to the cap and renumber the survivors to LOG00001.. so a folder
         // that was left with drifting numbers (or came from an older build) is
         // tidied up at every boot / directory switch.
-        (void)sitlBlackboxEnforce(dir, gBlackboxMaxLogs);
+        (void)sitlBlackboxEnforce(dir, (gBlackboxMaxLogs > 0) ? gBlackboxMaxLogs : -1);
     }
     return sitlBlackboxVirtualOpenReal();
 }
@@ -1427,7 +1428,7 @@ int sitl_local_set_blackbox_max_logs(int maxLogs)
     gBlackboxMaxLogs = maxLogs;
     char dir[MAX_PATH];
     if (sitlBlackboxDir(dir, sizeof(dir)) != NULL) {
-        (void)sitlBlackboxEnforce(dir, gBlackboxMaxLogs);
+        (void)sitlBlackboxEnforce(dir, (gBlackboxMaxLogs > 0) ? gBlackboxMaxLogs : -1);
     }
     return 0;
 }
