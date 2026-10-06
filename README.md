@@ -1091,14 +1091,27 @@ standard `.BFL` logs to the working directory:
 - Fresh EEPROMs default to `blackbox_device = VIRTUAL` (compile-time default).
 - Existing EEPROMs keep their saved value; set it once with
   `set blackbox_device = VIRTUAL` + `save`.
-- Logs are named `LOG00001.BFL`, `LOG00002.BFL`, ... (auto-incrementing). In
-  the standalone build they land in the process working directory; in the
-  LOCAL DLL build they get a **dedicated, fixed folder** -
+- **Where they go.** Logs are named `LOG00001.BFL`, `LOG00002.BFL`, ...; the
+  standalone build writes them into the process working directory, while the
+  LOCAL DLL build gets a **dedicated, fixed folder** -
   `%LOCALAPPDATA%\Betaflight-SITL\blackbox\LOG00001.BFL` - because the host
   engine's working directory is not under your control and the logs must not mix
   with `eeprom.bin` / the audit and burst logs. The folder is created
-  automatically, the log numbering is re-scanned at every boot and directory
-  change, so existing logs are never overwritten.
+  automatically.
+- **The numbering is a rolling window.** With the cap at 10 the folder always
+  contains `LOG00001.BFL..LOG00010.BFL`, and the highest number is the newest log
+  (number order = age order). When a new log is opened the oldest is deleted and
+  the survivors are renumbered down, so the numbers neither grow for ever (the
+  firmware's own naming is "largest number in the folder + 1", which drifts, and
+  made a fresh folder inherit the previous folder's numbering) nor start at a
+  strange number in a new folder. The renumbering only moves *closed* logs, and
+  only to a lower number, in ascending order - so every target is either already
+  correct or was freed by the previous step, and it can never collide with a file
+  that still has to move. The log being opened is created with its final name
+  directly. A folder left with drifting numbers (e.g. from an older build) is
+  tidied on the next boot / directory switch. If a file cannot be renamed or
+  deleted (locked by an open viewer), that step is skipped, written to the audit
+  log, and retried by the next log/boot.
 - **The folder is kept bounded.** Only the newest 10 logs are kept (default
   `BF_SITL_BLACKBOX_MAX_LOGS=10`, `0` = unlimited); older ones are deleted when a
   new log is opened *and* when the blackbox directory is scanned at boot, so a

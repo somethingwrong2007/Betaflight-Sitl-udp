@@ -1214,26 +1214,22 @@ static bool sitlIsBlackboxLogName(const char *name)
         && strncmp(name + 9, "BFL", 3) == 0;
 }
 
-// Keep at most gBlackboxMaxLogs logs in `dir`, deleting the oldest ones (by log
-// number). Runs with the blackbox closed, so it can never delete the log being
-// written.
-static void sitlBlackboxPrune(const char *dir)
-{
-    if (gBlackboxMaxLogs <= 0) {
-        return;
-    }
-    struct {
-        int number;
-        char name[MAX_PATH];
-    } logs[SITL_BLACKBOX_MAX_TRACKED];
-    int count = 0;
+typedef struct {
+    int number;
+    char name[MAX_PATH];
+} sitlBlackboxLog_t;
 
+// List the LOG*.BFL files in `dir`, sorted by their log number (= their age
+// order, because every log is created with a number above all existing ones).
+static int sitlBlackboxCollect(const char *dir, sitlBlackboxLog_t *logs, int maxLogs)
+{
+    int count = 0;
     DIR *d = opendir(dir);
     if (d == NULL) {
-        return;
+        return 0;
     }
     struct dirent *entry;
-    while ((entry = readdir(d)) != NULL && count < SITL_BLACKBOX_MAX_TRACKED) {
+    while ((entry = readdir(d)) != NULL && count < maxLogs) {
         if (sitlIsBlackboxLogName(entry->d_name)) {
             logs[count].number = atoi(entry->d_name + 3);
             strncpy(logs[count].name, entry->d_name, sizeof(logs[count].name) - 1);
@@ -1243,12 +1239,8 @@ static void sitlBlackboxPrune(const char *dir)
     }
     closedir(d);
 
-    if (count <= gBlackboxMaxLogs) {
-        return;
-    }
-    // Ascending by log number, so the oldest end up first.
     for (int i = 1; i < count; i++) {
-        const typeof(logs[0]) key = logs[i];
+        const sitlBlackboxLog_t key = logs[i];
         int j = i - 1;
         while (j >= 0 && logs[j].number > key.number) {
             logs[j + 1] = logs[j];
@@ -1256,16 +1248,53 @@ static void sitlBlackboxPrune(const char *dir)
         }
         logs[j + 1] = key;
     }
+    return count;
+}
 
-    const int removeCount = count - gBlackboxMaxLogs;
-    for (int i = 0; i < removeCount; i++) {
-        char path[MAX_PATH];
-        _snprintf(path, sizeof(path), "%s\\%s", dir, logs[i].name);
-        if (remove(path) == 0) {
-            sitlAuditLog("blackbox: pruned %s (keeping the newest %d logs in %s)",
-                         logs[i].name, gBlackboxMaxLogs, dir);
+// Drop the oldest logs until at most `keep` remain (keep <= 0 = no limit) and
+// renumber the survivors so the folder is a rolling window LOG00001..LOG0000n
+// with the newest log always at the highest number. Without the renumbering the
+// firmware's own counter (blackbox_virtual.c always uses "largest in folder + 1")
+// grows for ever, and a fresh folder inherits the previous folder's numbering.
+//
+// The renumbering only ever moves a closed log to a *lower* number, processing
+// them in ascending number order, so every target is either already correct or
+// was freed by the previous step - it can never collide with a file that is
+// still to move. The log being written at this moment is untouched (it is
+// created with its final name by sitlBlackboxFopen()).
+static int sitlBlackboxEnforce(const char *dir, int keep)
+{
+    sitlBlackboxLog_t logs[SITL_BLACKBOX_MAX_TRACKED];
+    const int count = sitlBlackboxCollect(dir, logs, SITL_BLACKBOX_MAX_TRACKED);
+    int first = 0;
+
+    if (keep > 0 && count > keep) {
+        first = count - keep;
+        for (int i = 0; i < first; i++) {
+            char path[MAX_PATH];
+            _snprintf(path, sizeof(path), "%s\\%s", dir, logs[i].name);
+            if (remove(path) == 0) {
+                sitlAuditLog("blackbox: pruned %s (keeping the newest %d logs in %s)",
+                             logs[i].name, keep, dir);
+            }
         }
     }
+
+    for (int i = first; i < count; i++) {
+        const int target = i - first + 1;
+        if (logs[i].number == target) {
+            continue;
+        }
+        char from[MAX_PATH];
+        char to[MAX_PATH];
+        _snprintf(from, sizeof(from), "%s\\%s", dir, logs[i].name);
+        _snprintf(to, sizeof(to), "%s\\LOG%05d.BFL", dir, target);
+        if (rename(from, to) != 0) {
+            sitlAuditLog("blackbox: could not renumber %s -> LOG%05d.BFL (file in use?)",
+                         logs[i].name, target);
+        }
+    }
+    return count - first;
 }
 
 static void sitlBlackboxReadMaxLogsSetting(void)
@@ -1311,16 +1340,25 @@ FILE *sitlBlackboxFopen(const char *filename, const char *mode)
     char dir[MAX_PATH];
     if (sitlBlackboxDir(dir, sizeof(dir)) != NULL) {
         char path[MAX_PATH];
+        const bool newLog = sitlIsBlackboxLogName(filename)
+            && (mode[0] == 'w') && (mode[1] == '\0' || mode[1] == 'b');
+        if (newLog) {
+            // Make room, compact the existing logs to LOG00001.. and give this
+            // one the next number: the folder stays a rolling window and the
+            // newest log is always the highest number (the firmware's own
+            // counter is not used for the name).
+            const int keep = (gBlackboxMaxLogs > 0) ? gBlackboxMaxLogs - 1 : 0;
+            const int existing = sitlBlackboxEnforce(dir, keep);
+            _snprintf(path, sizeof(path), "%s\\LOG%05d.BFL", dir, existing + 1);
+            FILE *fp = fopen(path, mode);
+            if (fp != NULL) {
+                sitlAuditLog("blackbox: new log LOG%05d.BFL in %s (max %d)",
+                             existing + 1, dir, gBlackboxMaxLogs);
+            }
+            return fp;
+        }
         _snprintf(path, sizeof(path), "%s\\%s", dir, filename);
         FILE *fp = fopen(path, mode);
-        // A new log was just created: keep the folder bounded (the file itself
-        // is the newest, so only older logs can be pruned).
-        if (fp != NULL && sitlIsBlackboxLogName(filename)
-            && (mode[0] == 'w') && (mode[1] == '\0' || mode[1] == 'b')) {
-            sitlAuditLog("blackbox: new log %s in %s (max %d)",
-                         filename, dir, gBlackboxMaxLogs);
-            sitlBlackboxPrune(dir);
-        }
         return fp;
     }
     return fopen(filename, mode);
@@ -1350,7 +1388,10 @@ bool blackboxVirtualOpen(void)
     if (sitlBlackboxDir(dir, sizeof(dir)) != NULL) {
         sitlAuditLog("blackbox: directory %s (keeping at most %d logs)",
                      dir, gBlackboxMaxLogs);
-        sitlBlackboxPrune(dir);
+        // Trim to the cap and renumber the survivors to LOG00001.. so a folder
+        // that was left with drifting numbers (or came from an older build) is
+        // tidied up at every boot / directory switch.
+        (void)sitlBlackboxEnforce(dir, gBlackboxMaxLogs);
     }
     return sitlBlackboxVirtualOpenReal();
 }
@@ -1386,7 +1427,7 @@ int sitl_local_set_blackbox_max_logs(int maxLogs)
     gBlackboxMaxLogs = maxLogs;
     char dir[MAX_PATH];
     if (sitlBlackboxDir(dir, sizeof(dir)) != NULL) {
-        sitlBlackboxPrune(dir);
+        (void)sitlBlackboxEnforce(dir, gBlackboxMaxLogs);
     }
     return 0;
 }
