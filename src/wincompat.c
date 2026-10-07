@@ -431,6 +431,21 @@ uint32_t sitlLocalGyroGridUs(void)
 #endif
 }
 
+// The rates the gyro/loop actually run at (for the boot rate audit).
+void sitlLocalGetGyroRates(uint16_t *sampleRateHz, uint32_t *sampleLooptime,
+                           uint32_t *targetLooptime)
+{
+#ifdef SITL_LOCAL
+    if (sampleRateHz)   { *sampleRateHz = gyro.sampleRateHz; }
+    if (sampleLooptime) { *sampleLooptime = gyro.sampleLooptime; }
+    if (targetLooptime) { *targetLooptime = gyro.targetLooptime; }
+#else
+    UNUSED(sampleRateHz);
+    UNUSED(sampleLooptime);
+    UNUSED(targetLooptime);
+#endif
+}
+
 // The RPM the host actually sent (before the firmware-style lowpass), for the
 // input-data view.
 void sitlLocalGetRpmRawMotorHz(float motorHz[4])

@@ -47,6 +47,7 @@
 #include "fc/runtime_config.h"
 #include "config/feature.h"
 #include "msp/msp.h"
+#include "pg/rpm_filter.h"
 #include "rx/rx.h"
 #include "sensors/battery.h"
 #ifdef USE_BLACKBOX
@@ -870,6 +871,72 @@ static DWORD WINAPI localMspThreadProc(LPVOID arg)
     return 0;
 }
 
+// Boot audit of the rates the loop actually runs at. The SITL target's
+// compile-time defaults are 10 kHz for the gyro/PID task
+// (TASK_GYROPID_DESIRED_PERIOD) with the scheduler's period floor lifted
+// (SCHEDULER_DELAY_LIMIT 1), while the *runtime* configuration (the virtual
+// gyro's 1 kHz sample rate and pid_process_denom) decides the real periods.
+// Logging both makes a mis-set rate visible instead of a guess - a rate that is
+// still on the compile-time default shows up here immediately.
+static void sitlLocalLogRateAudit(void)
+{
+    extern void sitlLocalGetGyroRates(uint16_t *sampleRateHz, uint32_t *sampleLooptime,
+                                      uint32_t *targetLooptime);
+    extern uint8_t activePidLoopDenom;
+
+    uint16_t sampleRateHz = 0;
+    uint32_t sampleLooptime = 0;
+    uint32_t targetLooptime = 0;
+    sitlLocalGetGyroRates(&sampleRateHz, &sampleLooptime, &targetLooptime);
+
+    taskInfo_t info;
+    getTaskInfo(TASK_GYRO, &info);
+    const uint32_t gyroUs = (uint32_t)info.desiredPeriodUs;
+    getTaskInfo(TASK_FILTER, &info);
+    const uint32_t filterUs = (uint32_t)info.desiredPeriodUs;
+    getTaskInfo(TASK_PID, &info);
+    const uint32_t pidUs = (uint32_t)info.desiredPeriodUs;
+    getTaskInfo(TASK_RX, &info);
+    const uint32_t rxUs = (uint32_t)info.desiredPeriodUs;
+    getTaskInfo(TASK_SERIAL, &info);
+    const uint32_t serialUs = (uint32_t)info.desiredPeriodUs;
+    getTaskInfo(TASK_ACCEL, &info);
+    const uint32_t accelUs = (uint32_t)info.desiredPeriodUs;
+    getTaskInfo(TASK_ATTITUDE, &info);
+    const uint32_t attitudeUs = (uint32_t)info.desiredPeriodUs;
+
+    sitlAuditLog("rates: gyroHz=%u sampleUs=%u targetUs=%u denom(active/cfg)=%u/%u "
+                 "pidDT=%.6f pidHz=%.1f taskUs(gyro/filter/pid/rx/serial/accel/att)="
+                 "%u/%u/%u/%u/%u/%u/%u measured(gyro/pid)Us=%d/%d | "
+                 "compile: TASK_GYROPID_DESIRED_PERIOD=%u SCHEDULER_DELAY_LIMIT=%u "
+                 "TASK_EXEC_TIME_CLAMP_US=%u",
+                 (unsigned)sampleRateHz, (unsigned)sampleLooptime, (unsigned)targetLooptime,
+                 (unsigned)activePidLoopDenom, (unsigned)pidConfig()->pid_process_denom,
+                 (double)pidGetDT(), (double)pidGetPidFrequency(),
+                 (unsigned)gyroUs, (unsigned)filterUs, (unsigned)pidUs, (unsigned)rxUs,
+                 (unsigned)serialUs, (unsigned)accelUs, (unsigned)attitudeUs,
+                 (int)getTaskDeltaTimeUs(TASK_GYRO), (int)getTaskDeltaTimeUs(TASK_PID),
+                 (unsigned)TASK_GYROPID_DESIRED_PERIOD, (unsigned)SCHEDULER_DELAY_LIMIT,
+                 (unsigned)TASK_EXEC_TIME_CLAMP_US);
+
+    // The RPM filter's own rate-coupled numbers, derived the same way
+    // rpmFilterInit()/rpmFilterUpdate() do (RPM_FILTER_DURATION_S is 1 ms, so at
+    // a 1 ms loop every notch of every motor is refreshed once per cycle).
+    {
+        const uint32_t looptimeUs = targetLooptime ? targetLooptime : 1000;
+        const uint32_t harmonics = rpmFilterConfig()->rpm_filter_harmonics;
+        const uint32_t notches = (unsigned)getMotorCount() * harmonics;
+        const uint32_t iterationsPerUpdate = looptimeUs >= 1000 ? 1 : (1000 / looptimeUs);
+        const uint32_t updatesPerCycle = (notches + iterationsPerUpdate - 1) / iterationsPerUpdate;
+        sitlAuditLog("rpm filter rates: harmonics=%u dt=%.6f s maxHz=%.0f lpfHz=%u "
+                     "notches=%u updatesPerCycle=%u (RPM_FILTER_DURATION_S=1ms)",
+                     (unsigned)harmonics, (double)looptimeUs * 1e-6,
+                     0.48 * 1e6 / (double)looptimeUs,
+                     (unsigned)rpmFilterConfig()->rpm_filter_lpf_hz,
+                     (unsigned)notches, (unsigned)updatesPerCycle);
+    }
+}
+
 int sitl_local_init(void)
 {
     if (gLocalRunning) {
@@ -979,6 +1046,8 @@ int sitl_local_init(void)
     sitlLocalLogControlState(gLocalBootCount == 1 ? "boot#1" : "boot#n");
     extern void sitlLocalLogRpmLoops(void);
     sitlLocalLogRpmLoops();
+    extern void sitlLocalLogRateAudit(void);
+    sitlLocalLogRateAudit();
 
     gLocalRunning = true;
     gMspThreadStop = 0;
