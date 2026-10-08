@@ -161,6 +161,49 @@ undefines `USE_DYN_NOTCH_FILTER` whenever `ENABLE_SIMULATOR` is 1 (it needs
 loop rate. On real hardware `dynNotchInit()` additionally refuses to build it
 below 2 kHz of loop rate - a gate 4 kHz would satisfy.
 
+#### Performance (LOCAL, measured)
+
+`sitl_local_save_compare bench` reports what one step costs (set
+`BF_HARNESS_STEP_US=250` for the 4 kHz link). Measured here, armed, with the
+blackbox logging:
+
+| Configuration | CPU per 250 us step | of one core |
+| --- | --- | --- |
+| 4 kHz loop (default) | 3.5-3.9 us | **1.4-1.6%** |
+| 4 kHz loop, disarmed | 3.4 us | 1.37% |
+| 1 kHz loop (`BF_SITL_GYRO_HZ=1000`) | 1.1 us | 0.46% |
+
+The cost is the firmware's own loop math, and it scales with the loop rate; the
+armed-only part (mixer, motor output, blackbox frames) is ~0.2 us/step. What the
+LOCAL link adds on top is the per-step sensor feed (gyro/acc/mag/GPS/telemetry),
+which is flat per host step.
+
+Two log paths wrote far more often than they needed to - that is what
+"high-rate logging" looks like from inside the flight loop:
+
+- **Burst record**: it wrote one line per FC loop iteration, so a 4 kHz build
+  produced **4000 formatted lines/s** and rewrote its ~400 KB file every 3 s
+  (~130 KB/s). It now records on a 1 ms *virtual-time* grid (1000 lines/s at any
+  loop rate) and rewrites every 12 s (~33 KB/s), with the same 2 s window.
+  `BF_SITL_BURST_FULL=1` restores one line per iteration.
+- **Blackbox**: `blackbox.c` flushes the log on every frame ("so that our runtime
+  variance is minimized"), which at 4 kHz with the default `sample_rate` of 1/4
+  is **1000 `flush()` syscalls per second** out of the flight loop. The LOCAL
+  build now gives the log a 64 KB stdio buffer and throttles that flush to 10 Hz
+  (`BF_SITL_BLACKBOX_FLUSH_MS`); the forced flushes at log start/stop and in the
+  cache-flush state still write everything out.
+
+Also removed from the per-step path: a `getenv()` (now cached), a `pow()` (now
+recomputed only when the altitude moves 5 cm) and two `clock_gettime()` calls per
+step (now QueryPerformanceCounter - which also fixes the `stepUs` figure in the
+audit log, which used to read 0-1 us because that clock is too coarse to time a
+step).
+
+The test harness now claims its own port block (`BF_SITL_TCP_BASE=15760` and
+`BF_SITL_WS_PORT=16761`) and writes its audit/burst/blackbox files under `%TEMP%`,
+so it can run while a live host holds the configurator ports, the EEPROM and the
+user's logs.
+
 ### CI
 
 `.github/workflows/build.yml` builds Linux and Windows binaries on push/PR:
@@ -1242,6 +1285,15 @@ sim workflow.
 |----------|---------|
 | `BF_SITL_EEPROM` | Path to the virtual EEPROM file (default `eeprom.bin` in CWD) |
 | `BF_SITL_GYRO_HZ` | Runtime gyro/filter/PID frequency override (100-10000); re-derives the gyro sample rate and filter chains at boot |
+| `BF_SITL_AUDIT_LOG` | Path of the audit trail (default `%LOCALAPPDATA%\Betaflight-SITL\sitl-audit.log`) |
+| `BF_SITL_BURST_LOG` | Path of the burst record (default `%LOCALAPPDATA%\Betaflight-SITL\sitl-burst.log`) |
+| `BF_SITL_BURST_FULL` | `1` records one burst line per FC loop iteration instead of the 1 kHz record grid |
+| `BF_SITL_BLACKBOX_DIR` | Blackbox folder (LOCAL default: `%LOCALAPPDATA%\Betaflight-SITL\blackbox`) |
+| `BF_SITL_BLACKBOX_MAX_LOGS` | Rolling-window size of the blackbox folder (default 10, `0` = unlimited) |
+| `BF_SITL_BLACKBOX_FLUSH_MS` | How often the per-frame blackbox flush reaches the disk (default 100 ms; the forced flushes at log start/stop are unaffected) |
+| `BF_SITL_TCP_BASE` | Base of the MSP/TCP listen block (default 5760, i.e. MSP on 5761) |
+| `BF_SITL_WS_PORT` | WebSocket proxy listen port (default 6761) |
+| `BF_SITL_DT_SNAP` | `0` disables snapping a near-grid host step onto the FC grid |
 | `BFWEB_PORT` | Port for the local web configurator (default 8080) |
 | `BF_SITL_REBOOT_CHILD` | Internal marker for the auto-restart child process |
 

@@ -475,6 +475,14 @@ if(WIN32)
     # %LOCALAPPDATA%\Betaflight-SITL folder (same as the virtual EEPROM).
     set_source_files_properties("${BF_ROOT}/src/main/blackbox/blackbox_virtual.c" PROPERTIES COMPILE_OPTIONS
       "-Dfopen=sitlBlackboxFopen;-Dopendir=sitlBlackboxOpendir;-DblackboxVirtualOpen=sitlBlackboxVirtualOpenReal")
+    # blackbox.c flushes the log "every iteration so that our runtime variance is
+    # minimized" - at a 4 kHz loop with the default sample_rate of 1/4 that is
+    # 1000 flush() syscalls per second, straight out of the flight loop. Rename
+    # only that call site: blackboxDeviceFlushForce()/ForceComplete() keep the
+    # real flush for the log start/stop and cache-flush paths, and the wrapper in
+    # wincompat.c throttles the per-iteration one to 10 Hz.
+    set_source_files_properties("${BF_ROOT}/src/main/blackbox/blackbox.c" PROPERTIES COMPILE_OPTIONS
+      "-DblackboxDeviceFlush=sitlBlackboxDeviceFlushThrottled")
   else()
     set_source_files_properties("${BF_ROOT}/src/main/msp/msp.c" PROPERTIES COMPILE_OPTIONS
       "-DsystemReset=sitlSystemReset")
