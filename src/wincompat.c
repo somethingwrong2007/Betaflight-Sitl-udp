@@ -67,16 +67,39 @@ void systemReset(void);
 extern void blackboxFinish(void);
 #endif
 
+// Cheap monotonic wall clock for the flight-loop hot path.
+//
+// micros64_real() goes through clock_gettime(CLOCK_MONOTONIC), which on
+// Windows/MinGW costs ~1.5 us per call - and sitl_local_step() reads the clock
+// twice per step (once to start the timing, once in localRecordStepStats). At a
+// 4 kHz loop that is 3 us out of every 250 us step, i.e. the single largest item
+// of the wrapper's own overhead. QueryPerformanceCounter is ~20 ns, so use it
+// for the per-step timing and anything else that runs per frame; the audit log
+// and other rare callers keep micros64_real().
+uint64_t sitlWallUs(void)
+{
+    static LARGE_INTEGER freq;
+    if (freq.QuadPart == 0) {
+        QueryPerformanceFrequency(&freq);
+    }
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return (uint64_t)((now.QuadPart * 1000000LL) / freq.QuadPart);
+}
+
 // Append one line to %LOCALAPPDATA%\Betaflight-SITL\sitl-audit.log so save /
 // connection problems in the in-process LOCAL build are traceable without
-// capturing the host process stderr.
+// capturing the host process stderr. BF_SITL_AUDIT_LOG redirects the file, so a
+// test tool can keep its own trail instead of appending to the host's.
 void sitlAuditLog(const char *fmt, ...)
 {
     char path[MAX_PATH];
-    if (GetEnvironmentVariableA("LOCALAPPDATA", path, sizeof(path)) <= 0) {
-        return;
+    if (GetEnvironmentVariableA("BF_SITL_AUDIT_LOG", path, sizeof(path)) <= 0) {
+        if (GetEnvironmentVariableA("LOCALAPPDATA", path, sizeof(path)) <= 0) {
+            return;
+        }
+        strncat(path, "\\Betaflight-SITL\\sitl-audit.log", sizeof(path) - strlen(path) - 1);
     }
-    strncat(path, "\\Betaflight-SITL\\sitl-audit.log", sizeof(path) - strlen(path) - 1);
 
     FILE *log = fopen(path, "a");
     if (log == NULL) {
@@ -1409,11 +1432,11 @@ static const char *sitlBlackboxDir(char *buf, size_t size)
 
 FILE *sitlBlackboxFopen(const char *filename, const char *mode)
 {
-    // The firmware writes blackbox frames one byte at a time (fputc) and a FILE*
-    // opened without an explicit buffer uses the CRT default (512 bytes on
-    // MinGW/ucrt). Give it a large buffer of our own so the per-byte writes never
-    // reach the OS and the throttled flush below is the only thing that touches
-    // the disk.
+    // The firmware writes blackbox frames one byte at a time (fputc), and a
+    // FILE* opened without an explicit buffer uses the CRT default (512 bytes
+    // on MinGW/ucrt). Give it a large buffer of our own: the per-byte writes
+    // then never reach the OS, and the throttled flush below is the only thing
+    // that touches the disk.
     static char blackboxFileBuffer[64 * 1024];
     FILE *fp = NULL;
     char dir[MAX_PATH];
@@ -1449,12 +1472,12 @@ FILE *sitlBlackboxFopen(const char *filename, const char *mode)
 }
 
 // The per-iteration flush blackbox.c performs (renamed to this symbol for the
-// LOCAL build, see CMakeLists.txt). It exists so a decode-to-date log file is on
-// disk at all times, but a 4 kHz loop logs ~1000 frames/s and every flush() is a
-// WriteFile syscall from the flight loop. The log is only read after it is
-// closed, so fuse that to a few Hz - nothing is lost (the forced flushes at log
-// start/stop and the shutdown path still write everything out) and the flight
-// loop stops waiting on the file system.
+// LOCAL build, see CMakeLists.txt). It exists so that a decode-to-date log file
+// is on disk at all times, but a 4 kHz loop logs ~1000 frames/s and every
+// flush() is a WriteFile syscall from the flight loop. The log is only read
+// after it is closed, so fuse that to a few Hz: nothing is lost - the forced
+// flushes at log start/stop and the shutdown path still write everything out -
+// and the flight loop stops paying for the file system.
 void sitlBlackboxDeviceFlushThrottled(void)
 {
     extern void blackboxDeviceFlush(void);
@@ -1465,7 +1488,8 @@ void sitlBlackboxDeviceFlushThrottled(void)
         const long v = (env != NULL && env[0] != '\0') ? strtol(env, NULL, 10) : 100;
         flushIntervalMs = (v >= 1 && v <= 5000) ? (uint32_t)v : 100;
     }
-    const uint64_t nowUs = micros64_real();
+    extern uint64_t sitlWallUs(void);
+    const uint64_t nowUs = sitlWallUs();
     if (nowUs - lastFlushUs < (uint64_t)flushIntervalMs * 1000ULL) {
         return;
     }
