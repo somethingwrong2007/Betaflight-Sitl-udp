@@ -125,6 +125,37 @@ def main():
         describe(ax, gyro_filt[:, i], fs, motor_hz)
     print(f"  |D| mean = {np.mean(np.abs(pid_d), axis=0).round(3)} (deg/s * D gain)")
 
+    # Is a peak in the feed driven by the FC (a limit cycle) or injected? Compare
+    # where the feed, the PID sum and the motor outputs put their energy.
+    pid_p = d[:, 4:7]
+    pid_sum = d[:, 16:19]
+    print("  PID terms (mean |P|/|I|/|D|/|sum| per axis):")
+    for i, ax in enumerate(("roll", "pitch", "yaw")):
+        print(f"    {ax:6s} P={np.mean(np.abs(pid_p[:, i])):8.2f} "
+              f"I={np.mean(np.abs(d[:, 7 + i])):7.2f} "
+              f"D={np.mean(np.abs(pid_d[:, i])):8.2f} "
+              f"sum={np.mean(np.abs(pid_sum[:, i])):8.2f}")
+    print(f"  motor outputs: mean={np.mean(motors, axis=0).round(0)} "
+          f"pk-pk={np.round(np.ptp(motors, axis=0), 0)}")
+    print(f"  attitude pk-pk (deg): {np.round(np.ptp(d[:, 23:26], axis=0) / 10.0, 2)}")
+    print("  top spectral peaks:")
+    for tag, x, scale in (("fed roll", gyro_raw[:, 0], 1.0),
+                          ("filtered roll", gyro_filt[:, 0], 1.0),
+                          ("D roll", pid_d[:, 0], 1.0),
+                          ("motor 0", motors[:, 0], 1.0),
+                          ("att roll", d[:, 23] / 10.0, 1.0)):
+        freqs, amp, _ = spectrum(x * scale, fs)
+        order = np.argsort(amp)[::-1]
+        picked = []
+        for i in order:
+            if any(abs(freqs[i] - f) < 8.0 for f, _ in picked):
+                continue
+            picked.append((float(freqs[i]), float(amp[i])))
+            if len(picked) == 4:
+                break
+        txt = "  ".join(f"{f:6.1f}Hz={a:7.3f}" for f, a in picked)
+        print(f"    {tag:14s} {txt}")
+
     ratio = max(s["motor_peak"] for s in stats)
     ctrl = max(s["control"] for s in stats)
     print()
