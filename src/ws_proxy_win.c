@@ -15,30 +15,16 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
 
 #include "win_socket_util.h"
 
 extern void sitlAuditLog(const char *fmt, ...);
-// The MSP port is serial_tcp_win.c's base + 1, so a test build that moves the
-// TCP block (BF_SITL_TCP_BASE) still gets a working proxy.
-extern uint16_t sitlTcpBasePort(void);
 
-#define DEFAULT_WS_PORT 6761
+#define WS_PORT 6761
+#define MSP_PORT 5761
 #define WS_GUID "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-
-static uint16_t wsListenPort(void)
-{
-    static int cached = -1;
-    if (cached < 0) {
-        const char *env = getenv("BF_SITL_WS_PORT");
-        const long v = (env != NULL && env[0] != '\0') ? strtol(env, NULL, 10) : 0;
-        cached = (v >= 1024 && v <= 65000) ? (int)v : DEFAULT_WS_PORT;
-    }
-    return (uint16_t)cached;
-}
 
 static SOCKET wsListenSocket = INVALID_SOCKET;
 static pthread_t wsListenThreadHandle;
@@ -312,7 +298,7 @@ static void *wsClientThread(void *arg)
             struct sockaddr_in addr;
             memset(&addr, 0, sizeof(addr));
             addr.sin_family = AF_INET;
-            addr.sin_port = htons((u_short)(sitlTcpBasePort() + 1));
+            addr.sin_port = htons(MSP_PORT);
             addr.sin_addr.s_addr = inet_addr("127.0.0.1");
 
             if (connect(tcp, (const struct sockaddr *)&addr, sizeof(addr)) != SOCKET_ERROR) {
@@ -327,8 +313,7 @@ static void *wsClientThread(void *arg)
     }
 
     if (tcp == INVALID_SOCKET) {
-        fprintf(stderr, "[wsproxy] could not reach MSP port %u\n",
-                (unsigned)(sitlTcpBasePort() + 1));
+        fprintf(stderr, "[wsproxy] could not reach MSP port %d\n", MSP_PORT);
         closesocket(ws);
         return NULL;
     }
@@ -420,7 +405,7 @@ void wsProxyStart(void)
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons(wsListenPort());
+    addr.sin_port = htons(WS_PORT);
 
     if (bind(wsListenSocket, (const struct sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR) {
         closesocket(wsListenSocket);
@@ -441,8 +426,7 @@ void wsProxyStart(void)
     pthread_detach(wsListenThreadHandle);
 
     wsStarted = true;
-    fprintf(stderr, "WebSocket proxy listening on ws://127.0.0.1:%u\n",
-            (unsigned)wsListenPort());
+    fprintf(stderr, "WebSocket proxy listening on ws://127.0.0.1:%d\n", WS_PORT);
 }
 
 // Stop the listener so a later sitl_local_init() can bind 6761 again.

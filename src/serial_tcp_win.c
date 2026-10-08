@@ -25,26 +25,10 @@
 #include "io/serial.h"
 #include "win_socket_util.h"
 
-#define DEFAULT_BASE_PORT 5760
+#define BASE_PORT 5760
 #define MAX_TCP_CLIENTS 8
 
 void wsProxyStart(void);
-
-// The listen ports are fixed at 5761+ (the configurator's default), but a test
-// tool that runs next to a live host must not fight it for the port - Windows
-// lets a second socket bind the same port with SO_REUSEADDR and would silently
-// steal new connections. BF_SITL_TCP_BASE moves the whole block (the MSP port is
-// base + 1) for a build that wants to stay out of the way.
-uint16_t sitlTcpBasePort(void)
-{
-    static int cached = -1;
-    if (cached < 0) {
-        const char *env = getenv("BF_SITL_TCP_BASE");
-        const long v = (env != NULL && env[0] != '\0') ? strtol(env, NULL, 10) : 0;
-        cached = (v >= 1024 && v <= 65000) ? (int)v : DEFAULT_BASE_PORT;
-    }
-    return (uint16_t)cached;
-}
 
 static tcpPort_t tcpSerialPorts[SERIAL_PORT_COUNT];
 static bool tcpPortInitialized[SERIAL_PORT_COUNT];
@@ -247,7 +231,7 @@ static int tcpReconfigure(tcpPort_t *s, int id)
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons((u_short)(sitlTcpBasePort() + id + 1));
+    addr.sin_port = htons((u_short)(BASE_PORT + id + 1));
 
     if (bind(listenSock, (const struct sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR) {
         closesocket(listenSock);
@@ -271,7 +255,7 @@ static int tcpReconfigure(tcpPort_t *s, int id)
 
     tcpPortInitialized[id] = true;
     tcpStart = true;
-    fprintf(stderr, "bind port %u for UART%u\n", (unsigned)(sitlTcpBasePort() + id + 1), (unsigned)id + 1);
+    fprintf(stderr, "bind port %u for UART%u\n", (unsigned)(BASE_PORT + id + 1), (unsigned)id + 1);
     wsProxyStart();
     return 0;
 }

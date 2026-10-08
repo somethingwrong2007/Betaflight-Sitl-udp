@@ -41,11 +41,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-// Test tools must not fight a live host for the configurator ports: Windows lets
-// a second socket bind 5761 with SO_REUSEADDR and silently take the new
-// connections. The harness therefore moves its own instance (and its MSP
-// client) to BF_SITL_TCP_BASE, which main() sets before sitl_local_init().
-#define DEFAULT_MSP_PORT    5761
+#define MSP_PORT            5761
 #define MSP_SET_REBOOT      68
 #define MSP_EEPROM_WRITE    250
 #define MSP_API_VERSION     1
@@ -84,86 +80,6 @@ static uint16_t gArmLow = 1000;
 
 static void makeInput(int phase, uint16_t throttle, bool armHigh, sitl_local_input_t *in);
 static bool runSteps(int count, uint16_t throttle, bool armHigh);
-
-// The MSP port of *this process's* FC instance. Matches the DLL's own
-// BF_SITL_TCP_BASE + 1 (see serial_tcp_win.c), so a harness run cannot talk to
-// somebody else's flight controller by accident.
-static uint16_t harnessMspPort(void)
-{
-    const char *env = getenv("BF_SITL_TCP_BASE");
-    const long v = (env != NULL && env[0] != '\0') ? strtol(env, NULL, 10) : 0;
-    return (uint16_t)((v >= 1024 && v <= 65000) ? (v + 1) : DEFAULT_MSP_PORT);
-}
-
-// Move this instance off the configurator's ports unless the caller asked for a
-// specific block: Windows lets a second socket bind 5761 with SO_REUSEADDR and
-// silently steal the new connections, which would disturb a live host.
-static void harnessClaimPrivatePorts(void)
-{
-    if (getenv("BF_SITL_TCP_BASE") == NULL) {
-        _putenv_s("BF_SITL_TCP_BASE", "15760");
-    }
-    if (getenv("BF_SITL_WS_PORT") == NULL) {
-        _putenv_s("BF_SITL_WS_PORT", "16761");
-    }
-    // Keep the test tool's logs out of the live host's files (this process does
-    // not touch %LOCALAPPDATA%\Betaflight-SITL while a flight is running).
-    const char *tempDir = getenv("TEMP");
-    if (tempDir != NULL && getenv("BF_SITL_AUDIT_LOG") == NULL) {
-        static char auditPath[MAX_PATH];
-        _snprintf(auditPath, sizeof(auditPath), "%s\\sitl-harness-audit.log", tempDir);
-        _putenv_s("BF_SITL_AUDIT_LOG", auditPath);
-    }
-    if (tempDir != NULL && getenv("BF_SITL_BURST_LOG") == NULL) {
-        static char burstPath[MAX_PATH];
-        _snprintf(burstPath, sizeof(burstPath), "%s\\sitl-harness-burst.log", tempDir);
-        _putenv_s("BF_SITL_BURST_LOG", burstPath);
-    }
-    // The blackbox rotates the newest N logs by renaming them; doing that in the
-    // live host's folder while the host holds a log open fails ("could not
-    // renumber ... file in use?") and disturbs the user's own logs.
-    if (tempDir != NULL && getenv("BF_SITL_BLACKBOX_DIR") == NULL) {
-        static char bbPath[MAX_PATH];
-        _snprintf(bbPath, sizeof(bbPath), "%s\\sitl-harness-blackbox", tempDir);
-        _putenv_s("BF_SITL_BLACKBOX_DIR", bbPath);
-    }
-    fprintf(stderr, "[harness] FC instance on 127.0.0.1:%u (ws %s)\n",
-            (unsigned)harnessMspPort(), getenv("BF_SITL_WS_PORT"));
-}
-
-#ifdef _WIN32
-static double harnessWallSeconds(void)
-{
-    LARGE_INTEGER freq, now;
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&now);
-    return (double)now.QuadPart / (double)freq.QuadPart;
-}
-
-static double harnessCpuSeconds(void)
-{
-    FILETIME create, exitT, kernel, user;
-    if (!GetProcessTimes(GetCurrentProcess(), &create, &exitT, &kernel, &user)) {
-        return 0.0;
-    }
-    ULARGE_INTEGER k, u;
-    k.LowPart = kernel.dwLowDateTime; k.HighPart = kernel.dwHighDateTime;
-    u.LowPart = user.dwLowDateTime;   u.HighPart = user.dwHighDateTime;
-    return (double)(k.QuadPart + u.QuadPart) * 1e-7;
-}
-#else
-static double harnessWallSeconds(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
-}
-
-static double harnessCpuSeconds(void)
-{
-    return (double)clock() / (double)CLOCKS_PER_SEC;
-}
-#endif
 
 // Scale factor for the fast gyro component. The `sensitivity` mode doubles it
 // for the second trace: the control loop has to react visibly to that, which
@@ -978,7 +894,7 @@ static int mspConnect(void)
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(harnessMspPort());
+    addr.sin_port = htons(MSP_PORT);
     addr.sin_addr.s_addr = inet_addr("127.0.0.1");
 
     for (int attempt = 0; attempt < 50; attempt++) {
@@ -1612,17 +1528,13 @@ int main(int argc, char **argv)
         }
     }
 
-    // Must happen before the DLL boots: the listen ports are read at init.
-    harnessClaimPrivatePorts();
-
     if (sitl_local_init() != 0) {
         fprintf(stderr, "sitl_local_init() failed\n");
         return 1;
     }
     gStepBase = gStepCount;
     if (mspConnect() != 0) {
-        fprintf(stderr, "could not connect to the MSP server on 127.0.0.1:%u\n",
-                (unsigned)harnessMspPort());
+        fprintf(stderr, "could not connect to the MSP server on 127.0.0.1:%d\n", MSP_PORT);
         sitl_local_shutdown();
         return 1;
     }
@@ -1828,110 +1740,6 @@ int main(int argc, char **argv)
         warmUpAndTrace(traceA, &motorCountA, &armedA, rangeA);
         printClosedLoopResult("rpm filter restored (harmonics 3)");
 
-        sitl_local_shutdown();
-        return 0;
-    } else if (strcmp(mode, "bench") == 0) {
-        // What does this build cost per step? Wall and process CPU time for a
-        // fixed number of steps at the configured host step (BF_HARNESS_STEP_US,
-        // default 1000 us; use 250 for the 4 kHz LOCAL link). Compare builds,
-        // BF_SITL_GYRO_HZ values, and `bench aux` (all AUX channels high, so a
-        // bound blackbox switch logs) to see what each part costs.
-        const int warmup = 4000;
-        // 24 s of virtual time, so the burst recorder (one 2 s window every 12 s)
-        // always contributes its share to the measurement.
-        const int steps = 96000;
-        gAuxHighOverride = (argc > 2 && strcmp(argv[2], "aux") == 0);
-
-        // Disarmed pass first: same loop, but the mixer does not drive the
-        // motors and the blackbox does not log. The difference to the armed pass
-        // is what the armed-only work costs (mixer/motor output + the flight log).
-        for (int i = 0; i < warmup; i++) {
-            sitl_local_input_t in;
-            sitl_local_output_t out;
-            makeInput(0, ARM_THROTTLE, false, &in);
-            rawStep(&in, &out);
-        }
-        double dWall0 = harnessWallSeconds();
-        double dCpu0 = harnessCpuSeconds();
-        double dVus0 = (double)sitl_local_time_us();
-        for (int i = 0; i < steps; i++) {
-            sitl_local_input_t in;
-            sitl_local_output_t out;
-            makeInput(0, ARM_THROTTLE, false, &in);
-            rawStep(&in, &out);
-        }
-        const double dWall = harnessWallSeconds() - dWall0;
-        const double dCpu = harnessCpuSeconds() - dCpu0;
-        const double dVirtualS = ((double)sitl_local_time_us() - dVus0) * 1e-6;
-        fprintf(stderr, "[bench] disarmed: per step wall %.3f us cpu %.3f us => %.2f%% of one core\n",
-                dWall * 1e6 / steps, dCpu * 1e6 / steps,
-                100.0 * dCpu / dVirtualS);
-
-        // Arm the way the scenarios do - low throttle first, the firmware will
-        // not arm otherwise - so the measured path is the armed one (mixer,
-        // motor output and, when the config binds it, the blackbox log).
-        if (!runSteps(1500, ARM_THROTTLE, true)) {
-            fprintf(stderr, "[bench] warning: could not arm, measuring the disarmed path\n");
-        }
-        deactivateRunawayTakeoffProtection();
-        fprintf(stderr, "[bench] armed=%d armFlags=0x%08X auxHigh=%d\n",
-                sitl_local_get_armed(), (unsigned)sitl_local_get_arming_flags(),
-                gAuxHighOverride ? 1 : 0);
-        for (int i = 0; i < warmup; i++) {
-            sitl_local_input_t in;
-            sitl_local_output_t out;
-            makeInput(0, TRACE_THROTTLE, true, &in);
-            rawStep(&in, &out);
-        }
-        const double wall0 = harnessWallSeconds();
-        const double cpu0 = harnessCpuSeconds();
-        const double vus0 = (double)sitl_local_time_us();
-        bool armed = false;
-        int armedSteps = 0;
-        for (int i = 0; i < steps; i++) {
-            sitl_local_input_t in;
-            sitl_local_output_t out;
-            makeInput(0, TRACE_THROTTLE, true, &in);
-            armed = rawStep(&in, &out);
-            if (armed) {
-                armedSteps++;
-            }
-        }
-        const double wall = harnessWallSeconds() - wall0;
-        const double cpu = harnessCpuSeconds() - cpu0;
-        const double virtualS = ((double)sitl_local_time_us() - vus0) * 1e-6;
-        const double coreFraction = (virtualS > 0.0) ? cpu / virtualS : 0.0;
-        fprintf(stderr, "[bench] steps=%d armedSteps=%d virtual=%.3f s wall=%.3f s cpu=%.3f s\n",
-                steps, armedSteps, virtualS, wall, cpu);
-        fprintf(stderr, "[bench] per step: wall %.3f us cpu %.3f us  "
-                        "=> %.2f%% of one core at %.0f Hz (%.0f steps/s wall)\n",
-                wall * 1e6 / steps, cpu * 1e6 / steps,
-                100.0 * coreFraction, (virtualS > 0.0) ? steps / virtualS : 0.0,
-                steps / wall);
-
-        // Where the per-step time actually goes: the harness's own input
-        // assembly, the DLL step, and the two clocks the DLL can use. A clock
-        // that costs microseconds per call is easy to miss in a profile but
-        // obvious here (clock_gettime on MinGW is not free).
-        {
-            sitl_local_input_t in;
-            sitl_local_output_t out;
-            makeInput(0, TRACE_THROTTLE, true, &in);
-            const int n = 200000;
-            double t0 = harnessWallSeconds();
-            for (int i = 0; i < n; i++) {
-                makeInput(0, TRACE_THROTTLE, true, &in);
-            }
-            const double tMake = (harnessWallSeconds() - t0) * 1e6 / n;
-            t0 = harnessWallSeconds();
-            for (int i = 0; i < n; i++) {
-                sitl_local_step(&in, gStepUs, &out);
-            }
-            const double tStep = (harnessWallSeconds() - t0) * 1e6 / n;
-            fprintf(stderr, "[bench] phases: makeInput %.3f us  sitl_local_step %.3f us  "
-                            "sum %.3f us (input struct %u B)\n",
-                    tMake, tStep, tMake + tStep, (unsigned)sizeof(sitl_local_input_t));
-        }
         sitl_local_shutdown();
         return 0;
     } else if (strcmp(mode, "vib") == 0) {

@@ -218,31 +218,18 @@ static int16_t gLocalLastGyroRaw[3] = { 0, 0, 0 };
 // oscillation can be analysed: which term drives it, how big it is and what the
 // motor response looks like.
 //
-// "1 kHz" is the point, not "one line per loop iteration": the recorder used to
-// write a line on every call, which is 1000 lines/s in a 1 kHz build but 4000 in
-// the LOCAL default (4 kHz) - i.e. 4000 formatted lines a second straight out of
-// the flight loop, for a third of the time, which is exactly the kind of log
-// "screen scrolling" that must not happen at a high tick rate. The record grid is
-// therefore 1 ms of *virtual* time (a line every 4 steps at 4 kHz, every step at
-// 1 kHz), the window stays 2 s and the burst cadence stays 12 s at any rate.
-// BF_SITL_BURST_HZ picks the record rate (default 1000; 0 or
-// BF_SITL_BURST_FULL=1 records one line per loop iteration, which is what makes
-// the write rate follow the loop rate) and BF_SITL_BURST_PERIOD_S the cadence
-// (default 12 s). Note the line count per window is fixed, so the rate only
-// trades time resolution against window length - the bytes per dump are the
-// same; the period is what changes the bytes per second.
+// "1 kHz" is the point, not "one line per loop iteration": writing a line on
+// every call is 1000 lines/s in a 1 kHz build but 4000 in a 4 kHz one - 4000
+// formatted lines a second straight out of the flight loop, for a third of the
+// time. The record grid is therefore 1 ms of *virtual* time (a line every 4
+// steps at 4 kHz, every step at 1 kHz), so the write rate does not follow the
+// loop rate up. A window holds a fixed 2000 records, so the rate only trades
+// time resolution against window length (the bytes per dump are the same);
+// BF_SITL_BURST_PERIOD_S is what changes the bytes per second.
+//   BF_SITL_BURST_HZ        record rate (default 1000)
+//   BF_SITL_BURST_FULL=1    one line per loop iteration
+//   BF_SITL_BURST_PERIOD_S  seconds between dumps (default 12)
 #define SITL_BURST_RECORDS 2000     // 2 s of 1 kHz records
-
-static uint64_t localBurstPeriodUs(void)
-{
-    static long secondsCached = -1;
-    if (secondsCached < 0) {
-        const char *env = getenv("BF_SITL_BURST_PERIOD_S");
-        const long v = (env != NULL && env[0] != '\0') ? strtol(env, NULL, 10) : 12;
-        secondsCached = (v >= 1 && v <= 3600) ? v : 12;
-    }
-    return (uint64_t)secondsCached * 1000ULL * 1000ULL;
-}
 
 static uint32_t localBurstGridUs(uint32_t stepUs)
 {
@@ -254,9 +241,7 @@ static uint32_t localBurstGridUs(uint32_t stepUs)
             gridCached = 0;             // one line per loop iteration
         } else if (hzEnv != NULL && hzEnv[0] != '\0') {
             const long hz = strtol(hzEnv, NULL, 10);
-            gridCached = (hz <= 0) ? 0
-                       : (hz > 4000) ? 0
-                       : (int)(1000000L / hz);
+            gridCached = (hz <= 0 || hz > 4000) ? 0 : (int)(1000000L / hz);
         } else {
             gridCached = 1000;          // 1 kHz records
         }
@@ -266,6 +251,17 @@ static uint32_t localBurstGridUs(uint32_t stepUs)
     }
     const uint32_t grid = (uint32_t)gridCached;
     return (grid < stepUs) ? stepUs : grid;
+}
+
+static uint64_t localBurstPeriodUs(void)
+{
+    static long secondsCached = -1;
+    if (secondsCached < 0) {
+        const char *env = getenv("BF_SITL_BURST_PERIOD_S");
+        const long v = (env != NULL && env[0] != '\0') ? strtol(env, NULL, 10) : 12;
+        secondsCached = (v >= 1 && v <= 3600) ? v : 12;
+    }
+    return (uint64_t)secondsCached * 1000ULL * 1000ULL;
 }
 
 static bool localBurstLog(uint32_t stepUs)
@@ -285,19 +281,12 @@ static bool localBurstLog(uint32_t stepUs)
     nextRecordUs = nowUs + localBurstGridUs(stepUs);
 
     if (fp == NULL) {
-        // BF_SITL_BURST_LOG keeps a test tool from overwriting the live host's
-        // record (the harness points it at %TEMP%).
-        char path[MAX_PATH];
-        const char *override = getenv("BF_SITL_BURST_LOG");
-        if (override != NULL && override[0] != '\0') {
-            _snprintf(path, sizeof(path), "%s", override);
-        } else {
-            const char *appData = getenv("LOCALAPPDATA");
-            if (appData == NULL) {
-                return false;
-            }
-            _snprintf(path, sizeof(path), "%s\\Betaflight-SITL\\sitl-burst.log", appData);
+        const char *appData = getenv("LOCALAPPDATA");
+        if (appData == NULL) {
+            return false;
         }
+        char path[MAX_PATH];
+        _snprintf(path, sizeof(path), "%s\\Betaflight-SITL\\sitl-burst.log", appData);
         fp = fopen(path, "w");
         if (fp == NULL) {
             return false;
@@ -1420,8 +1409,8 @@ static uint32_t gLocalZeroMotorStepsWhileArmed = 0;
 
 static void localRecordStepStats(uint64_t stepStartUs, const sitl_local_output_t *out)
 {
-    extern uint64_t sitlWallUs(void);
-    const uint32_t elapsedUs = (uint32_t)(sitlWallUs() - stepStartUs);
+    extern uint64_t micros64_real(void);
+    const uint32_t elapsedUs = (uint32_t)(micros64_real() - stepStartUs);
     if (elapsedUs > gLocalStepUsMax) {
         gLocalStepUsMax = elapsedUs;
     }
@@ -1457,11 +1446,8 @@ void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
     if (!gLocalRunning || !in) {
         return;
     }
-    // sitlWallUs() (QueryPerformanceCounter) rather than micros64_real(): the
-    // latter is a clock_gettime() call that costs ~1.5 us on MinGW, and this is
-    // the hot path of a 4 kHz loop.
-    extern uint64_t sitlWallUs(void);
-    const uint64_t stepStartUs = sitlWallUs();
+    extern uint64_t micros64_real(void);
+    const uint64_t stepStartUs = micros64_real();
 
     // The flight controller's virtual clock is a fixed grid: every filter and
     // the PID's dt are designed for one sample period. A host that forwards its
@@ -1481,14 +1467,8 @@ void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
     extern uint32_t sitlLocalGyroGridUs(void);
     const uint32_t gridUs = sitlLocalGyroGridUs();
     {
-        // Read the A/B knob once: getenv() walks the environment block and has
-        // no place in a path that runs 4000 times a second.
-        static int snapEnabledCached = -1;
-        if (snapEnabledCached < 0) {
-            const char *snapEnv = getenv("BF_SITL_DT_SNAP");
-            snapEnabledCached = (snapEnv == NULL || snapEnv[0] == '\0' || snapEnv[0] != '0') ? 1 : 0;
-        }
-        const bool snapEnabled = snapEnabledCached != 0;
+        const char *snapEnv = getenv("BF_SITL_DT_SNAP");
+        const bool snapEnabled = (snapEnv == NULL || snapEnv[0] == '\0' || snapEnv[0] != '0');
         if (snapEnabled && gridUs > 0) {
             const uint32_t nearest = ((dtUs + gridUs / 2) / gridUs) * gridUs;
             const uint32_t diff = nearest > dtUs ? nearest - dtUs : dtUs - nearest;
@@ -1583,20 +1563,9 @@ void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
     gLocalLastGyroRaw[2] = gz;
 
     // --- pressure derived from altitude (Gazebo bridge convention) ---
-    // pow() is far too expensive to run once per 250 us step, and the value only
-    // feeds the barometer (altitude hold), so recompute it when the altitude has
-    // actually moved by more than 5 cm and hold it in between - well below the
-    // noise floor of a real baro.
     const double altMeters = in->position_xyz[2];
-    static double baroAltHeld = 0.0;
-    static int32_t baroPressureHeld = 101325;
-    static bool baroValid = false;
-    if (!baroValid || fabs(altMeters - baroAltHeld) > 0.05) {
-        baroAltHeld = altMeters;
-        baroPressureHeld = (int32_t)(101325.0 * pow(1.0 - 2.25577e-5 * altMeters, 5.25588));
-        baroValid = true;
-    }
-    virtualBaroSet(baroPressureHeld, 2500);
+    const int32_t pressure = (int32_t)(101325.0 * pow(1.0 - 2.25577e-5 * altMeters, 5.25588));
+    virtualBaroSet(pressure, 2500);
 
     // --- attitude quaternion (Gazebo plugin format -> NWU body-to-world) ---
     const float pktQw = (float)in->orientation_quat[0];
