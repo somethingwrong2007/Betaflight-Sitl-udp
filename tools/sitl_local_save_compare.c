@@ -1094,6 +1094,92 @@ static void setRpmHarmonicsViaMsp(int harmonics, const char *tag)
     }
 }
 
+// Write the whole gyro/D-term filter block through the configurator's own MSP
+// path, so the firmware rebuilds the chains exactly like a configurator save.
+// Byte offsets follow MSP_SET_FILTER_CONFIG (msp.c): 0/20-21 gyro_lpf1,
+// 22-23 gyro_lpf2, 29-32 gyro dyn LPF1, 1-2 dterm_lpf1, 43 rpm harmonics.
+static void setFilterConfigViaMsp(int lpf1, int lpf2, int dynMin, int dynMax,
+                                  int dtermLpf, int rpmHarmonics)
+{
+    uint8_t cfg[MSP_MAX_PAYLOAD];
+    const int len = mspRequest(MSP_FILTER_CONFIG, NULL, 0, cfg, sizeof(cfg), 2000);
+    if (len < 45) {
+        fprintf(stderr, "[vib] could not read the filter config (%d bytes)\n", len);
+        return;
+    }
+    cfg[0] = (uint8_t)lpf1;
+    cfg[1] = (uint8_t)(dtermLpf & 0xFF);
+    cfg[2] = (uint8_t)((dtermLpf >> 8) & 0xFF);
+    cfg[20] = (uint8_t)(lpf1 & 0xFF);
+    cfg[21] = (uint8_t)((lpf1 >> 8) & 0xFF);
+    cfg[22] = (uint8_t)(lpf2 & 0xFF);
+    cfg[23] = (uint8_t)((lpf2 >> 8) & 0xFF);
+    cfg[29] = (uint8_t)(dynMin & 0xFF);
+    cfg[30] = (uint8_t)((dynMin >> 8) & 0xFF);
+    cfg[31] = (uint8_t)(dynMax & 0xFF);
+    cfg[32] = (uint8_t)((dynMax >> 8) & 0xFF);
+    cfg[43] = (uint8_t)rpmHarmonics;
+    (void)mspRequest(MSP_SET_FILTER_CONFIG, cfg, (uint8_t)len, NULL, 0, 2000);
+}
+
+// --- vibration attenuation probe (`vib`) -------------------------------------
+// The harness can put motor-harmonic vibration into the gyro data it feeds
+// (BF_HARNESS_VIB_RADPS, the same signal a real gyro measures). This probe
+// measures what the firmware's filter chain does with it: it holds a steady
+// hover, reads the gyro the sensor produced (gyroADC) and the gyro the PID
+// sees (gyroADCf) on every step, and fits the amplitude of the motor
+// fundamental with a DFT against the flight controller's own virtual clock. The
+// harness feeds a fixed 12000 rpm on motor 0, i.e. 200 Hz.
+static void runVibrationProbe(const char *tag)
+{
+    const int steps = 4000;
+    const double freqHz = 12000.0 / 60.0;
+    double siIn = 0.0, coIn = 0.0, siOut = 0.0, coOut = 0.0;
+    double motorMin = 1e9, motorMax = -1e9;
+    int samples = 0;
+
+    for (int i = 0; i < steps; i++) {
+        sitl_local_input_t in;
+        sitl_local_output_t out;
+        makeInput(0, TRACE_THROTTLE, true, &in);
+        rawStep(&in, &out);
+
+        sitl_local_loop_state_t ls;
+        if (sitl_local_get_loop_state(&ls) != 0) {
+            continue;
+        }
+        // Settle first: a filter change rebuilds the chains and the dynamic LPF
+        // follows the throttle at the start of the segment.
+        if (i < steps / 4) {
+            continue;
+        }
+        const double t = (double)sitl_local_time_us() * 1e-6;
+        const double ph = 2.0 * M_PI * freqHz * t;
+        const double s = sin(ph);
+        const double c = cos(ph);
+        siIn += ls.gyroADC[0] * s;
+        coIn += ls.gyroADC[0] * c;
+        siOut += ls.gyroADCf[0] * s;
+        coOut += ls.gyroADCf[0] * c;
+        const double m = (double)out.pwm_output_raw[0];
+        if (m < motorMin) { motorMin = m; }
+        if (m > motorMax) { motorMax = m; }
+        samples++;
+    }
+
+    if (samples < 100) {
+        fprintf(stderr, "[vib] %-34s no samples\n", tag);
+        return;
+    }
+    const double ampIn = 2.0 * sqrt(siIn * siIn + coIn * coIn) / (double)samples;
+    const double ampOut = 2.0 * sqrt(siOut * siOut + coOut * coOut) / (double)samples;
+    const double attDb = ampIn > 1e-6 ? 20.0 * log10(ampOut / ampIn) : 0.0;
+    fprintf(stderr, "[vib] %-34s fed@%.0fHz %7.3f deg/s -> PID sees %7.3f deg/s "
+                    "(%6.1f dB)  motor0 pk-pk %6.0f us\n",
+            tag, freqHz, ampIn, ampOut, attDb, motorMax - motorMin);
+}
+
+
 // What the *loop* sees, straight from currentPidProfile: an MSP write that the
 // firmware stores but never applies shows up here.
 static void printLoopGains(const char *tag)
@@ -1654,6 +1740,27 @@ int main(int argc, char **argv)
         warmUpAndTrace(traceA, &motorCountA, &armedA, rangeA);
         printClosedLoopResult("rpm filter restored (harmonics 3)");
 
+        sitl_local_shutdown();
+        return 0;
+    } else if (strcmp(mode, "vib") == 0) {
+        // Does the filter chain actually remove motor vibration? The harness
+        // puts the harmonics a real gyro measures into the gyro data it feeds
+        // (motor 0 of its telemetry runs at 12000 rpm = 200 Hz), and this
+        // measures how much of that survives to the PID with the filters off
+        // vs on. Nothing on the DLL side is involved - the point is to test the
+        // firmware's chain, not the host.
+        if (gVibAmp <= 0.0) {
+            gVibAmp = 0.10;   // rad/s per motor harmonic: ~8.6 deg/s fed peak
+        }
+        fprintf(stderr, "[vib] gyro feed = physics rate + %.2f rad/s motor "
+                        "harmonics (BF_HARNESS_VIB_RADPS)\n", gVibAmp);
+        runVibrationProbe("as configured");
+        setFilterConfigViaMsp(0, 0, 0, 0, 0, 0);
+        runVibrationProbe("all gyro/D filters off");
+        setFilterConfigViaMsp(275, 550, 275, 550, 75, 1);
+        runVibrationProbe("LPF1 275-550, LPF2 550, dterm 75, RPM h1");
+        setFilterConfigViaMsp(275, 550, 275, 550, 75, 0);
+        runVibrationProbe("same LPFs, RPM filter off");
         sitl_local_shutdown();
         return 0;
     } else if (strcmp(mode, "rpm-tone") == 0) {
