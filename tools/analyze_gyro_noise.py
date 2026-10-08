@@ -42,7 +42,19 @@ def default_path():
 def load(path):
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
         lines = [ln for ln in fh if ln.strip() and not ln.lstrip().startswith("#")]
-    data = np.array([[float(v) for v in ln.split()] for ln in lines])
+    rows = []
+    for ln in lines:
+        vals = ln.split()
+        # columns 26/27 are the mode flags and the arming-disable flags, printed
+        # as hex (%04X / %08X) - e.g. 2000008C is not a float.
+        # A burst that was cut short (the process ended mid-record) leaves a
+        # partial last line: drop anything that is not a whole row.
+        if len(vals) != 40:
+            continue
+        vals[26] = str(int(vals[26], 16))
+        vals[27] = str(int(vals[27], 16))
+        rows.append([float(v) for v in vals])
+    data = np.array(rows)
     return data
 
 
