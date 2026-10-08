@@ -185,7 +185,11 @@ Two log paths wrote far more often than they needed to - that is what
   produced **4000 formatted lines/s** and rewrote its ~400 KB file every 3 s
   (~130 KB/s). It now records on a 1 ms *virtual-time* grid (1000 lines/s at any
   loop rate) and rewrites every 12 s (~33 KB/s), with the same 2 s window.
-  `BF_SITL_BURST_FULL=1` restores one line per iteration.
+  A window holds a fixed 2000 records (~400 KB), so the record *rate* only trades
+  time resolution against window length - the bytes per dump are the same;
+  `BF_SITL_BURST_PERIOD_S` is what changes the bytes per second, and
+  `BF_SITL_BURST_HZ` / `BF_SITL_BURST_FULL=1` pick the rate (1000 by default,
+  4000 = every loop iteration).
 - **Blackbox**: `blackbox.c` flushes the log on every frame ("so that our runtime
   variance is minimized"), which at 4 kHz with the default `sample_rate` of 1/4
   is **1000 `flush()` syscalls per second** out of the flight loop. The LOCAL
@@ -1287,7 +1291,9 @@ sim workflow.
 | `BF_SITL_GYRO_HZ` | Runtime gyro/filter/PID frequency override (100-10000); re-derives the gyro sample rate and filter chains at boot |
 | `BF_SITL_AUDIT_LOG` | Path of the audit trail (default `%LOCALAPPDATA%\Betaflight-SITL\sitl-audit.log`) |
 | `BF_SITL_BURST_LOG` | Path of the burst record (default `%LOCALAPPDATA%\Betaflight-SITL\sitl-burst.log`) |
-| `BF_SITL_BURST_FULL` | `1` records one burst line per FC loop iteration instead of the 1 kHz record grid |
+| `BF_SITL_BURST_FULL` | `1` records one burst line per FC loop iteration instead of the configured record grid |
+| `BF_SITL_BURST_HZ` | Burst record rate (default 1000). A window holds a fixed 2000 records, so this trades time resolution against window length (250 Hz = 8 s, 1000 Hz = 2 s); it does not change the bytes per dump |
+| `BF_SITL_BURST_PERIOD_S` | Seconds between burst dumps (default 12) - this is the knob for bytes per second |
 | `BF_SITL_BLACKBOX_DIR` | Blackbox folder (LOCAL default: `%LOCALAPPDATA%\Betaflight-SITL\blackbox`) |
 | `BF_SITL_BLACKBOX_MAX_LOGS` | Rolling-window size of the blackbox folder (default 10, `0` = unlimited) |
 | `BF_SITL_BLACKBOX_FLUSH_MS` | How often the per-frame blackbox flush reaches the disk (default 100 ms; the forced flushes at log start/stop are unaffected) |

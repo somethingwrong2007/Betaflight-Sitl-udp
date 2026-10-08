@@ -225,21 +225,47 @@ static int16_t gLocalLastGyroRaw[3] = { 0, 0, 0 };
 // "screen scrolling" that must not happen at a high tick rate. The record grid is
 // therefore 1 ms of *virtual* time (a line every 4 steps at 4 kHz, every step at
 // 1 kHz), the window stays 2 s and the burst cadence stays 12 s at any rate.
-// BF_SITL_BURST_FULL=1 restores one line per loop iteration.
+// BF_SITL_BURST_HZ picks the record rate (default 1000; 0 or
+// BF_SITL_BURST_FULL=1 records one line per loop iteration, which is what makes
+// the write rate follow the loop rate) and BF_SITL_BURST_PERIOD_S the cadence
+// (default 12 s). Note the line count per window is fixed, so the rate only
+// trades time resolution against window length - the bytes per dump are the
+// same; the period is what changes the bytes per second.
 #define SITL_BURST_RECORDS 2000     // 2 s of 1 kHz records
-#define SITL_BURST_PERIOD_US (12 * 1000 * 1000ULL)
+
+static uint64_t localBurstPeriodUs(void)
+{
+    static long secondsCached = -1;
+    if (secondsCached < 0) {
+        const char *env = getenv("BF_SITL_BURST_PERIOD_S");
+        const long v = (env != NULL && env[0] != '\0') ? strtol(env, NULL, 10) : 12;
+        secondsCached = (v >= 1 && v <= 3600) ? v : 12;
+    }
+    return (uint64_t)secondsCached * 1000ULL * 1000ULL;
+}
 
 static uint32_t localBurstGridUs(uint32_t stepUs)
 {
-    static int fullCached = -1;
-    if (fullCached < 0) {
-        const char *env = getenv("BF_SITL_BURST_FULL");
-        fullCached = (env != NULL && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+    static int gridCached = -1;
+    if (gridCached < 0) {
+        const char *full = getenv("BF_SITL_BURST_FULL");
+        const char *hzEnv = getenv("BF_SITL_BURST_HZ");
+        if (full != NULL && full[0] != '\0' && full[0] != '0') {
+            gridCached = 0;             // one line per loop iteration
+        } else if (hzEnv != NULL && hzEnv[0] != '\0') {
+            const long hz = strtol(hzEnv, NULL, 10);
+            gridCached = (hz <= 0) ? 0
+                       : (hz > 4000) ? 0
+                       : (int)(1000000L / hz);
+        } else {
+            gridCached = 1000;          // 1 kHz records
+        }
     }
-    if (fullCached || stepUs == 0) {
+    if (gridCached == 0 || stepUs == 0) {
         return stepUs;
     }
-    return 1000;    // 1 kHz records whatever the loop rate is
+    const uint32_t grid = (uint32_t)gridCached;
+    return (grid < stepUs) ? stepUs : grid;
 }
 
 static bool localBurstLog(uint32_t stepUs)
@@ -317,7 +343,7 @@ static bool localBurstLog(uint32_t stepUs)
     if (++burstStep >= SITL_BURST_RECORDS) {
         fclose(fp);
         fp = NULL;
-        nextBurstUs = (uint64_t)micros64() + SITL_BURST_PERIOD_US;
+        nextBurstUs = (uint64_t)micros64() + localBurstPeriodUs();
     }
     return true;
 }
