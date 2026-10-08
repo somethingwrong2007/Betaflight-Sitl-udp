@@ -108,12 +108,58 @@ DLLs are statically linked; GitHub Actions collects everything into the
 |--------|--------|---------|-------------|
 | `SITL_TIME_MODE` | `REALTIME` / `UDP` | `REALTIME` | Scheduler time base |
 | `SITL_LINK_MODE` | `UDP` / `LOCAL` | `UDP` | `UDP` builds the standalone server; `LOCAL` builds an in-process DLL (`betaflight_SITL.dll`) with a synchronous step API |
-| `SITL_GYRO_HZ` | 100-10000 | `1000` | Gyro/filter/PID frequency |
+| `SITL_GYRO_HZ` | 100-32000, or `0` | `0` (auto) | Gyro/filter/PID loop frequency. `0` = auto: `4000` for `SITL_LINK_MODE=LOCAL` (the host feeds a physics-rate gyro stream) and `1000` for `UDP`/`REALTIME`. Drives both the task periods *and* the virtual gyro's sample rate (`VIRTUAL_GYRO_SAMPLE_RATE_HZ`) - see [Loop rate](#loop-rate) |
 | `SITL_ATTITUDE_DIRECT` | defined / not defined | not defined | When defined manually (compile flag), the FDM quaternion is injected as attitude and the onboard estimator is bypassed. The default keeps `USE_IMU_CALC` on: attitude is estimated by the firmware's Mahony filter from the virtual accelerometer/gyroscope/magnetometer feeds. |
 | `DEFAULT_BLACKBOX_DEVICE` | (defined) | `BLACKBOX_DEVICE_VIRTUAL` | Fresh EEPROMs log blackbox to files by default |
 | `SITL_BRUSHLESS_PWM_RATE` | Hz | `20000` | Virtual brushless PWM rate used by config validation; raised so "sync PWM with PID" mode does not force `pid_process_denom` up |
 
-`SITL_GYRO_HZ` can also be overridden at runtime with `BF_SITL_GYRO_HZ`.
+`SITL_GYRO_HZ` can also be overridden at runtime with `BF_SITL_GYRO_HZ`
+(clamped to 100-10000). The boot code then re-derives the gyro sample rate and
+rebuilds the gyro/D-term filter chains, so a runtime override cannot leave the
+virtual gyro sampling at the compiled rate while the scheduler runs at another
+- see [Loop rate](#loop-rate).
+
+#### Loop rate
+
+The compiled `SITL_GYRO_HZ` drives **both** the task periods and
+`VIRTUAL_GYRO_SAMPLE_RATE_HZ` (the virtual gyro's own sample rate). They have to
+agree: `gyro.sampleLooptime`/`targetLooptime` decide the filter coefficients,
+the RPM filter's `dt`/Nyquist ceiling and the D-term filter cutoffs.
+
+The host step has to match too. `sitl_local_step()` runs the scheduler in the
+largest power of two <= 100 us that divides the gyro period (100 us at a 1 kHz
+loop, 50 us at 4 kHz, 25 us at 8 kHz), so the engine must step the FC at
+1e6/`SITL_GYRO_HZ` microseconds - for Unreal that is the async-physics tick
+(250 us at 4 kHz).
+
+The first lines of `sitl-audit.log` show what the loop actually got (wrapped
+here, one line each in the file):
+
+```
+rates: gyroHz=4000 sampleUs=250 targetUs=250 denom(active/cfg)=1/1 pidDT=0.000250
+pidHz=4000.0 taskUs(gyro/filter/pid/rx/serial/accel/att)=250/250/250/1/10000/250/10000
+quantumUs=50 measured(gyro/pid)Us=0/0 | compile: TASK_GYROPID_DESIRED_PERIOD=100
+SCHEDULER_DELAY_LIMIT=1 TASK_EXEC_TIME_CLAMP_US=100
+rpm filter rates: harmonics=1 dt=0.000250 s maxHz=1920 lpfHz=150 notches=4
+updatesPerCycle=1 (RPM_FILTER_DURATION_S=1ms)
+```
+
+(`measured(gyro/pid)Us` is 0 in the boot line - the tasks have not run yet; a
+later `state rt` line reports the measured period, `looptime=250 pidDt=250`.)
+
+What the higher loop rate changes: the RPM filter's notch ceiling moves from
+480 Hz (1 kHz loop, `dt` = 1 ms) to 1920 Hz (4 kHz loop, `dt` = 250 us), so the
+notch bank leaves the control band and finally sits where the motor harmonics
+actually are, and the whole bank is refreshed once per loop instead of once
+every four loops (`updatesPerCycle` 1 vs 4, i.e. `RPM_FILTER_DURATION_S` = 1 ms
+of virtual time is now four loop periods instead of one) - the notches track
+RPM four times as tightly.
+
+The dynamic notch is deliberately *not* part of that comparison: `common_post.h`
+undefines `USE_DYN_NOTCH_FILTER` whenever `ENABLE_SIMULATOR` is 1 (it needs
+`arm_math.h`, which does not exist on x86), so SITL has no dynamic notch at any
+loop rate. On real hardware `dynNotchInit()` additionally refuses to build it
+below 2 kHz of loop rate - a gate 4 kHz would satisfy.
 
 ### CI
 
@@ -200,7 +246,8 @@ cmake -S . -B build-win-cmake -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64-toolchain.c
 ### LOCAL (in-process library, zero UDP)
 
 For engines that want the flight controller inside their own process (e.g.
-Unreal's async physics tick at 1000 Hz), build the SITL as a DLL:
+Unreal's async physics tick), build the SITL as a DLL. The default loop rate
+for this link mode is 4 kHz, so the engine steps the FC every 250 us:
 
 ```bash
 cmake -S . -B build-win-local -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64-toolchain.cmake \
@@ -222,17 +269,23 @@ sitl_local_init();                                  // boots the FC once
 while (physicsTick) {
     sitl_local_input_t in = /* FDM state, same fields/conventions as fdm_packet */;
     sitl_local_output_t out;
-    sitl_local_step(&in, 1000, &out);               // 1000 = 1 ms virtual step
+    sitl_local_step(&in, 250, &out);                // 250 = one 4 kHz loop period
     // out.pwm_output_raw[0..motor_count-1] are the motor PWM values (1000..2000)
     // out.servo_output_raw[0..servo_count-1] are fixed-wing surface PWM values
 }
 ```
 
 `sitl_local_step()` feeds the virtual sensors, advances the virtual clock by
-`dtUs` on the same 100 us quantum grid as UDP mode (so the non-realtime
+`dtUs` in scheduler quanta that divide the gyro period (so the non-realtime
 tasks, including RX and failsafe, get scheduler time before each gyro
 deadline), runs the scheduler and returns the motor outputs for that exact
-state in the same call. RC channels are taken from
+state in the same call. The quantum is the largest power of two <= 100 us that
+divides `gyro.targetLooptime` (100 us at a 1 kHz loop, 50 us at 4 kHz), because
+the scheduler rounds a task's next deadline up to the grid it is called on - a
+250 us target stepped on a 100 us grid actually runs every 300 us - and because
+the realtime poll (`while (schedLoopRemainingCycles > 0) getCycleCounter();`)
+spins on the *virtual* clock, which only advances inside `sitl_local_step`, so a
+deadline that falls between grid points can never be reached. RC channels are taken from
 `in.rc_channels` (AETR + aux, 1000..2000). RC uses the AJ92/SimITL "latest
 value cache" model plus a fixed 125 Hz frame cadence: the channel cache is
 refreshed whenever the host data changes, and the frame status reports one
@@ -571,7 +624,8 @@ in-process DLL can, what real hardware does:
 
 Three deliberate deviations, all simulator-specific:
 
-- The gyro filter chain (LPF1/LPF2, notches, dynamic notch, RPM filter) keeps
+- The gyro filter chain (LPF1/LPF2, static notches, RPM filter - the dynamic
+  notch is not compiled into `ENABLE_SIMULATOR` builds) keeps
   its state across a reload/reboot and is only rebuilt when the filter
   settings themselves changed. The LOCAL gyro stream never stops, so zeroing
   that state injects a step into the filtered rate which the PID's D-term
@@ -1187,7 +1241,7 @@ sim workflow.
 | Variable | Purpose |
 |----------|---------|
 | `BF_SITL_EEPROM` | Path to the virtual EEPROM file (default `eeprom.bin` in CWD) |
-| `BF_SITL_GYRO_HZ` | Runtime gyro/filter/PID frequency override (100-10000) |
+| `BF_SITL_GYRO_HZ` | Runtime gyro/filter/PID frequency override (100-10000); re-derives the gyro sample rate and filter chains at boot |
 | `BFWEB_PORT` | Port for the local web configurator (default 8080) |
 | `BF_SITL_REBOOT_CHILD` | Internal marker for the auto-restart child process |
 

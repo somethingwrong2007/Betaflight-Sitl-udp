@@ -524,9 +524,26 @@ else()
 endif()
 
 # Gyro/filter/PID loop frequency in Hz (the official scheduler busy-waits to
-# this exact deadline). Can also be overridden at runtime with the
-# BF_SITL_GYRO_HZ environment variable.
-set(SITL_GYRO_HZ 1000 CACHE STRING "SITL gyro/filter/PID loop frequency in Hz")
+# this exact deadline). It drives *both* the task periods and the virtual gyro's
+# sample rate (VIRTUAL_GYRO_SAMPLE_RATE_HZ below), because the filter chain, the
+# RPM filter's dt/Nyquist ceiling and the dynamic-notch gate all derive from
+# gyro.sampleLooptime/targetLooptime - if the two disagree the firmware runs the
+# filters at a rate they were not built for.
+#
+# 0 = automatic: 4000 Hz for the LOCAL DLL (the host feeds a physics-rate gyro
+# stream, so the loop should match it) and 1000 Hz for the UDP/standalone build
+# (the FDM packet rate). Can be overridden at runtime with BF_SITL_GYRO_HZ; the
+# boot code then re-derives the gyro sample rate and the filter chains so the two
+# stay in sync.
+set(SITL_GYRO_HZ 0 CACHE STRING "SITL gyro/filter/PID loop frequency in Hz (0 = auto)")
+
+if(SITL_GYRO_HZ EQUAL 0)
+  if(SITL_LINK_MODE STREQUAL "LOCAL")
+    set(SITL_GYRO_HZ 4000)
+  else()
+    set(SITL_GYRO_HZ 1000)
+  endif()
+endif()
 
 # Virtual brushless motor PWM rate used by Betaflight's config validation.
 # Real ESCs cap standard PWM near 480 Hz, which makes the firmware raise
@@ -551,6 +568,7 @@ target_compile_definitions(betaflight_SITL PRIVATE
   SIMULATOR
   SIMULATOR_BUILD
   SITL_GYRO_HZ=${SITL_GYRO_HZ}
+  VIRTUAL_GYRO_SAMPLE_RATE_HZ=${SITL_GYRO_HZ}
   BRUSHLESS_MOTORS_PWM_RATE=${SITL_BRUSHLESS_PWM_RATE}
   DEFAULT_BLACKBOX_DEVICE=BLACKBOX_DEVICE_VIRTUAL
   USE_CHIRP

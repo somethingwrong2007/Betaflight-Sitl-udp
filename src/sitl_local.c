@@ -871,6 +871,18 @@ static DWORD WINAPI localMspThreadProc(LPVOID arg)
     return 0;
 }
 
+// The scheduler step quantum: the largest power-of-two value <= 100 us that
+// divides the gyro period, so every realtime deadline falls exactly on a step
+// (see sitl_local_step for why that is mandatory).
+static uint32_t localStepQuantumUs(uint32_t gridUs)
+{
+    uint32_t quantumUs = 100;
+    while (gridUs > 0 && quantumUs > 1 && (gridUs % quantumUs) != 0) {
+        quantumUs >>= 1;
+    }
+    return quantumUs;
+}
+
 // Boot audit of the rates the loop actually runs at. The SITL target's
 // compile-time defaults are 10 kHz for the gyro/PID task
 // (TASK_GYROPID_DESIRED_PERIOD) with the scheduler's period floor lifted
@@ -907,7 +919,7 @@ static void sitlLocalLogRateAudit(void)
 
     sitlAuditLog("rates: gyroHz=%u sampleUs=%u targetUs=%u denom(active/cfg)=%u/%u "
                  "pidDT=%.6f pidHz=%.1f taskUs(gyro/filter/pid/rx/serial/accel/att)="
-                 "%u/%u/%u/%u/%u/%u/%u measured(gyro/pid)Us=%d/%d | "
+                 "%u/%u/%u/%u/%u/%u/%u quantumUs=%u measured(gyro/pid)Us=%d/%d | "
                  "compile: TASK_GYROPID_DESIRED_PERIOD=%u SCHEDULER_DELAY_LIMIT=%u "
                  "TASK_EXEC_TIME_CLAMP_US=%u",
                  (unsigned)sampleRateHz, (unsigned)sampleLooptime, (unsigned)targetLooptime,
@@ -915,6 +927,7 @@ static void sitlLocalLogRateAudit(void)
                  (double)pidGetDT(), (double)pidGetPidFrequency(),
                  (unsigned)gyroUs, (unsigned)filterUs, (unsigned)pidUs, (unsigned)rxUs,
                  (unsigned)serialUs, (unsigned)accelUs, (unsigned)attitudeUs,
+                 (unsigned)localStepQuantumUs(targetLooptime),
                  (int)getTaskDeltaTimeUs(TASK_GYRO), (int)getTaskDeltaTimeUs(TASK_PID),
                  (unsigned)TASK_GYROPID_DESIRED_PERIOD, (unsigned)SCHEDULER_DELAY_LIMIT,
                  (unsigned)TASK_EXEC_TIME_CLAMP_US);
@@ -1026,6 +1039,34 @@ int sitl_local_init(void)
     // telemetry). Shared with the runtime config reload, which replaces every
     // PG record and therefore has to re-apply the same overrides.
     localApplyLinkOverrides();
+
+    // Make the virtual gyro's sample rate match the loop rate the tasks were
+    // rescheduled to (SITL_GYRO_HZ / BF_SITL_GYRO_HZ). For a plain build the two
+    // are the same compiled value and this is a no-op; a runtime override would
+    // otherwise leave the filter chain, the RPM filter's dt/Nyquist ceiling and
+    // the dynamic-notch gate on the old rate. Runs before the host steps the FC,
+    // so rebuilding the chains cannot disturb a running loop.
+    extern uint32_t sitlGyroHz(void);
+    extern void sitlLocalApplyGyroRate(uint32_t hz);
+    sitlLocalApplyGyroRate(sitlGyroHz());
+    // Put the loop tasks on the periods the (possibly re-derived) gyro rates
+    // imply: the gyro task follows the sample period, filter/PID follow the
+    // denominator-scaled PID period, the accelerometer task its own rate. With
+    // the default denominator of 1 all of them are simply 1e6/hz.
+    {
+        extern uint32_t sitlLocalGyroSampleUs(void);
+        extern uint32_t sitlLocalGyroGridUs(void);
+        extern uint16_t sitlLocalAccSampleRateHz(void);
+        const uint32_t sampleUs = sitlLocalGyroSampleUs();
+        const uint32_t pidUs = sitlLocalGyroGridUs();
+        rescheduleTask(TASK_GYRO, sampleUs);
+        rescheduleTask(TASK_FILTER, pidUs);
+        rescheduleTask(TASK_PID, pidUs);
+        const uint16_t accHz = sitlLocalAccSampleRateHz();
+        if (accHz > 0) {
+            rescheduleTask(TASK_ACCEL, TASK_PERIOD_HZ(accHz));
+        }
+    }
 
     // Record the settings the boot path built its stateful chains from (gyro
     // filters, D-term filters, rate/RC processing). The configurator's SET
@@ -1395,6 +1436,24 @@ void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
         }
     }
 
+    // Tell the host once if its tick is a whole multiple of the loop period:
+    // the FC then runs several loop periods on one set of sensor samples, so
+    // the extra loops buy nothing (and the RPM filter is handed a signal that
+    // only updates at the host rate). The usual case is a 1 kHz host stepping a
+    // 4 kHz LOCAL build, which is the default loop rate.
+    if (gridUs > 0 && stepUs > gridUs && (stepUs % gridUs) == 0) {
+        static bool mismatchLogged = false;
+        if (!mismatchLogged) {
+            mismatchLogged = true;
+            sitlAuditLog("local step: host step %u us = %u x the %u us loop period - the FC runs "
+                         "%u loop periods per step on held sensor data. Step it every %u us, or "
+                         "build with -DSITL_GYRO_HZ=%u / set BF_SITL_GYRO_HZ=%u to match the host.",
+                         (unsigned)stepUs, (unsigned)(stepUs / gridUs), (unsigned)gridUs,
+                         (unsigned)(stepUs / gridUs), (unsigned)gridUs,
+                         (unsigned)(1000000u / stepUs), (unsigned)(1000000u / stepUs));
+        }
+    }
+
     // A configurator Save may have undone the pinned LOCAL runtime state; this
     // only rewrites flags/mode sources, so it also runs while armed.
     if (InterlockedCompareExchange(&gLocalRepinPending, 0, 0) != 0) {
@@ -1560,23 +1619,33 @@ void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
         gLocalRcValid = true;
     }
 
-    // --- run the scheduler on the same 100 us quantum grid as UDP mode ---
+    // --- run the scheduler on the gyro-period grid ---
     // A single scheduler() call exactly on the gyro deadline only runs the
     // realtime tasks (gyro/filter/PID). Non-realtime tasks (RX, failsafe, OSD,
     // blackbox) are only selected when time is left before the next deadline
-    // (schedLoopRemainingCycles > CHECK_GUARD_MARGIN_US), so stepping in
-    // 100 us quanta gives the pre-deadline passes a chance to run them -
-    // otherwise TASK_RX never processes RC frames and RXLOSS stays active.
+    // (schedLoopRemainingCycles > CHECK_GUARD_MARGIN_US), so stepping in quanta
+    // that divide the gyro period gives the pre-deadline passes a chance to run
+    // them - otherwise TASK_RX never processes RC frames and RXLOSS stays active.
+    //
+    // The quantum *must* divide the gyro period, for two hard reasons:
+    //   - the scheduler rounds a task's next deadline up to the grid it is called
+    //     on, so a 250 us target stepped on a 100 us grid actually runs every
+    //     300 us (3.33 kHz), and host and firmware beat against each other;
+    //   - the realtime poll is `while (schedLoopRemainingCycles > 0)
+    //     getCycleCounter();` and in LOCAL mode getCycleCounter() is the virtual
+    //     clock, which only advances inside sitl_local_step - a deadline that
+    //     falls between grid points can never be reached, so the poll spins
+    //     forever.
+    // 250 us -> 50, 1000 us -> 100 (unchanged), 8000 us -> 25.
     //
     // Carry the sub-quantum remainder over to the next call. Without it a host
     // that does not step in exact multiples of the quantum (any real engine tick
     // jitters a little) injects a short extra step, and that shifts the gyro/PID
-    // deadline grid: the loop period then alternates instead of staying at 1 ms,
-    // which the D term (delta/dt) turns into a high-frequency tremor. Carrying
-    // the remainder keeps every step a whole quantum and the grid aligned.
+    // deadline grid: the loop period then alternates instead of staying on the
+    // grid, which the D term (delta/dt) turns into a high-frequency tremor.
     static uint32_t gStepRemainderUs = 0;
+    const uint32_t quantumUs = localStepQuantumUs(gridUs);
     uint32_t remainingUs = stepUs + gStepRemainderUs;
-    const uint32_t quantumUs = 100;
     gStepRemainderUs = remainingUs % quantumUs;
     while (remainingUs >= quantumUs) {
         sitlStepTime(quantumUs);

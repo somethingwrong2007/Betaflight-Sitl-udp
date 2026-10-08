@@ -76,7 +76,9 @@ void mspSerialProcess(mspEvaluateNonMspData_e evaluateNonMspData,
                       mspProcessReplyFnPtr mspProcessReplyFn);
 #endif
 
-static uint32_t sitlGyroHz(void)
+// The loop rate that both the task periods and (at boot) the virtual gyro's
+// sample rate follow: BF_SITL_GYRO_HZ overrides the compiled SITL_GYRO_HZ.
+uint32_t sitlGyroHz(void)
 {
     const char *env = getenv("BF_SITL_GYRO_HZ");
     if (env != NULL && env[0] != '\0') {

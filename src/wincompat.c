@@ -424,10 +424,67 @@ void sitlLocalGetGyroChainState(float sampleSum[3], float *lpf1State, float *lpf
 // (sensors/gyro.h is not includable from sitl_local.c).
 uint32_t sitlLocalGyroGridUs(void)
 {
-#ifdef SITL_LOCAL
     return gyro.targetLooptime ? gyro.targetLooptime : 1000;
+}
+
+// The gyro/filter/PID periods the loop should run at: the gyro task follows the
+// *sample* period, the filter and PID tasks the (denominator-scaled) PID period.
+uint32_t sitlLocalGyroSampleUs(void)
+{
+    return gyro.sampleLooptime ? gyro.sampleLooptime : 1000;
+}
+
+uint16_t sitlLocalAccSampleRateHz(void)
+{
+    return gyro.accSampleRateHz;
+}
+
+// Make the virtual gyro's *sample* rate match the loop rate the tasks actually
+// run at, and re-derive everything that depends on it. The compiled
+// VIRTUAL_GYRO_SAMPLE_RATE_HZ and SITL_GYRO_HZ are the same value, so this is a
+// no-op for a plain build; it exists so a runtime BF_SITL_GYRO_HZ override cannot
+// leave the gyro sampling at the compiled rate while the scheduler runs faster
+// (the filter coefficients, RPM filter dt/Nyquist ceiling and the dynamic-notch
+// gate all derive from gyro.sampleLooptime/targetLooptime).
+//
+// Only ever called at boot, before the host starts stepping the FC, so the
+// chain rebuild cannot disturb a running loop.
+void sitlLocalApplyGyroRate(uint32_t hz)
+{
+#ifdef SITL_LOCAL
+    if (hz < 100 || hz > 32000) {
+        return;
+    }
+    if (gyro.sampleRateHz == hz && gyro.sampleLooptime == (uint32_t)(1e6f / hz)) {
+        return;     // already consistent
+    }
+    gyro.sampleRateHz = hz;
+    gyro.sampleLooptime = 1e6f / hz;
+    // The accelerometer lives in the same virtual device and is sampled at the
+    // same rate; keep its task consistent as well.
+    gyro.accSampleRateHz = hz;
+    acc.sampleRateHz = hz;
+    if (gyro.rawSensorDev != NULL) {
+        gyro.rawSensorDev->gyroSampleRateHz = hz;
+        gyro.rawSensorDev->accSampleRateHz = hz;
+    }
+    // The loop-time validation can raise pid_process_denom (e.g. a motor
+    // protocol that cannot be updated that fast); run it before deriving the
+    // looptime, exactly like initPhase3 does.
+    validateAndFixGyroConfig();
+    gyroSetTargetLooptime(pidConfig()->pid_process_denom);
+    gyroInitFilters();
+    pidInit(currentPidProfile);
+#if defined(USE_DSHOT_TELEMETRY) || defined(USE_ESC_SENSOR)
+    initDshotTelemetry(gyro.targetLooptime);
+#endif
+    sitlAuditLog("gyro rate: applied %u Hz (sampleUs=%u targetUs=%u denom=%u) "
+                 "and re-derived the filter chains",
+                 (unsigned)hz, (unsigned)gyro.sampleLooptime,
+                 (unsigned)gyro.targetLooptime,
+                 (unsigned)pidConfig()->pid_process_denom);
 #else
-    return 1000;
+    UNUSED(hz);
 #endif
 }
 

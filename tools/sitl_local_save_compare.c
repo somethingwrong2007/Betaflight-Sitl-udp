@@ -59,6 +59,16 @@
 #define WARMUP_PERIODS      3
 #define ARM_CHANNEL_FIRST   4        // rc_channels[]: 0..3 = AETR, 4.. = AUX1..
 
+// Sample-to-sample difference that still counts as "the same response". The two
+// traces are prepared by separate arm/settle/warm-up sequences, so the PID
+// integrator's random walk leaves a residue that scales with the loop rate: at a
+// 1 kHz loop it is ~2e-3 us, at 4 kHz ~5e-2 us (with the gyro, the filters and
+// the RC command bit-identical). The tolerance therefore scales with the loop
+// period the firmware reports; everything the harness is looking for - a live
+// re-init of a stateful chain, a save changing the stick response - shows up as
+// tens to hundreds of microseconds, i.e. two to three orders of magnitude more.
+static double gTraceToleranceUs = 0.05;
+
 #define TRACE_THROTTLE      1500     // 1500 throttle in every scenario
 #define ARM_THROTTLE        1000     // firmware only arms at low throttle
 
@@ -109,6 +119,7 @@ static double gClosedMax[2] = { 0.0, 0.0 };   // { motor0, plant rate } max
 // designed for one dt; the RPM filter's notches in particular are narrow, so a
 // varying sample interval moves them off the motor harmonic.
 static bool gStepDtJitter = false;
+static uint32_t gStepUs = 1000;      // host step (BF_HARNESS_STEP_US)
 static uint32_t gLastStepDtUs = 1000;
 
 // RPM input source: a fixed bench value, or - like Unreal's ESC model - the
@@ -141,12 +152,15 @@ static double sitlHarnessMotorRpm(int index)
 static uint32_t nextStepDtUs(void)
 {
     if (!gStepDtJitter) {
-        return 1000;
+        return gStepUs;
     }
-    // Deterministic +/-20% pattern; the physics tick of a real engine jitters
-    // around this much and is quantized to 100 us by the host.
-    static const uint32_t pattern[] = { 1000, 1200, 800, 1100, 900, 1000, 1200, 800 };
-    return pattern[gStepCount % (sizeof(pattern) / sizeof(pattern[0]))];
+    // Deterministic +/-20% pattern around the configured step; the physics tick
+    // of a real engine jitters around this much and is usually quantized to
+    // 100 us by the host (at the default 1000 us step that is exactly
+    // 1000/1200/800/1100/900).
+    static const int pattern[] = { 0, +20, -20, +10, -10, 0, +20, -20 };
+    const int pct = pattern[gStepCount % (sizeof(pattern) / sizeof(pattern[0]))];
+    return (uint32_t)((int)gStepUs + ((int)gStepUs * pct) / 100);
 }
 
 static bool rawStep(const sitl_local_input_t *in, sitl_local_output_t *out)
@@ -163,7 +177,11 @@ static bool rawStep(const sitl_local_input_t *in, sitl_local_output_t *out)
 
 static void padToFrameGrid(void)
 {
-    while (((gStepCount - gStepBase) % 8) != 0) {
+    // The firmware's RC frame cadence is 8 ms of virtual time; align the trace
+    // to it in *steps*, which depends on the host step size (8 steps at 1 ms,
+    // 32 at 250 us).
+    const uint64_t stepsPerFrame = (8000 + gStepUs / 2) / gStepUs;
+    while (stepsPerFrame > 0 && ((gStepCount - gStepBase) % stepsPerFrame) != 0) {
         sitl_local_input_t in;
         makeInput(0, TRACE_THROTTLE, true, &in);
         sitl_local_output_t out;
@@ -237,6 +255,12 @@ static void captureSignals(int index)
         return;
     }
     float *row = gSigTarget[index];
+    // Scale the comparison tolerance with the loop rate the firmware reports
+    // (gyroDeltaUs = the measured gyro period): the shorter the period, the more
+    // integrator steps per trace, the larger the residual random walk.
+    if (ls.gyroDeltaUs > 0) {
+        gTraceToleranceUs = 0.05 * (1000.0 / (double)ls.gyroDeltaUs);
+    }
     row[0] = ls.gyroADCf[0];
     row[1] = ls.gyroADC[0];
     row[2] = ls.rcCommand[0];
@@ -1187,14 +1211,14 @@ static void compare(const char *label, float a[SCENARIO_STEPS][4],
             if (d > maxDiff) {
                 maxDiff = d;
             }
-            if (first < 0 && d > 0.01) {
+            if (first < 0 && d > gTraceToleranceUs) {
                 first = i;
             }
         }
         fprintf(stderr, "  motor %d: max|d|=%9.4f us  mean|d|=%8.4f us  ", m, maxDiff,
                 sumDiff / SCENARIO_STEPS);
         if (first < 0) {
-            fprintf(stderr, "identical to 0.01 us\n");
+            fprintf(stderr, "identical to %.2f us\n", gTraceToleranceUs);
         } else {
             fprintf(stderr, "diverges from scenario step %d (before=%.2f us, after=%.2f us)\n",
                     first, (double)a[first][m], (double)b[first][m]);
@@ -1323,6 +1347,20 @@ int main(int argc, char **argv)
         if (gStepDtJitter) {
             fprintf(stderr, "[harness] step dt JITTER enabled (1000/1200/800/1100/900 us)\n");
         }
+    }
+    // BF_HARNESS_STEP_US: the host step size (default 1000 us = 1 kHz). Use 250
+    // to feed the FC at 4 kHz like the Unreal integration does; the scenario is
+    // step-indexed, so it simply runs faster in wall-clock terms.
+    {
+        const char *stepEnv = getenv("BF_HARNESS_STEP_US");
+        if (stepEnv != NULL && stepEnv[0] != '\0') {
+            const long v = strtol(stepEnv, NULL, 10);
+            if (v >= 100 && v <= 10000) {
+                gStepUs = (uint32_t)v;
+            }
+        }
+        fprintf(stderr, "[harness] host step = %u us (%.0f Hz)\n",
+                (unsigned)gStepUs, 1e6 / (double)gStepUs);
     }
     // BF_HARNESS_RPM_FROM_MOTORS=1 feeds RPM = 24000 * (motor-1000)/1000, i.e.
     // the speed the FC's own output commands (Unreal's ESC model), optionally
