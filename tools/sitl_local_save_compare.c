@@ -189,6 +189,9 @@ static uint64_t gStepBase = 0;
 #define PLANT_TAU_S      0.025   // 25 ms rate response
 static double gPlantGain = 0.017;   // rad/s per us of motor differential
 #define PLANT_GAIN       gPlantGain
+// 0 = a pure integrator with no angular damping (BF_HARNESS_PLANT_TAU_MS=0),
+// i.e. what an ideal rigid-body simulator looks like.
+static double gPlantTauS = PLANT_TAU_S;
 static bool gClosedLoop = false;
 static double gPlantRate[3] = { 0.0, 0.0, 0.0 };
 static float gLastMotorsForPlant[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
@@ -681,8 +684,12 @@ static void makeInput(int phase, uint16_t throttle, bool armHigh,
         const double yawTorque   = ((m[0] + m[1] + m[2]) / 3.0 - m[3]) * 0.5;
         const double torque[3] = { rollTorque, pitchTorque, yawTorque };
         for (int axis = 0; axis < 3; axis++) {
-            gPlantRate[axis] += (gLastStepDtUs * 1e-6)
-                              * (PLANT_GAIN * torque[axis] - gPlantRate[axis] / PLANT_TAU_S);
+            // BF_HARNESS_PLANT_TAU_MS = 0 makes this a pure integrator with no
+            // angular damping - which is what an ideal rigid-body simulator (and
+            // the Unreal pawn) looks like. The default 25 ms lag is a forgiving
+            // plant that hides loop-margin problems.
+            const double damp = (gPlantTauS > 0.0) ? gPlantRate[axis] / gPlantTauS : 0.0;
+            gPlantRate[axis] += (gLastStepDtUs * 1e-6) * (PLANT_GAIN * torque[axis] - damp);
         }
         in->angular_velocity_rpy[0] = gPlantRate[0];
         in->angular_velocity_rpy[1] = gPlantRate[1];
@@ -1564,8 +1571,14 @@ int main(int argc, char **argv)
         if (gain != NULL && gain[0] != '\0') {
             gPlantGain = atof(gain);
         }
+        const char *tau = getenv("BF_HARNESS_PLANT_TAU_MS");
+        if (tau != NULL && tau[0] != '\0') {
+            gPlantTauS = atof(tau) * 1e-3;
+        }
         fprintf(stderr, "[harness] closed-loop mode: gyro comes from the plant "
-                        "(gain %.4f rad/s per us), step dt %s\n", gPlantGain,
+                        "(gain %.4f rad/s per us, tau %.1f ms%s), step dt %s\n",
+                gPlantGain, gPlantTauS * 1000.0,
+                (gPlantTauS <= 0.0) ? " = pure integrator, no damping" : "",
                 gStepDtJitter ? "JITTERS (1000/1200/800/1100/900 us)" : "fixed 1000 us");
     }
 
@@ -1625,6 +1638,18 @@ int main(int argc, char **argv)
                 (unsigned)harnessMspPort());
         sitl_local_shutdown();
         return 1;
+    }
+
+    // BF_HARNESS_FILTERS_OFF=1 zeroes the whole gyro/D filter block through the
+    // configurator's own MSP path before any trace runs, so a run can compare
+    // "filters as configured" against "no filters at all" with everything else
+    // identical. Used to separate a filter problem from a loop-rate problem.
+    {
+        const char *off = getenv("BF_HARNESS_FILTERS_OFF");
+        if (off != NULL && off[0] != '\0' && off[0] != '0') {
+            setFilterConfigViaMsp(0, 0, 0, 0, 0, 0);
+            fprintf(stderr, "[harness] gyro/D filters zeroed (BF_HARNESS_FILTERS_OFF=1)\n");
+        }
     }
 
     // Maintenance: put a configuration back to a known PID-profile fingerprint

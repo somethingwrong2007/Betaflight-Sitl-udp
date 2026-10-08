@@ -105,6 +105,27 @@ def describe(tag, x, fs, motor_hz):
                 motor_peak=float(max(harms)) if harms else 0.0)
 
 
+def transfer(x_in, x_out, fs, freq_hz):
+    """Gain (dB) and phase (deg) of the filter chain at one frequency.
+
+    Both signals come from the same burst record, so the cross-spectrum at a
+    frequency where the feed has energy gives the chain's response there - this
+    is the part an amplitude sweep of a *driven* tone cannot show from a flight,
+    and the part that actually eats phase margin.
+    """
+    n = min(len(x_in), len(x_out))
+    win = np.hanning(n)
+    t = np.arange(n) / fs
+    e = np.exp(-2j * np.pi * freq_hz * t)
+    a = np.sum(x_in[:n] * win * e)
+    b = np.sum(x_out[:n] * win * e)
+    if abs(a) < 1e-9:
+        return None
+    gain_db = 20.0 * np.log10(abs(b) / abs(a))
+    phase_deg = float(np.degrees(np.angle(b / a)))
+    return gain_db, phase_deg
+
+
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else default_path()
     if not os.path.exists(path):
@@ -136,6 +157,20 @@ def main():
     for i, ax in enumerate(("roll", "pitch", "yaw")):
         describe(ax, gyro_filt[:, i], fs, motor_hz)
     print(f"  |D| mean = {np.mean(np.abs(pid_d), axis=0).round(3)} (deg/s * D gain)")
+
+    # Chain gain/phase at the frequencies that matter: the control band and the
+    # motor harmonics. Phase is the number to look at - a filter set that is flat
+    # in amplitude can still cost tens of degrees right where the loop needs them.
+    print("  filter chain (fed -> PID), gain/phase at:")
+    for f in (20.0, 50.0, 92.0, 150.0, 250.0, 400.0):
+        row = []
+        for i, ax in enumerate(("roll", "pitch")):
+            r = transfer(gyro_raw[:, i], gyro_filt[:, i], fs, f)
+            if r is None:
+                row.append(f"{ax}=--")
+            else:
+                row.append(f"{ax}={r[0]:+.1f}dB/{r[1]:+6.1f}deg")
+        print(f"    {f:5.0f} Hz  " + "  ".join(row))
 
     # Is a peak in the feed driven by the FC (a limit cycle) or injected? Compare
     # where the feed, the PID sum and the motor outputs put their energy.
