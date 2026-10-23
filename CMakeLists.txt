@@ -483,6 +483,34 @@ if(WIN32)
     # wincompat.c throttles the per-iteration one to 10 Hz.
     set_source_files_properties("${BF_ROOT}/src/main/blackbox/blackbox.c" PROPERTIES COMPILE_OPTIONS
       "-DblackboxDeviceFlush=sitlBlackboxDeviceFlushThrottled")
+    # writeEEPROM() is a synchronous 32 KB file write plus fopen/fclose/rename,
+    # and the flight thread reaches it directly: fc/stats.c writes the stats from
+    # the dispatcher (which runs inside sitl_local_step) the moment the aircraft
+    # disarms, and cli.c / gyro_init.c do the same from their own paths. Those
+    # call sites become the deferred hook (wincompat.c), which only raises the
+    # pending flag; the MSP thread does the real write - exactly what the MSP
+    # save path above already does. config.c keeps the real definition, which is
+    # what the MSP thread and localFlushEepromWrite() call.
+    foreach(BF_EEPROM_WRITER "fc/stats.c" "cli/cli.c" "sensors/gyro_init.c")
+      set_source_files_properties("${BF_ROOT}/src/main/${BF_EEPROM_WRITER}" PROPERTIES COMPILE_OPTIONS
+        "-DwriteEEPROM=sitlWriteEEPROMDeferred")
+    endforeach()
+    # Arming path trace (wincompat.c): tryArm() arms and processRcStickPositions()
+    # is its only RC caller, so tracing the two call sites names whichever gate is
+    # shut when the aircraft will not arm while armFlags reads 0.
+    set_source_files_properties("${BF_ROOT}/src/main/fc/core.c" PROPERTIES COMPILE_OPTIONS
+      "-DtryArm=sitlTryArmReal;-DprocessRcStickPositions=sitlProcessRcStickPositionsTraced;-DgetLastDshotBeaconCommandTimeUs=sitlLastDshotBeaconCommandTimeUs")
+    set_source_files_properties("${BF_ROOT}/src/main/fc/rc_controls.c" PROPERTIES COMPILE_OPTIONS
+      "-DtryArm=sitlTryArmTraced;-DprocessRcStickPositions=sitlProcessRcStickPositionsReal;-Ddisarm=sitlDisarmTraced")
+    # osd.c's post-flight statistics page prints a blackbox storage line:
+    # osdGetBlackboxStatusString() computes used/total where storageTotal stays 0
+    # whenever neither USE_SDCARD nor USE_FLASHFS is compiled (both are absent on
+    # SITL), and GCC constant-folds that division into a ud2 trap. The row is
+    # drawn while disarmed, so the aircraft dies on every arm/disarm with
+    # 0xC000001D inside osdUpdate(). Report "no storage device" to the OSD
+    # instead: the file-based virtual blackbox has no storage statistics to show.
+    set_source_files_properties("${BF_ROOT}/src/main/osd/osd.c" PROPERTIES COMPILE_OPTIONS
+      "-DisBlackboxDeviceWorking=sitlOsdIsBlackboxDeviceWorking")
   else()
     set_source_files_properties("${BF_ROOT}/src/main/msp/msp.c" PROPERTIES COMPILE_OPTIONS
       "-DsystemReset=sitlSystemReset")
@@ -490,8 +518,11 @@ if(WIN32)
   # UDP-fed battery telemetry: battery.c's ADC meter reads are renamed to
   # wincompat shims that return voltage/current from the extended FDM packet
   # (sim_telemetry.h), and fresh EEPROMs default the meters to that path.
+  # batteryUpdateVoltage is renamed so wincompat.c can run the complete update
+  # first and then probe for battery presence with this tick's voltage (the
+  # refresh hook runs before the meter is read).
   set_source_files_properties("${BF_ROOT}/src/main/sensors/battery.c" PROPERTIES COMPILE_OPTIONS
-    "-DvoltageMeterADCRefresh=sitlBatteryVoltageRefresh;-DvoltageMeterADCRead=sitlBatteryVoltageRead;-DcurrentMeterADCRefresh=sitlBatteryCurrentRefresh;-DcurrentMeterADCRead=sitlBatteryCurrentRead;-DDEFAULT_VOLTAGE_METER_SOURCE=VOLTAGE_METER_ADC;-DDEFAULT_CURRENT_METER_SOURCE=CURRENT_METER_ADC")
+    "-DvoltageMeterADCRefresh=sitlBatteryVoltageRefresh;-DvoltageMeterADCRead=sitlBatteryVoltageRead;-DcurrentMeterADCRefresh=sitlBatteryCurrentRefresh;-DcurrentMeterADCRead=sitlBatteryCurrentRead;-DbatteryUpdateVoltage=sitlBatteryUpdateVoltageReal;-DDEFAULT_VOLTAGE_METER_SOURCE=VOLTAGE_METER_ADC;-DDEFAULT_CURRENT_METER_SOURCE=CURRENT_METER_ADC")
   # The dyad-based TCP bridge is replaced by serial_tcp_win.c; dyad_update()
   # busy-spins when no streams exist, so wincompat.c provides a sleeping stub.
   set_source_files_properties("${BF_ROOT}/lib/main/dyad/dyad.c" PROPERTIES COMPILE_OPTIONS "-Ddyad_update=dyad_update_real")
@@ -502,6 +533,17 @@ if(WIN32)
   list(APPEND BF_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/ws_proxy_win.c")
   if(SITL_LINK_MODE STREQUAL "LOCAL")
     list(APPEND BF_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/sitl_local.c")
+    # OSD canvas capture: wraps the firmware's MSP displayport and publishes the
+    # character grid for the host (see src/sitl_osd.c).
+    list(APPEND BF_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/sitl_osd.c")
+
+    # io/displayport_hott.c is guarded by "USE_HOTT_TEXTMODE && USE_CMS".
+    # Enabling the OSD defines USE_CMS, which activates the file, but
+    # USE_HOTT_TEXTMODE lives in common_pre.h's non-SITL block (the SITL target
+    # disables HOTT telemetry), so the hottTextmode* functions it calls are not
+    # compiled and the link fails with undefined references. Nothing on SITL
+    # references the HOTT displayport, so drop the source instead.
+    list(REMOVE_ITEM BF_SOURCES "${BF_ROOT}/src/main/io/displayport_hott.c")
     # Optional A/B switch: inject the FDM attitude straight into the IMU instead
     # of letting the firmware's estimator (USE_IMU_CALC) derive it from the
     # virtual acc/gyro/mag. Applied to sitl_local.c only, so toggling it rebuilds
@@ -511,6 +553,28 @@ if(WIN32)
       set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/sitl_local.c"
         PROPERTIES COMPILE_OPTIONS "-DSITL_ATTITUDE_DIRECT")
     endif()
+
+    # msp_box.c only adds BOXCRASHFLIP (FLIP OVER AFTER CRASH) to the active box
+    # list when the configured motor protocol is DShot. The LOCAL link has to run
+    # the virtual PWM backend, so wincompat.c provides initActiveBoxIds() that
+    # reports DShot for the duration of that pure config function and restores
+    # PWM immediately after - the Configurator then shows the mode while the
+    # motor backend, RPM telemetry and output path stay untouched.
+    set_source_files_properties("${BF_ROOT}/src/main/msp/msp_box.c"
+      PROPERTIES COMPILE_OPTIONS "-DinitActiveBoxIds=sitlInitActiveBoxIdsReal")
+
+    # Crash flip: the firmware latches crashFlipModeActive only when the motor
+    # protocol is DShot (core.c tryArm), so a PWM-only LOCAL backend would never
+    # flip. sitl_local.c reproduces the latch; these are the TUs that read it.
+    foreach(_cf_source
+        "${BF_ROOT}/src/main/flight/mixer.c"
+        "${BF_ROOT}/src/main/io/ledstrip.c"
+        "${BF_ROOT}/src/main/osd/osd.c"
+        "${BF_ROOT}/src/main/osd/osd_elements.c"
+        "${BF_ROOT}/src/main/osd/osd_warnings.c")
+      set_property(SOURCE "${_cf_source}" APPEND PROPERTY COMPILE_OPTIONS
+        "-DisCrashFlipModeActive=sitlIsCrashFlipModeActive")
+    endforeach()
   endif()
 endif()
 
@@ -522,6 +586,11 @@ endif()
 if(SITL_LINK_MODE STREQUAL "LOCAL")
   add_library(betaflight_SITL SHARED ${BF_SOURCES})
   set_target_properties(betaflight_SITL PROPERTIES PREFIX "")
+  # Line tables for the firmware sources: a crash report carries the faulting
+  # instruction's RVA (see sitlCrashLogger() in src/wincompat.c), and without
+  # -g addr2line can only answer "osdUpdate" instead of "osd.c:1234". Debug
+  # info does not change code generation at the same -O2.
+  target_compile_options(betaflight_SITL PRIVATE -g)
   # MinGW auto-exports every global symbol in a DLL by default, which keeps
   # firmware sections alive that the executable build normally garbage
   # collects (and that reference target-only helpers). Export only the API
@@ -624,10 +693,46 @@ if(SITL_LINK_MODE STREQUAL "LOCAL")
   set_source_files_properties("${BF_ROOT}/src/main/msp/msp_serial.c" PROPERTIES COMPILE_OPTIONS
     "-DmspSerialProcess=sitlMspSerialProcessReal")
 
+  # displayport_msp.c's displayPortMspInit() is the displayport the firmware
+  # builds when the OSD runs in HD/MSP mode. Rename it so src/sitl_osd.c can
+  # provide the displayPortMspInit() the firmware calls, wrap the real vtable
+  # (keeping the MSP/goggle stream intact) and mirror every clear/write/draw
+  # into a character grid the host reads back. See src/sitl_osd.c.
+  set_source_files_properties("${BF_ROOT}/src/main/io/displayport_msp.c" PROPERTIES COMPILE_OPTIONS
+    "-DdisplayPortMspInit=sitlRealDisplayPortMspInit")
+
   # Prepend wincompat so the x86 build/atomic.h shadow wins over the
   # ARM-only submodule header (required once USE_DSHOT is enabled).
   target_include_directories(betaflight_SITL PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/wincompat
+  )
+
+  # ---------------------------------------------------------------------------
+  # OSD enablement (shadow target.h).
+  #
+  # The SITL target does not build the OSD: in
+  # extern/betaflight/src/main/target/common_pre.h the whole classic-build block
+  # (which contains "#define USE_OSD" and "#define USE_MAX7456") sits inside
+  #
+  #     #if !defined(CLOUD_BUILD) && !defined(SITL)
+  #
+  # and this build defines SITL, so those gates are never opened. target.h's own
+  # "#undef USE_OSD" is therefore a no-op rather than the cause.
+  #
+  # platform.h includes target/common_pre.h (line 37) BEFORE "target.h"
+  # (line 42), so a shim placed ahead of the real target directory can re-open
+  # the OSD gates after common_pre.h has run and before common_post.h runs - at
+  # which point the firmware behaves exactly like a normal OSD-capable target.
+  #
+  # The pinned extern/betaflight submodule is deliberately NOT modified; this is
+  # the same layering trick already used above for wincompat/.
+  #
+  # Only the LOCAL in-process build gets the OSD: the standalone UDP server is
+  # not a host for the Unreal HUD and its link script (sitl.ld) is not set up
+  # for the extra sections.
+  # ---------------------------------------------------------------------------
+  target_include_directories(betaflight_SITL BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/sitl_osd/include
   )
 endif()
 
@@ -718,4 +823,31 @@ if(SITL_LINK_MODE STREQUAL "LOCAL")
   add_executable(sitl_local_save_compare tools/sitl_local_save_compare.c)
   target_link_libraries(sitl_local_save_compare PRIVATE betaflight_SITL ws2_32)
   target_include_directories(sitl_local_save_compare PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+  # OSD capture check: boots the FC, steps it, and dumps the character grid the
+  # firmware rendered - the end-to-end proof that the OSD is enabled and that a
+  # host can read the canvas (see src/sitl_osd.c).
+  add_executable(sitl_osd_check tools/sitl_osd_check.c)
+  target_link_libraries(sitl_osd_check PRIVATE betaflight_SITL)
+  target_include_directories(sitl_osd_check PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+  # OSD contract check: configures OSD elements the way the Configurator does and
+  # asserts the canvas a host reads back changes to match - the "UE HUD follows
+  # the SITL OSD" requirement, verified without an editor.
+  add_executable(sitl_osd_contract_check tools/sitl_osd_contract_check.c)
+  target_link_libraries(sitl_osd_contract_check PRIVATE betaflight_SITL)
+  target_include_directories(sitl_osd_contract_check PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+  # OSD ABI check: proves the hand-written UE mirror (FBfSitlOsdFrame) is
+  # byte-compatible with sitl_local_osd_frame_t, which the DLL writes into
+  # directly. A drift otherwise corrupts silently.
+  add_executable(sitl_osd_abi_check tools/sitl_osd_abi_check.c)
+  target_link_libraries(sitl_osd_abi_check PRIVATE betaflight_SITL)
+  target_include_directories(sitl_osd_abi_check PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+  # EEPROM side-effect check: booting with the OSD enabled must not persist
+  # FEATURE_OSD into the user's aircraft config.
+  add_executable(sitl_osd_eeprom_effect tools/sitl_osd_eeprom_effect.c)
+  target_link_libraries(sitl_osd_eeprom_effect PRIVATE betaflight_SITL)
+  target_include_directories(sitl_osd_eeprom_effect PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 endif()

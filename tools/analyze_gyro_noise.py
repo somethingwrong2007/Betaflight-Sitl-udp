@@ -11,6 +11,10 @@ The burst recorder (src/sitl_local.c) writes one line per FC loop period:
   gyroADCf*   gyro the PID actually sees, after the whole filter chain (deg/s)
   rpm*        per-motor mechanical frequency the RPM filter works from (Hz)
 
+NOTE: the burst recorder is off by default - set BF_SITL_BURST=1 for the process
+that runs the flight controller, fly for a few seconds, then analyse the log it
+writes (the harness pins its own copy under %TEMP%).
+
 The point of the report is to separate "the filters are doing something" from
 "there is something to filter": the filter chain can only pay off if the feed
 carries motor vibration. A real 5" quad shows clearly visible peaks at the

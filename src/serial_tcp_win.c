@@ -276,11 +276,42 @@ static int tcpReconfigure(tcpPort_t *s, int id)
     return 0;
 }
 
+// Close every accepted configurator connection.
+//
+// A reboot that leaves the old sockets open is what makes a ground station
+// unable to come back: the peer (configurator, or the WebSocket proxy holding
+// the upstream MSP link) sees a connection that is open but will never answer
+// again, and it gets no disconnect event - so its reboot-reconnect flow, which
+// is built around one, never starts and the user has to connect by hand. Real
+// hardware drops the link when the MCU resets; do the same.
+//
+// The client threads notice recv() failing and clean their own slot up, and the
+// close also frees a stuck slot, which matters with only MAX_TCP_CLIENTS of them.
+void serialTcpDropClients(void)
+{
+    for (int id = 0; id < SERIAL_PORT_COUNT; id++) {
+        if (!tcpPortInitialized[id]) {
+            continue;   // never opened: no clients, and the lock is uninitialised
+        }
+        pthread_mutex_lock(&clientLocks[id]);
+        for (int i = 0; i < MAX_TCP_CLIENTS; i++) {
+            if (clientSockets[id][i] != INVALID_SOCKET) {
+                closesocket(clientSockets[id][i]);
+                clientSockets[id][i] = INVALID_SOCKET;
+            }
+        }
+        tcpSerialPorts[id].clientCount = 0;
+        tcpSerialPorts[id].connected = false;
+        pthread_mutex_unlock(&clientLocks[id]);
+    }
+}
+
 // Stop every listener so a later sitl_local_init() can bind 5761 again: the
 // accept loops leave as soon as their listen socket is closed.
 void serialTcpStop(void)
 {
     tcpStopping = true;
+    serialTcpDropClients();
     for (int id = 0; id < SERIAL_PORT_COUNT; id++) {
         if (listenSockets[id] != INVALID_SOCKET) {
             closesocket(listenSockets[id]);

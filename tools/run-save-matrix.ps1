@@ -33,7 +33,7 @@ New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 # stick transient (a real FC behaves the same way - the filter state is not
 # rewound). The check below therefore accepts a divergence in the reverted trace
 # only when it starts at or after the stick doublet.
-$saveOps = @('save-only', 'save-reboot', 'cfg-save', 'cfg-save-reboot', 'aux-save')
+$saveOps = @('save-only', 'save-reboot', 'cfg-save', 'cfg-save-reboot', 'aux-save', 'cli-save')
 $editOps = @{
     'cfg-change'        = @('DIVERGES', 'identical')
     'cfg-change-filter' = @('DIVERGES', 'identical')

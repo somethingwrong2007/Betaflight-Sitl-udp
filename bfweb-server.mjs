@@ -9,6 +9,12 @@
  *   - showManualMode : true        (manual becomes the default selection)
  *   - expertMode : true            (manual item is gated behind expert mode)
  *   - portOverride : ws://127.0.0.1:6761
+ *   - autoConnect : true           (the reboot reconnect cycle requires it; without
+ *                                   it the window concludes 1.5 s after a reboot -
+ *                                   "Flight Controller did not reconnect" - and no
+ *                                   attempt is made at all. It does not connect on
+ *                                   page load: the manual device emits no device
+ *                                   event, so Connect stays a user action.)
  *
  * No files from bf-configurator are modified; the injection happens in memory
  * on every request.
@@ -49,6 +55,7 @@ try {
     localStorage.setItem("showManualMode", JSON.stringify({ showManualMode: true }));
     localStorage.setItem("expertMode", JSON.stringify({ expertMode: true }));
     localStorage.setItem("portOverride", JSON.stringify({ portOverride: "ws://127.0.0.1:6761" }));
+    localStorage.setItem("autoConnect", JSON.stringify({ autoConnect: true }));
 } catch (e) { /* localStorage unavailable */ }
 </script>`;
 

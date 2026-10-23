@@ -47,6 +47,7 @@
 #include "fc/runtime_config.h"
 #include "config/feature.h"
 #include "msp/msp.h"
+#include "msp/msp_box.h"
 #include "pg/rpm_filter.h"
 #include "rx/rx.h"
 #include "sensors/battery.h"
@@ -268,25 +269,66 @@ static uint32_t localBurstGridUs(uint32_t stepUs)
     return (grid < stepUs) ? stepUs : grid;
 }
 
-static bool localBurstLog(uint32_t stepUs)
+// Off by default: set BF_SITL_BURST=1 to record. The recorder is a diagnostic, so
+// a normal session does not pay for it at all (the check is a cached flag).
+static bool localBurstEnabled(void)
 {
-    static uint64_t nextRecordUs = 0;
-    static uint64_t nextBurstUs = 0;
-    static uint32_t burstStep = 0;
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("BF_SITL_BURST");
+        cached = (env != NULL && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+// One record as read on the step thread. The step only fills this in and pushes
+// it; the 40-field formatting and the file write happen on the MSP thread in
+// sitlBurstDrain(), because the recorder runs for 2 s out of every 12 s and used
+// to cost a 40-field fprintf() plus a write per millisecond inside the step.
+typedef struct {
+    uint64_t tUs;
+    int16_t gyroRaw[3];
+    float pid[4][3];            // P, I, D, Sum
+    float feedforward[3];
+    float motors[4];
+    int16_t att[3];
+    uint16_t modes;
+    uint32_t armFlags;
+    int pidDeltaUs, gyroDeltaUs;
+    float rpmHz[4];
+    float notchHz[3];
+    float gyroADCf[3];
+} sitlBurstRecord_t;
+
+#define SITL_BURST_RING 4096
+
+static sitlBurstRecord_t gBurstRing[SITL_BURST_RING];
+static volatile LONG gBurstHead = 0;        // advanced by the step thread
+static volatile LONG gBurstTail = 0;        // advanced by the MSP thread
+static volatile LONG gBurstRecording = 0;   // 1 while a window is open
+static volatile LONG gBurstDropped = 0;
+
+static void sitlBurstPush(const sitlBurstRecord_t *rec)
+{
+    const LONG head = gBurstHead;
+    const LONG next = (head + 1 == SITL_BURST_RING) ? 0 : head + 1;
+    if (next == gBurstTail) {
+        InterlockedIncrement(&gBurstDropped);   // the MSP thread is behind: drop
+        return;
+    }
+    gBurstRing[head] = *rec;
+    gBurstHead = next;
+}
+
+// MSP thread: format and write what the step produced, and close the file once
+// the window has ended and the ring is drained.
+void sitlBurstDrain(void)
+{
     static FILE *fp = NULL;
-
-    const uint64_t nowUs = micros64();
-    if (fp == NULL && nowUs < nextBurstUs) {
-        return false;   // the gate that keeps this off the hot path
-    }
-    if (nowUs < nextRecordUs) {
-        return false;
-    }
-    nextRecordUs = nowUs + localBurstGridUs(stepUs);
-
     if (fp == NULL) {
-        // BF_SITL_BURST_LOG keeps a test tool from overwriting the live host's
-        // record (the harness points it at %TEMP%).
+        if (!gBurstRecording) {
+            return;
+        }
         char path[MAX_PATH];
         const char *override = getenv("BF_SITL_BURST_LOG");
         if (override != NULL && override[0] != '\0') {
@@ -294,56 +336,112 @@ static bool localBurstLog(uint32_t stepUs)
         } else {
             const char *appData = getenv("LOCALAPPDATA");
             if (appData == NULL) {
-                return false;
+                return;
             }
             _snprintf(path, sizeof(path), "%s\\Betaflight-SITL\\sitl-burst.log", appData);
         }
         fp = fopen(path, "w");
         if (fp == NULL) {
-            return false;
+            InterlockedExchange(&gBurstRecording, 0);
+            return;
         }
         fprintf(fp, "# t_us gyroR gyroP gyroY pR pP pY iR iP iY dR dP dY fR fP fY "
                     "sumR sumP sumY m0 m1 m2 m3 attR attP attY modes armFlags "
                     "pidDeltaUs gyroDeltaUs rpm0 rpm1 rpm2 rpm3 notch1 notch2 notch3 "
                     "gyroADCfR gyroADCfP gyroADCfY\n");
+        InterlockedExchange(&gBurstDropped, 0);
+    }
+    while (gBurstTail != gBurstHead) {
+        const sitlBurstRecord_t *r = &gBurstRing[gBurstTail];
+        fprintf(fp, "%.0f %.1f %.1f %.1f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f "
+                    "%.2f %.2f %.2f %.2f %.2f %.2f %.0f %.0f %.0f %.0f %d %d %d %04X %08X "
+                    "%d %d %.1f %.1f %.1f %.1f %.0f %.0f %.0f %.2f %.2f %.2f\n",
+                (double)r->tUs,
+                (double)r->gyroRaw[0], (double)r->gyroRaw[1], (double)r->gyroRaw[2],
+                (double)r->pid[0][0], (double)r->pid[0][1], (double)r->pid[0][2],
+                (double)r->pid[1][0], (double)r->pid[1][1], (double)r->pid[1][2],
+                (double)r->pid[2][0], (double)r->pid[2][1], (double)r->pid[2][2],
+                (double)r->feedforward[0], (double)r->feedforward[1], (double)r->feedforward[2],
+                (double)r->pid[3][0], (double)r->pid[3][1], (double)r->pid[3][2],
+                (double)r->motors[0], (double)r->motors[1],
+                (double)r->motors[2], (double)r->motors[3],
+                (int)r->att[0], (int)r->att[1], (int)r->att[2],
+                (unsigned)r->modes, (unsigned)r->armFlags,
+                r->pidDeltaUs, r->gyroDeltaUs,
+                (double)r->rpmHz[0], (double)r->rpmHz[1],
+                (double)r->rpmHz[2], (double)r->rpmHz[3],
+                (double)r->notchHz[0], (double)r->notchHz[1], (double)r->notchHz[2],
+                (double)r->gyroADCf[0], (double)r->gyroADCf[1], (double)r->gyroADCf[2]);
+        gBurstTail = (gBurstTail + 1 == SITL_BURST_RING) ? 0 : gBurstTail + 1;
+    }
+    if (!gBurstRecording) {
+        if (gBurstDropped != 0) {
+            fprintf(fp, "# dropped %ld records (ring full)\n", (long)gBurstDropped);
+        }
+        fclose(fp);
+        fp = NULL;
+    }
+}
+
+static bool localBurstLog(uint32_t stepUs)
+{
+    if (!localBurstEnabled()) {
+        return false;   // off by default: BF_SITL_BURST=1 turns the recorder on
+    }
+    static uint64_t nextRecordUs = 0;
+    static uint64_t nextBurstUs = 0;
+    static uint32_t burstStep = 0;
+
+    const uint64_t nowUs = micros64();
+    if (!gBurstRecording && nowUs < nextBurstUs) {
+        return false;   // the gate that keeps this off the hot path
+    }
+    if (nowUs < nextRecordUs) {
+        return false;
+    }
+    nextRecordUs = nowUs + localBurstGridUs(stepUs);
+
+    if (!gBurstRecording) {
+        // Window start: the MSP thread opens the file as soon as it sees this.
         burstStep = 0;
+        InterlockedExchange(&gBurstRecording, 1);
     }
 
     extern void sitlLocalGetRpmNotchHz(float notchHz[3]);
-    float notchHz[3] = { 0.0f, 0.0f, 0.0f };
-    sitlLocalGetRpmNotchHz(notchHz);
-    float rpmHz[4];
-    float gyroADCf[3];
     extern void sitlLocalGetGyroState(float scaled[3], float filtered[3]);
-    sitlLocalGetGyroState(NULL, gyroADCf);
-    for (int i = 0; i < 4; i++) {
-        rpmHz[i] = getMotorFrequencyHz((uint8_t)i);
-    }
 
-    fprintf(fp, "%.0f %.1f %.1f %.1f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f "
-                "%.2f %.2f %.2f %.2f %.2f %.2f %.0f %.0f %.0f %.0f %d %d %d %04X %08X "
-                "%d %d %.1f %.1f %.1f %.1f %.0f %.0f %.0f %.2f %.2f %.2f\n",
-            (double)nowUs,
-            (double)gLocalLastGyroRaw[0], (double)gLocalLastGyroRaw[1],
-            (double)gLocalLastGyroRaw[2],
-            (double)pidData[0].P, (double)pidData[1].P, (double)pidData[2].P,
-            (double)pidData[0].I, (double)pidData[1].I, (double)pidData[2].I,
-            (double)pidData[0].D, (double)pidData[1].D, (double)pidData[2].D,
-            (double)pidData[0].F, (double)pidData[1].F, (double)pidData[2].F,
-            (double)pidData[0].Sum, (double)pidData[1].Sum, (double)pidData[2].Sum,
-            (double)gLocalLastMotors[0], (double)gLocalLastMotors[1],
-            (double)gLocalLastMotors[2], (double)gLocalLastMotors[3],
-            (int)attitude.values.roll, (int)attitude.values.pitch, (int)attitude.values.yaw,
-            (unsigned)flightModeFlags, (unsigned)getArmingDisableFlags(),
-            (int)getTaskDeltaTimeUs(TASK_PID), (int)getTaskDeltaTimeUs(TASK_GYRO),
-            (double)rpmHz[0], (double)rpmHz[1], (double)rpmHz[2], (double)rpmHz[3],
-            (double)notchHz[0], (double)notchHz[1], (double)notchHz[2],
-            (double)gyroADCf[0], (double)gyroADCf[1], (double)gyroADCf[2]);
+    // Only reads and a memcpy happen here: everything else is the MSP thread's.
+    sitlBurstRecord_t rec;
+    rec.tUs = nowUs;
+    for (int a = 0; a < 3; a++) {
+        rec.gyroRaw[a] = gLocalLastGyroRaw[a];
+        rec.feedforward[a] = pidData[a].F;
+    }
+    rec.att[0] = (int16_t)attitude.values.roll;
+    rec.att[1] = (int16_t)attitude.values.pitch;
+    rec.att[2] = (int16_t)attitude.values.yaw;
+    for (int a = 0; a < 3; a++) {
+        rec.pid[0][a] = pidData[a].P;
+        rec.pid[1][a] = pidData[a].I;
+        rec.pid[2][a] = pidData[a].D;
+        rec.pid[3][a] = pidData[a].Sum;
+    }
+    for (int i = 0; i < 4; i++) {
+        rec.motors[i] = gLocalLastMotors[i];
+        rec.rpmHz[i] = getMotorFrequencyHz((uint8_t)i);
+    }
+    rec.modes = (uint16_t)flightModeFlags;
+    rec.armFlags = (uint32_t)getArmingDisableFlags();
+    rec.pidDeltaUs = getTaskDeltaTimeUs(TASK_PID);
+    rec.gyroDeltaUs = getTaskDeltaTimeUs(TASK_GYRO);
+    rec.notchHz[0] = rec.notchHz[1] = rec.notchHz[2] = 0.0f;
+    sitlLocalGetRpmNotchHz(rec.notchHz);
+    sitlLocalGetGyroState(NULL, rec.gyroADCf);
+    sitlBurstPush(&rec);
 
     if (++burstStep >= SITL_BURST_RECORDS) {
-        fclose(fp);
-        fp = NULL;
-        nextBurstUs = (uint64_t)micros64() + localBurstPeriodUs();
+        InterlockedExchange(&gBurstRecording, 0);   // the MSP thread closes it
+        nextBurstUs = nowUs + localBurstPeriodUs();
     }
     return true;
 }
@@ -434,6 +532,30 @@ void sitlLocalPreMotorInit(void)
                  (env != NULL && env[0] != '\0') ? " [BF_SITL_DSHOT_TELEMETRY]" : "");
 }
 
+// Pin the battery meters before batteryInit()/tasksInit() run.
+//
+// localApplyLinkOverrides() selects the same two sources, but it runs *after*
+// sitlBoot() - i.e. after initPhase2/initPhase3 have already called
+// batteryInit() and tasksInit(). Those read batteryConfig()->voltageMeterSource /
+// currentMeterSource to decide whether TASK_BATTERY_VOLTAGE,
+// TASK_BATTERY_CURRENT and TASK_BATTERY_ALERTS are enabled, so an EEPROM that
+// stored VOLTAGE_METER_NONE (or any other non-ADC source) left all three off for
+// the whole session: voltage, current and mAh stayed 0, and a configurator save
+// could not bring them back (re-pinning the sources later does not re-run
+// tasksInit()).
+//
+// main_windows.c calls this right after initPhase1 (the EEPROM read) and before
+// initPhase2/3, so the boot derives the tasks from the virtual meters.
+void sitlLocalPreBatteryInit(void)
+{
+    const uint8_t voltageBefore = batteryConfig()->voltageMeterSource;
+    const uint8_t currentBefore = batteryConfig()->currentMeterSource;
+    batteryConfigMutable()->voltageMeterSource = VOLTAGE_METER_ADC;
+    batteryConfigMutable()->currentMeterSource = CURRENT_METER_ADC;
+    sitlAuditLog("boot: battery meters %u/%u -> ADC/ADC before batteryInit/tasksInit",
+                 (unsigned)voltageBefore, (unsigned)currentBefore);
+}
+
 // The LOCAL link owns a few settings that the stock firmware would take from
 // the EEPROM: the virtual UDP receiver, the ADC battery shims that read
 // sitl_local_step() telemetry and the virtual PWM motor backend. sitl.c's boot
@@ -492,6 +614,13 @@ static void localApplyLinkOverrides(void)
     // Voltage/current arrive as telemetry, not from a real ADC input.
     batteryConfigMutable()->voltageMeterSource = VOLTAGE_METER_ADC;
     batteryConfigMutable()->currentMeterSource = CURRENT_METER_ADC;
+    // tasksInit() derives these from the meter sources, and the pre-boot
+    // sitlLocalPreBatteryInit() pinning covers a reboot. A reload replaces the
+    // PG records (a configurator save can put NONE back), so make sure the tasks
+    // are running as well - setTaskEnabled() is idempotent.
+    setTaskEnabled(TASK_BATTERY_VOLTAGE, true);
+    setTaskEnabled(TASK_BATTERY_CURRENT, true);
+    setTaskEnabled(TASK_BATTERY_ALERTS, true);
 
     // Pin the virtual PWM backend before the next motorDevInit().
     sitlLocalPreMotorInit();
@@ -537,6 +666,9 @@ static void localRepinOverrides(void)
     featureEnableImmediate(FEATURE_RX_UDP);
     batteryConfigMutable()->voltageMeterSource = VOLTAGE_METER_ADC;
     batteryConfigMutable()->currentMeterSource = CURRENT_METER_ADC;
+    setTaskEnabled(TASK_BATTERY_VOLTAGE, true);
+    setTaskEnabled(TASK_BATTERY_CURRENT, true);
+    setTaskEnabled(TASK_BATTERY_ALERTS, true);
     if (!rcOursBefore) {
         // A configurator write re-ran rxInit(): put the virtual receiver back.
         localTakeOverRcProvider();
@@ -831,6 +963,19 @@ static void localRunPendingReboot(void)
     // a blackbox device / directory change takes effect.
     blackboxInit();
 #endif
+
+    // A real FC redraws its boot splash and starts a fresh flight's statistics
+    // after *every* reboot, this in-process one included (Save and Reboot, CLI
+    // save/exit/defaults, CMS, Enter bootloader/DFU). Only OSD/telemetry state -
+    // nothing the control loop reads - so it can run here between scheduler
+    // passes without touching the filter/PID chains this path deliberately
+    // keeps alive. The host-side restart gets the same reset from
+    // sitlLocalResetVolatileControlState().
+    {
+        extern void sitlLocalResetOsdRuntimeState(void);
+        sitlLocalResetOsdRuntimeState();
+    }
+
     // Real FCs calibrate the gyro on every boot. With the virtual gyro this
     // completes immediately (gyroSetCalibrationCycles() leaves 0 cycles for
     // GYRO_VIRTUAL), so it cannot delay arming in the simulator.
@@ -925,6 +1070,22 @@ static DWORD WINAPI localMspThreadProc(LPVOID arg)
             sitlAuditLog("local setter: persisting config");
             writeEEPROM();
         }
+        // Blackbox housekeeping (delete the oldest logs beyond the cap, renumber
+        // the survivors) is a directory walk, so the flight thread only asks for
+        // it when it creates a log; it runs here.
+        {
+            extern int sitlBlackboxTakePendingPrune(void);
+            extern void sitlBlackboxRunPendingPrune(void);
+            if (sitlBlackboxTakePendingPrune()) {
+                sitlBlackboxRunPendingPrune();
+            }
+        }
+        // Burst recorder: the step only queues records, this thread formats and
+        // writes them (see localBurstLog()).
+        {
+            extern void sitlBurstDrain(void);
+            sitlBurstDrain();
+        }
         // 1 ms poll: keeps the configurator responsive when the host is not
         // stepping (no scheduler TASK_SERIAL) without adding meaningful CPU.
         Sleep(1);
@@ -1017,6 +1178,10 @@ int sitl_local_init(void)
     if (gLocalRunning) {
         return 0;
     }
+    // Locate any crash inside the firmware: log the faulting address and its RVA
+    // so `addr2line -f -C -e betaflight_SITL.dll <rva>` names the source line.
+    extern void sitlInstallCrashLogger(void);
+    sitlInstallCrashLogger();
     gLocalBootCount++;
 
     // A host may choose the virtual EEPROM before boot (one config per aircraft).
@@ -1380,6 +1545,167 @@ int sitl_local_set_arm_switch(uint8_t auxChannel, uint8_t startStep,
     return 0;
 }
 
+// --- generic mode ranges (any box, by permanent ID) -------------------------
+//
+// The permanent IDs are the ones msp_box.c puts on the wire, so a host can use
+// the same numbers it sees in MSP_BOXIDS / the Configurator (0 = ARM,
+// 1 = ANGLE, 2 = HORIZON, 28 = AIR MODE, 29 = 3D DISABLE, ...).
+static const box_t *sitlLocalBoxFromPermanentId(int permanentId)
+{
+    if (permanentId < 0 || permanentId > 255) {
+        return NULL;
+    }
+    const box_t *box = findBoxByPermanentId((uint8_t)permanentId);
+    return (box && box->boxId < CHECKBOX_ITEM_COUNT) ? box : NULL;
+}
+
+void sitl_local_get_mode_range(int permanentId, uint8_t *auxChannel,
+                               uint8_t *startStep, uint8_t *endStep)
+{
+    if (auxChannel) *auxChannel = 0xFF;
+    if (startStep)  *startStep  = 0;
+    if (endStep)    *endStep    = 0;
+
+    const box_t *box = sitlLocalBoxFromPermanentId(permanentId);
+    if (!gLocalRunning || !box) {
+        return;
+    }
+
+    modeActivationCondition_t emptyMac;
+    memset(&emptyMac, 0, sizeof(emptyMac));
+    for (int i = 0; i < MAX_MODE_ACTIVATION_CONDITION_COUNT; i++) {
+        const modeActivationCondition_t *mac = modeActivationConditions(i);
+        if (isModeActivationConditionConfigured(mac, &emptyMac)
+            && mac->modeId == box->boxId) {
+            if (auxChannel) *auxChannel = mac->auxChannelIndex;
+            if (startStep)  *startStep  = mac->range.startStep;
+            if (endStep)    *endStep    = mac->range.endStep;
+            return;
+        }
+    }
+}
+
+int sitl_local_set_mode_range(int permanentId, uint8_t auxChannel,
+                              uint8_t startStep, uint8_t endStep)
+{
+    const box_t *box = sitlLocalBoxFromPermanentId(permanentId);
+    if (!gLocalRunning || !box) {
+        return -1;
+    }
+    if (auxChannel != 0xFF && auxChannel >= SITL_LOCAL_MAX_RC_CHANNELS) {
+        return -1;
+    }
+    if (startStep > MAX_MODE_RANGE_STEP || endStep > MAX_MODE_RANGE_STEP
+        || startStep > endStep) {
+        return -1;
+    }
+
+    removeModeActivationCondition(box->boxId);
+
+    if (auxChannel != 0xFF) {
+        modeActivationCondition_t emptyMac;
+        memset(&emptyMac, 0, sizeof(emptyMac));
+
+        int slot = -1;
+        for (int i = 0; i < MAX_MODE_ACTIVATION_CONDITION_COUNT; i++) {
+            if (!isModeActivationConditionConfigured(modeActivationConditions(i), &emptyMac)) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot < 0) {
+            return -1;
+        }
+
+        modeActivationCondition_t *mac = modeActivationConditionsMutable(slot);
+        memset(mac, 0, sizeof(*mac));
+        mac->modeId = box->boxId;
+        mac->auxChannelIndex = auxChannel;
+        mac->range.startStep = startStep;
+        mac->range.endStep = endStep;
+        mac->modeLogic = MODELOGIC_OR;
+    }
+
+    // Same refresh as MSP_SET_MODE_RANGE, then persist on the background thread.
+    rcControlsInit();
+    sitlLocalRequestEepromWrite();
+    return 0;
+}
+
+int sitl_local_get_mode_active(int permanentId)
+{
+    const box_t *box = sitlLocalBoxFromPermanentId(permanentId);
+    return (gLocalRunning && box) ? (IS_RC_MODE_ACTIVE(box->boxId) ? 1 : 0) : 0;
+}
+
+int sitl_local_get_3d_enabled(void)
+{
+    return (gLocalRunning && featureIsEnabled(FEATURE_3D)) ? 1 : 0;
+}
+
+// Crash flip latch. Betaflight latches crashFlipModeActive inside tryArm(),
+// but only under "if (isMotorProtocolDshot())", and the LOCAL link has to run
+// the virtual PWM backend - so the firmware latch never happens here. The
+// mixer, the OSD warnings and the host read isCrashFlipModeActive(), which
+// would then always be false and the craft would not flip at all.
+//
+// Reproduce the same semantics locally: capture the box at the arm edge, clear
+// on disarm, and clear when the box is switched off while armed (stock's
+// auto-rearm branch). wincompat.c's sitlIsCrashFlipModeActive() ORs this latch
+// into the firmware function for mixer.c / the OSD.
+static bool gLocalCrashFlipLatched = false;
+static bool gLocalWasArmed = false;
+
+bool sitlLocalCrashFlipActive(void)
+{
+    return gLocalRunning && gLocalCrashFlipLatched;
+}
+
+static void localUpdateCrashFlipLatch(void)
+{
+    const bool armed = ARMING_FLAG(ARMED) != 0;
+    const bool box = IS_RC_MODE_ACTIVE(BOXCRASHFLIP) != 0;
+
+    if (!armed) {
+        gLocalCrashFlipLatched = false;
+    } else if (!gLocalWasArmed) {
+        gLocalCrashFlipLatched = box;   // the value tryArm() would have captured
+        if (gLocalCrashFlipLatched) {
+            sitlAuditLog("crash flip: latched at arming");
+        }
+    } else if (gLocalCrashFlipLatched && !box) {
+        gLocalCrashFlipLatched = false;
+        sitlAuditLog("crash flip: switch off, latch cleared");
+    }
+    gLocalWasArmed = armed;
+}
+
+int sitl_local_is_crash_flip_active(void)
+{
+    return (sitlLocalCrashFlipActive() || (gLocalRunning && isCrashFlipModeActive())) ? 1 : 0;
+}
+
+int sitl_local_set_3d_enabled(int enabled)
+{
+    if (!gLocalRunning || ARMING_FLAG(ARMED)) {
+        return -1;
+    }
+
+    if (enabled) {
+        featureEnableImmediate(FEATURE_3D);
+    } else {
+        featureDisableImmediate(FEATURE_3D);
+    }
+
+    // FEATURE_3D decides whether BOX3D is an active mode box, and the mixer
+    // profile derives the 3D throttle ranges from it.
+    initActiveBoxIds();
+    mixerInit(getMixerMode());
+    mixerInitProfile();
+    sitlLocalRequestEepromWrite();
+    return 0;
+}
+
 // Number of servo outputs the current mixer writes, mirroring writeServos()
 // in servos.c (without the channel-forwarding extras). 0 for multicopters.
 static uint8_t sitlLocalServoCount(void)
@@ -1727,6 +2053,11 @@ void sitl_local_step(const sitl_local_input_t *in, uint32_t dtUs,
         scheduler();
     }
 
+    // Arm/box state for this step is final now: update the LOCAL crash-flip
+    // latch (see localUpdateCrashFlipLatch). One step of latency: the mixer ran
+    // with the previous latch, which is 1 ms at 1 kHz.
+    localUpdateCrashFlipLatch();
+
     // --- motor outputs captured by udpSend() in LOCAL mode ---
     if (out) {
         servo_packet_raw raw;
@@ -1843,6 +2174,11 @@ void sitl_local_shutdown(void)
     // bind 5761/6761 again.
     extern void serialTcpStop(void);
     extern void wsProxyStop(void);
+    extern void serialTcpDropClients(void);
+    // Close the configurator's connections before the listeners go away: a link
+    // that survives a shutdown/init is open but dead, and the configurator's
+    // reboot-reconnect flow only starts on a real disconnect.
+    serialTcpDropClients();
     serialTcpStop();
     wsProxyStop();
 }

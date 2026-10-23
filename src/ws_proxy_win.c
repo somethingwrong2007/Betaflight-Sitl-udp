@@ -46,6 +46,92 @@ static bool wsStarted = false;
 // Set by wsProxyStop() so the accept loop leaves and a later init can bind 6761.
 static volatile bool wsStopping = false;
 
+// Live client sessions: the WebSocket socket and the MSP socket it is bridged
+// to. Tracked so a stop (or a firmware reboot, which calls one) can close them:
+// a session that outlives the flight controller is a link the configurator can
+// neither use nor detect as dead - it sees no close event, so its
+// reboot-reconnect flow never runs and the user has to connect by hand.
+#define WS_CLIENT_SLOTS 8
+// A client that stops mid-handshake or mid-frame must not hold its thread (and a
+// slot) forever; a local link crosses the whole handshake in microseconds.
+#define WS_CLIENT_RCV_TIMEOUT_MS 5000
+
+typedef struct {
+    SOCKET ws;
+    SOCKET tcp;
+} wsSession_t;
+
+static wsSession_t wsSessions[WS_CLIENT_SLOTS];
+static CRITICAL_SECTION wsSessionsLock;
+static volatile LONG wsSessionsLockReady = 0;
+
+static void wsSessionsEnsureLock(void)
+{
+    if (InterlockedCompareExchange(&wsSessionsLockReady, 1, 0) == 0) {
+        InitializeCriticalSection(&wsSessionsLock);
+    }
+}
+
+static void wsSessionAdd(SOCKET ws)
+{
+    wsSessionsEnsureLock();
+    EnterCriticalSection(&wsSessionsLock);
+    for (int i = 0; i < WS_CLIENT_SLOTS; i++) {
+        if (wsSessions[i].ws == INVALID_SOCKET) {
+            wsSessions[i].ws = ws;
+            wsSessions[i].tcp = INVALID_SOCKET;
+            break;
+        }
+    }
+    LeaveCriticalSection(&wsSessionsLock);
+}
+
+static void wsSessionSetUpstream(SOCKET ws, SOCKET tcp)
+{
+    wsSessionsEnsureLock();
+    EnterCriticalSection(&wsSessionsLock);
+    for (int i = 0; i < WS_CLIENT_SLOTS; i++) {
+        if (wsSessions[i].ws == ws) {
+            wsSessions[i].tcp = tcp;
+            break;
+        }
+    }
+    LeaveCriticalSection(&wsSessionsLock);
+}
+
+static void wsSessionRemove(SOCKET ws)
+{
+    wsSessionsEnsureLock();
+    EnterCriticalSection(&wsSessionsLock);
+    for (int i = 0; i < WS_CLIENT_SLOTS; i++) {
+        if (wsSessions[i].ws == ws) {
+            wsSessions[i].ws = INVALID_SOCKET;
+            wsSessions[i].tcp = INVALID_SOCKET;
+            break;
+        }
+    }
+    LeaveCriticalSection(&wsSessionsLock);
+}
+
+// Close every live session (client socket and its MSP bridge). Their threads
+// see recv() fail and finish their own cleanup.
+void wsProxyDropClients(void)
+{
+    wsSessionsEnsureLock();
+    EnterCriticalSection(&wsSessionsLock);
+    for (int i = 0; i < WS_CLIENT_SLOTS; i++) {
+        if (wsSessions[i].ws != INVALID_SOCKET) {
+            closesocket(wsSessions[i].ws);
+            wsSessions[i].ws = INVALID_SOCKET;
+        }
+        if (wsSessions[i].tcp != INVALID_SOCKET) {
+            closesocket(wsSessions[i].tcp);
+            wsSessions[i].tcp = INVALID_SOCKET;
+        }
+    }
+    LeaveCriticalSection(&wsSessionsLock);
+}
+
 static void sendAll(SOCKET sock, const uint8_t *data, size_t len)
 {
     while (len > 0) {
@@ -296,8 +382,20 @@ static void *wsClientThread(void *arg)
 {
     const SOCKET ws = (SOCKET)(intptr_t)arg;
 
+    wsSessionAdd(ws);
+
+    // Bound every blocking recv() on this socket: a client that opens the
+    // connection (or stalls mid-frame) and then goes quiet would otherwise hold
+    // this thread - and its slot - forever. select() still gates the streaming
+    // loop, so the timeout only bites when the client really did stop talking.
+    {
+        DWORD rcvTimeout = WS_CLIENT_RCV_TIMEOUT_MS;
+        setsockopt(ws, SOL_SOCKET, SO_RCVTIMEO, (const char *)&rcvTimeout, sizeof(rcvTimeout));
+    }
+
     if (!wsHandshake(ws)) {
         fprintf(stderr, "[wsproxy] handshake failed\n");
+        wsSessionRemove(ws);
         closesocket(ws);
         return NULL;
     }
@@ -305,7 +403,7 @@ static void *wsClientThread(void *arg)
     sitlAuditLog("configurator connected via WebSocket");
 
     SOCKET tcp = INVALID_SOCKET;
-    for (int attempt = 0; attempt < 50; attempt++) {
+    for (int attempt = 0; attempt < 50 && !wsStopping; attempt++) {
         tcp = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (tcp != INVALID_SOCKET) {
             socketNoInherit(tcp);
@@ -329,9 +427,11 @@ static void *wsClientThread(void *arg)
     if (tcp == INVALID_SOCKET) {
         fprintf(stderr, "[wsproxy] could not reach MSP port %u\n",
                 (unsigned)(sitlTcpBasePort() + 1));
+        wsSessionRemove(ws);
         closesocket(ws);
         return NULL;
     }
+    wsSessionSetUpstream(ws, tcp);
     fprintf(stderr, "[wsproxy] MSP link established\n");
 
     uint8_t tcpBuf[4096];
@@ -373,6 +473,7 @@ static void *wsClientThread(void *arg)
 
     fprintf(stderr, "[wsproxy] client disconnected\n");
     sitlAuditLog("configurator disconnected");
+    wsSessionRemove(ws);
     closesocket(tcp);
     closesocket(ws);
     return NULL;
@@ -445,7 +546,10 @@ void wsProxyStart(void)
             (unsigned)wsListenPort());
 }
 
-// Stop the listener so a later sitl_local_init() can bind 6761 again.
+// Stop the listener so a later sitl_local_init() can bind 6761 again, and close
+// the live sessions: the flight controller behind them is going away, and a
+// WebSocket that stays open while its MSP bridge is dead is exactly the state
+// the configurator cannot recover from on its own.
 void wsProxyStop(void)
 {
     wsStopping = true;
@@ -453,6 +557,7 @@ void wsProxyStop(void)
         closesocket(wsListenSocket);
         wsListenSocket = INVALID_SOCKET;
     }
+    wsProxyDropClients();
     wsStarted = false;
     Sleep(100);
 }

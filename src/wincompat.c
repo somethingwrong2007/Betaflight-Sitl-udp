@@ -53,6 +53,12 @@
 #include "fc/runtime_config.h"
 #include "fc/core.h"
 #include "fc/rc.h"
+#include "fc/rc_modes.h"
+#include "rx/rx.h"
+#include "io/beeper.h"
+#include "blackbox/blackbox.h"
+#include "rx/crsf.h"
+#include "osd/osd.h"
 #include "fc/rc_controls.h"
 #include "cli/cli.h"
 #include "sim_telemetry.h"
@@ -91,27 +97,51 @@ uint64_t sitlWallUs(void)
 // connection problems in the in-process LOCAL build are traceable without
 // capturing the host process stderr. BF_SITL_AUDIT_LOG redirects the file, so a
 // test tool can keep its own trail instead of appending to the host's.
+//
+// The log is opened once and kept open (line-buffered, so every line still
+// reaches the file immediately). It used to fopen/fprintf/fclose per line, and
+// this runs on the flight thread for the state/flight-recorder lines: three file
+// system calls per line, every 250 ms, is exactly the kind of spike that shows
+// up in stepUs(max). A critical section keeps the several threads that log
+// (flight, MSP, host) from interleaving a line.
 void sitlAuditLog(const char *fmt, ...)
 {
-    char path[MAX_PATH];
-    if (GetEnvironmentVariableA("BF_SITL_AUDIT_LOG", path, sizeof(path)) <= 0) {
-        if (GetEnvironmentVariableA("LOCALAPPDATA", path, sizeof(path)) <= 0) {
-            return;
-        }
-        strncat(path, "\\Betaflight-SITL\\sitl-audit.log", sizeof(path) - strlen(path) - 1);
+    static FILE *log = NULL;
+    // A spin lock, not a CRITICAL_SECTION: this runs on the flight, MSP and host
+    // threads, and a lazily-initialised critical section races (a second thread
+    // can EnterCriticalSection() while the first is still inside
+    // InitializeCriticalSection(), which is undefined behaviour and took the
+    // process down). A CAS spin lock needs no initialisation at all; the log is
+    // written a few times a second, so the spin is never hot.
+    static volatile LONG lock = 0;
+    while (InterlockedExchange(&lock, 1) != 0) {
+        Sleep(0);
     }
 
-    FILE *log = fopen(path, "a");
     if (log == NULL) {
+        char path[MAX_PATH];
+        if (GetEnvironmentVariableA("BF_SITL_AUDIT_LOG", path, sizeof(path)) > 0
+            || (GetEnvironmentVariableA("LOCALAPPDATA", path, sizeof(path)) > 0
+                && strncat(path, "\\Betaflight-SITL\\sitl-audit.log",
+                           sizeof(path) - strlen(path) - 1) != NULL)) {
+            log = fopen(path, "a");
+            if (log != NULL) {
+                setvbuf(log, NULL, _IOLBF, 0);
+            }
+        }
+    }
+    if (log == NULL) {
+        InterlockedExchange(&lock, 0);
         return;
     }
+
     fprintf(log, "[%llu] ", (unsigned long long)(micros64_real() / 1000));
     va_list ap;
     va_start(ap, fmt);
     vfprintf(log, fmt, ap);
     va_end(ap);
     fprintf(log, "\n");
-    fclose(log);
+    InterlockedExchange(&lock, 0);
 }
 
 // The firmware only syncs the debugMode global from systemConfig()->debug_mode
@@ -163,6 +193,16 @@ void sitlLocalRequestReboot(void)
     // it holds the FC in a config state), so that one is deliberately kept.
     cliMode = false;
     unsetArmingDisabled(ARMING_DISABLED_CLI | ARMING_DISABLED_REBOOT_REQUIRED);
+
+    // Drop the configurator's connections, like real hardware does when the MCU
+    // resets. A link that stays open across the reboot is silent from then on
+    // (nothing services MSP while the reboot is applied), and the peer never
+    // learns the session is gone - which is exactly the state that leaves a
+    // ground station unable to reconnect on its own.
+    {
+        extern void serialTcpDropClients(void);
+        serialTcpDropClients();
+    }
 
     sitlLocalRequestRebootApply();
 #endif
@@ -307,7 +347,8 @@ void sitlLocalLogStateIfChanged(const char *tag)
     sitlLocalMspLoad(&mspBusyUs, &mspCalls);
 
     sitlAuditLog("%s rt protocol=%u dshot(cfg/edt/bb)=%u/%u/%u idle=%u thr=%u/%u poles=%u "
-                 "battSrc=%u/%u rcOurs=%u mixer(cfg/rt/count)=%u/%u/%u denom=%u looptime=%u pidDt=%u "
+                 "battSrc=%u/%u batt(cells=%u v=%.2f a=%.2f mah=%u) rcOurs=%u "
+                 "mixer(cfg/rt/count)=%u/%u/%u denom=%u looptime=%u pidDt=%u "
                  "stepUs(max/avg/count)=%u/%u/%u motorPkts(cap/take/miss)=%u/%u/%u "
                  "motors=%.0f/%.0f/%.0f/%.0f zeroWhileArmed=%u "
                  "mspThread(busyUs/calls)=%u/%u "
@@ -321,7 +362,10 @@ void sitlLocalLogStateIfChanged(const char *tag)
                  (unsigned)now.protocol, (unsigned)now.dshotCfg,
                  (unsigned)now.dshotEdt, (unsigned)now.bitbang, (unsigned)now.motorIdle,
                  (unsigned)now.maxthrottle, (unsigned)now.mincommand, (unsigned)now.poles,
-                 (unsigned)now.voltSrc, (unsigned)now.currSrc, (unsigned)now.rcOurs,
+                 (unsigned)now.voltSrc, (unsigned)now.currSrc,
+                 (unsigned)getBatteryCellCount(), (double)getBatteryVoltage() * 0.01,
+                 (double)getAmperage() * 0.01, (unsigned)getMAhDrawn(),
+                 (unsigned)now.rcOurs,
                  (unsigned)now.mixerCfg, (unsigned)now.mixerRt, (unsigned)now.motorCount,
                  (unsigned)now.denom, (unsigned)now.targetLooptime, (unsigned)now.pidDtMicro,
                  (unsigned)stepMaxUs, (unsigned)stepAvgUs, (unsigned)stepCount,
@@ -351,6 +395,105 @@ void sitlLocalLogStateIfChanged(const char *tag)
                  (unsigned)currentPidProfile->anti_gravity_gain);
 #else
     UNUSED(tag);
+#endif
+}
+
+// OSD runtime state a reboot has to reset. Split out of
+// sitlLocalResetVolatileControlState() because the in-process reboot handler
+// (localRunPendingReboot(): the configurator's Save and Reboot, CLI
+// save/exit/defaults, CMS, Enter bootloader/DFU) needs exactly this part too -
+// a real FC redraws its boot splash after *every* reboot, and the HUD would
+// otherwise keep the previous session's frame.
+//
+// Nothing here is read by the control loop (osd.c's state machine, the
+// statistics the OSD/MSP report, and the consumed-charge counter), so unlike
+// the control leftovers below it is safe to run between scheduler passes on a
+// live loop.
+void sitlLocalResetOsdRuntimeState(void)
+{
+#ifdef SITL_LOCAL
+    // osd.c keeps these pieces of per-session state that no boot path rebuilds:
+    //   * osdState (its private osdState_e, OSD_STATE_INIT == 0) - the frame
+    //     state machine. The splash (BF logo + version + the menu hint) is only
+    //     drawn from OSD_STATE_INIT, so a restart has to put it back there for
+    //     the host to see a "just powered up" HUD again.
+    //   * the flight statistics (fc/stats.c's statistic_t, exposed through
+    //     osdGetStats()) - max current/speed/altitude/G, min voltage/RSSI/...,
+    //     armed time. They are reset by osdResetStats() on every *arm*, so a
+    //     restart would otherwise show the previous session's numbers on the
+    //     post-flight stats page until the next arm.
+    //   * three globals osd.h exports: resumeRefreshAt (the splash/post-flight
+    //     stats suppression window), osdFlyTime and osdLaunchTime. A restart
+    //     inheriting a resumeRefreshAt still in the future would hold the
+    //     screen frozen for up to the 60 s stats window, and the fly-time
+    //     element would carry the previous session's total.
+    // The field list below is a verbatim copy of osd.c's osdResetStats(); the
+    // function is file-static there and this build deliberately does not modify
+    // the pinned submodule. Keep the two in sync if upstream adds a field.
+    // (One static is deliberately left alone: osd.c's osdStatsEnabled /
+    // osdStatsVisible are file-static show/hide flags for the stats page. They
+    // cannot be reached from here without editing the submodule; the worst case
+    // is that the stats page - with the fresh numbers written below - is shown
+    // for its 60 s window after the reboot instead of the plain disarmed HUD,
+    // and the next arm/disarm edge clears it.)
+    extern uint32_t osdState;          // osd.c: osdState_e osdState = OSD_STATE_INIT
+    extern statistic_t *osdGetStats(void);
+
+    osdState = 0;                      // OSD_STATE_INIT
+    resumeRefreshAt = 0;
+    osdFlyTime = 0;
+    osdLaunchTime = 0;
+    // Consumed charge (the OSD/configurator mAh element): a fresh process
+    // starts at 0, an in-process restart would carry the previous flight's
+    // total. Kept here rather than in the statistics because it is integrated
+    // by the virtual current meter, not by osd.c.
+    {
+        const float beforeMahDrawn = simTelemetryMahDrawn();
+        simTelemetryResetMahDrawn();
+        sitlAuditLog("osd: mAh counter reset: %.1f -> 0.0", (double)beforeMahDrawn);
+    }
+
+    statistic_t *s = osdGetStats();
+    if (s != NULL) {
+        // Snapshot the previous session's numbers first. Clearing them is the
+        // point of this function, so the log line below is only evidence if its
+        // left-hand side is non-zero - the harness arms and flies before it
+        // reboots, so it is.
+        const int16_t  beforeMaxCurrent  = s->max_current;
+        const int16_t  beforeMaxSpeed    = s->max_speed;
+        const int32_t  beforeMaxAltitude = s->max_altitude;
+        const int16_t  beforeMinVoltage  = s->min_voltage;
+        const uint32_t beforeArmedTimeMs = (uint32_t)(s->armed_time / 1000);
+        const float    beforeMaxGForce   = s->max_g_force;
+
+        s->max_current     = 0;
+        s->max_speed       = 0;
+        s->min_voltage     = 5000;
+        s->end_voltage     = 0;
+        s->min_rssi        = 99;       // percent
+        s->max_altitude    = 0;
+        s->max_distance    = 0;
+        s->armed_time      = 0;
+        s->max_g_force     = 0;
+        s->max_esc_temp_ix = 0;
+        s->max_esc_temp    = 0;
+        s->max_esc_rpm     = 0;
+        s->min_link_quality = (linkQualitySource == LQ_SOURCE_NONE) ? 99 : 100;
+        s->min_rssi_dbm    = CRSF_RSSI_MAX;
+        s->min_rsnr        = CRSF_SNR_MAX;
+
+        // "before -> after" is the whole verification that a reboot starts a
+        // fresh flight's statistics: the left-hand side is whatever the
+        // previous session accumulated.
+        sitlAuditLog("osd: stats reset: armedTime %u->0 ms maxCurrent %d->0 "
+                     "maxSpeed %d->0 maxAlt %d->0 minVoltage %d->5000 maxG %.2f->0.00",
+                     (unsigned)beforeArmedTimeMs, (int)beforeMaxCurrent,
+                     (int)beforeMaxSpeed, (int)beforeMaxAltitude,
+                     (int)beforeMinVoltage, (double)beforeMaxGForce);
+    }
+    // Logged after the statistics so this line is the last thing a reader sees
+    // for the block (and the one the "did it run at all" check greps).
+    sitlAuditLog("osd: runtime state reset for a fresh boot (splash + stats)");
 #endif
 }
 
@@ -394,6 +537,11 @@ void sitlLocalResetVolatileControlState(void)
     memset(gyro.sampleSum, 0, sizeof(gyro.sampleSum));
     gyro.sampleCount = 0;
     memset(gyro.imuGyroFilter, 0, sizeof(gyro.imuGyroFilter));
+
+    // OSD runtime state (splash + statistics + mAh): the same reset the
+    // in-process reboot handler runs, so a host-side restart and a "Save and
+    // Reboot" end up in the identical "just powered up" HUD.
+    sitlLocalResetOsdRuntimeState();
 
     sitlAuditLog("boot: volatile control state reset (PID/PID-runtime/attitude/gyro leftovers)");
 #endif
@@ -903,6 +1051,40 @@ static bool rcProcessingConfigChanged(void)
 #endif
 }
 
+// msp_box.c's initActiveBoxIds() only adds BOXCRASHFLIP ("FLIP OVER AFTER
+// CRASH") to the active box list when the configured motor protocol is DShot
+// (msp_box.c: `checkMotorProtocolEnabled(...); if (configuredMotorProtocolDshot)
+// BME(BOXCRASHFLIP);`). The LOCAL link has to run the virtual PWM backend, so
+// without this the mode logic exists and MSP_SET_MODE_RANGE accepts the box, but
+// the Configurator never lists it (it only shows the boxes MSP_BOXIDS returns).
+//
+// msp_box.c's symbol is renamed to sitlInitActiveBoxIdsReal() by CMakeLists.txt;
+// this wrapper reports DShot for the duration of that pure config function and
+// restores the real protocol before returning. Nothing else reads the value in
+// between, so motorDev, the RPM bridge and the output path stay on PWM.
+#ifdef SITL_LOCAL
+void initActiveBoxIds(void)
+{
+    extern void sitlInitActiveBoxIdsReal(void);
+
+    const uint8_t savedProtocol = motorConfig()->dev.motorProtocol;
+    motorConfigMutable()->dev.motorProtocol = MOTOR_PROTOCOL_DSHOT600;
+    sitlInitActiveBoxIdsReal();
+    motorConfigMutable()->dev.motorProtocol = savedProtocol;
+}
+
+// Callers of isCrashFlipModeActive() (mixer.c, the OSD files, ledstrip.c) are
+// renamed to this by CMakeLists.txt in the LOCAL build. The firmware's own latch
+// is only set when the configured protocol is DShot, which the PWM-only LOCAL
+// backend never is; sitl_local.c reproduces that latch with the stock semantics
+// (arm edge + box active, cleared on disarm / switch off).
+bool sitlIsCrashFlipModeActive(void)
+{
+    extern bool sitlLocalCrashFlipActive(void);
+    return isCrashFlipModeActive() || sitlLocalCrashFlipActive();
+}
+#endif
+
 void sitlLocalRunBootReapply(bool reinitGyroFilters)
 {
 #ifdef SITL_LOCAL
@@ -987,6 +1169,328 @@ void sitlLocalRunBootProfileInit(void)
     positionInit();
     autopilotInit();
 #endif
+}
+
+// Substitute for isBlackboxDeviceWorking(), used by osd.c only
+// (CMakeLists.txt renames the call in that file).
+//
+// The post-flight statistics page draws a "BLACKBOX" row through
+// osdGetBlackboxStatusString(), which computes
+//
+//     storageUsedPercent = (storageUsed * 100) / storageTotal;
+//
+// with storageTotal still 0 whenever neither USE_SDCARD nor USE_FLASHFS is
+// compiled - which is the case for SITL - so GCC constant-folds the division
+// into a ud2 trap. The row is drawn while the aircraft is disarmed, so every
+// arm/disarm killed the process with 0xC000001D inside osdUpdate(). The
+// file-based virtual blackbox has no storage statistics to report, so the honest
+// answer for the OSD is "no working storage device"; SERIAL keeps its real value
+// (that is the one case the firmware can answer without storage counters).
+bool sitlOsdIsBlackboxDeviceWorking(void)
+{
+    extern bool isBlackboxDeviceWorking(void);
+    extern blackboxConfig_t *blackboxConfigMutable(void);
+    if (blackboxConfigMutable()->device != BLACKBOX_DEVICE_SERIAL) {
+        return false;
+    }
+    return isBlackboxDeviceWorking();
+}
+
+// ---------------------------------------------------------------------------
+// Crash locator.
+//
+// A crash inside the firmware (executed ud2, null pointer, stack overflow) tells
+// the host nothing on its own. This installs a vectored exception handler that
+// logs the exception code and the faulting address together with its offset
+// inside the module that contains it - the RVA that
+//
+//     addr2line -f -C -e betaflight_SITL.dll <rva>
+//
+// turns into file:line (the LOCAL DLL is built with -g for exactly this). The
+// handler never swallows the exception: it logs and returns
+// EXCEPTION_CONTINUE_SEARCH, so the process still dies the way Windows and a
+// debugger expect.
+//
+// The handler deliberately does not call sitlAuditLog(): the crash may be inside
+// that function with its spin lock held by this very thread, so it uses its own
+// one-shot write (and stderr, which a console host shows).
+//
+// What it must NOT do is what it used to: a vectored handler runs for *every*
+// exception, first-chance ones included, and the interesting-looking ones are
+// frequently not crashes at all - 0x40010006 (OutputDebugString), 0x406D1388
+// (thread naming by a debugger), 0xE06D7363 (a C++ exception being thrown and
+// caught), 0x80000003 (a breakpoint). Logging those buried the log in noise.
+// Worse, the handler also did CRT file I/O (fopen/fprintf/fclose) with ~600
+// bytes of stack locals: when the real fault is a stack overflow - or any fault
+// with the stack nearly gone - its own prologue/`_chkstk` faults, that nested
+// exception re-enters the handler, and the recursive work keeps the process
+// from handing a clean exception to the host's own crash reporter.
+//
+// So: fatal codes only, no CRT, no heap, no locks, fixed static buffers, one
+// pre-opened handle (opened at install time, never closed), one WriteFile, and a
+// per-thread re-entrancy guard so a fault *inside* the handler is just ignored.
+// ---------------------------------------------------------------------------
+
+static HANDLE gCrashLogHandle = INVALID_HANDLE_VALUE;
+static HANDLE gCrashErrHandle = INVALID_HANDLE_VALUE;
+static DWORD gCrashTlsIndex = TLS_OUT_OF_INDEXES;
+// Static, not stack: the handler must not need the (possibly exhausted) stack.
+static char gCrashLine[256];
+static MEMORY_BASIC_INFORMATION gCrashMbi;
+
+// Exception codes that mean "the process is going down". Everything else -
+// debugger/debug-print pseudo-exceptions, thrown-and-caught language exceptions,
+// breakpoints, Ctrl+C - is deliberately ignored.
+static bool sitlCrashIsFatal(DWORD code)
+{
+    switch (code) {
+    case 0xC0000005:    // access violation
+    case 0xC000001D:    // illegal instruction (the executed-ud2 case)
+    case 0xC0000025:    // noncontinuable: DCALL
+    case 0xC0000026:    // noncontinuable: invalid dispatch
+    case 0xC000008C:    // array bounds exceeded
+    case 0xC000008D:    // float denormal operand
+    case 0xC000008E:    // float divide by zero
+    case 0xC000008F:    // float inexact result
+    case 0xC0000090:    // float invalid operation
+    case 0xC0000091:    // float overflow
+    case 0xC0000092:    // float stack check
+    case 0xC0000093:    // float underflow
+    case 0xC0000094:    // integer divide by zero
+    case 0xC0000095:    // integer overflow
+    case 0xC00000FD:    // stack overflow
+    case 0xC0000374:    // heap corruption detected
+    case 0xC0000409:    // fastfail / buffer overrun / __stack_chk_fail
+    case 0xC0000602:    // fail-fast exception
+        return true;
+    default:
+        return false;
+    }
+}
+
+static char *sitlCrashAppendStr(char *p, const char *s)
+{
+    while (*s != '\0' && p < &gCrashLine[sizeof(gCrashLine) - 2]) {
+        *p++ = *s++;
+    }
+    return p;
+}
+
+// Unsigned hex, exactly `digits` digits, no leading zeros beyond that.
+static char *sitlCrashAppendHex(char *p, unsigned long long value, int digits)
+{
+    for (int shift = (digits - 1) * 4; shift >= 0; shift -= 4) {
+        if (p >= &gCrashLine[sizeof(gCrashLine) - 2]) {
+            break;
+        }
+        const unsigned nibble = (unsigned)((value >> shift) & 0xF);
+        *p++ = (char)(nibble < 10 ? ('0' + nibble) : ('A' + (nibble - 10)));
+    }
+    return p;
+}
+
+// Unsigned hex with no leading zeros at all (for the RVA, which is small).
+static char *sitlCrashAppendHexVar(char *p, unsigned long long value)
+{
+    if (value == 0) {
+        if (p < &gCrashLine[sizeof(gCrashLine) - 2]) {
+            *p++ = '0';
+        }
+        return p;
+    }
+    int shift = 60;
+    while (shift > 0 && ((value >> shift) & 0xF) == 0) {
+        shift -= 4;
+    }
+    return sitlCrashAppendHex(p, value, (shift / 4) + 1);
+}
+
+static void sitlCrashWriteLine(const char *prefix, char *end)
+{
+    *end++ = '\r';
+    *end++ = '\n';
+    const DWORD len = (DWORD)(end - gCrashLine);
+    if (gCrashLogHandle != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        SetFilePointer(gCrashLogHandle, 0, NULL, FILE_END);
+        WriteFile(gCrashLogHandle, gCrashLine, len, &written, NULL);
+    }
+    if (gCrashErrHandle != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        WriteFile(gCrashErrHandle, prefix, (DWORD)strlen(prefix), &written, NULL);
+        WriteFile(gCrashErrHandle, gCrashLine, len, &written, NULL);
+    }
+}
+
+static LONG WINAPI sitlCrashLogger(EXCEPTION_POINTERS *info)
+{
+    if (info == NULL || info->ExceptionRecord == NULL) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    const DWORD code = info->ExceptionRecord->ExceptionCode;
+    if (!sitlCrashIsFatal(code)) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    // Per-thread re-entrancy guard (TlsAlloc, not a static: two threads can fault
+    // at the same time, and a fault inside this handler must not recurse).
+    if (gCrashTlsIndex != TLS_OUT_OF_INDEXES && TlsGetValue(gCrashTlsIndex) != NULL) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if (gCrashTlsIndex != TLS_OUT_OF_INDEXES) {
+        TlsSetValue(gCrashTlsIndex, (void *)1);
+    }
+
+    const void *addr = info->ExceptionRecord->ExceptionAddress;
+    unsigned long long base = 0;
+    // VirtualQuery, not GetModuleHandleEx: no loader lock, no allocation, results
+    // in a static buffer.
+    if (VirtualQuery(addr, &gCrashMbi, sizeof(gCrashMbi)) == sizeof(gCrashMbi)) {
+        base = (unsigned long long)(uintptr_t)gCrashMbi.AllocationBase;
+    }
+    const unsigned long long rva = base != 0 ? (unsigned long long)(uintptr_t)addr - base : 0;
+
+    char *p = gCrashLine;
+    p = sitlCrashAppendStr(p, "code=0x");
+    p = sitlCrashAppendHex(p, code, 8);
+    p = sitlCrashAppendStr(p, " addr=0x");
+    p = sitlCrashAppendHex(p, (unsigned long long)(uintptr_t)addr, 12);
+    p = sitlCrashAppendStr(p, " module=0x");
+    p = sitlCrashAppendHex(p, base, 12);
+    p = sitlCrashAppendStr(p, " rva=0x");
+    p = sitlCrashAppendHexVar(p, rva);
+    p = sitlCrashAppendStr(p, " (addr2line -f -C -e betaflight_SITL.dll 0x");
+    p = sitlCrashAppendHexVar(p, rva);
+    p = sitlCrashAppendStr(p, ")");
+    sitlCrashWriteLine("[SITL-CRASH] ", p);
+
+    if (gCrashTlsIndex != TLS_OUT_OF_INDEXES) {
+        TlsSetValue(gCrashTlsIndex, NULL);
+    }
+    // Never swallow it: the host's crash reporter / the debugger must still see it.
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void sitlInstallCrashLogger(void)
+{
+    static LONG installed = 0;
+    if (InterlockedCompareExchange(&installed, 1, 0) == 0) {
+        char path[MAX_PATH];
+        gCrashTlsIndex = TlsAlloc();
+        gCrashErrHandle = GetStdHandle(STD_ERROR_HANDLE);
+
+        // Opened once, kept open: a crash must not have to open a file. The audit
+        // log path is honoured so a test harness gets the report in its own file.
+        if (GetEnvironmentVariableA("BF_SITL_AUDIT_LOG", path, sizeof(path)) <= 0) {
+            if (GetEnvironmentVariableA("LOCALAPPDATA", path, sizeof(path)) > 0) {
+                strncat(path, "\\Betaflight-SITL\\sitl-crash.log",
+                        sizeof(path) - strlen(path) - 1);
+            } else {
+                path[0] = '\0';
+            }
+        }
+        if (path[0] != '\0') {
+            gCrashLogHandle = CreateFileA(path, FILE_APPEND_DATA,
+                                          FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                                          OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        }
+        AddVectoredExceptionHandler(1, sitlCrashLogger);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Arming path trace (LOCAL diagnostics).
+//
+// tryArm() is the only function that arms, and it calls updateArmingStatus()
+// itself, so "armFlags == 0 yet never armed" can only mean tryArm() was never
+// reached. Its only RC-path caller is processRcStickPositions(), and processRx()
+// skips that call entirely while the CMS menu is open. Both are renamed through
+// CMakeLists.txt (the pinned submodule is untouched); the trace logs only when
+// the inputs change, so a steady throttle/switch costs nothing.
+// ---------------------------------------------------------------------------
+void sitlProcessRcStickPositionsTraced(void)
+{
+    extern void sitlProcessRcStickPositionsReal(void);
+    extern bool cmsInMenu;
+
+    const uint32_t flags = (uint32_t)getArmingDisableFlags();
+    const int armBoxActive = IS_RC_MODE_ACTIVE(BOXARM) ? 1 : 0;
+    const int armBoxConfigured = isModeActivationConditionPresent(BOXARM) ? 1 : 0;
+    const int cms = cmsInMenu ? 1 : 0;
+    const int throttle = (int)rcData[3];      // AETR: 3 = throttle
+
+    static uint32_t lastFlags = 0xFFFFFFFFu;
+    static int lastActive = -1, lastConfigured = -1, lastCms = -1;
+    if (flags != lastFlags || armBoxActive != lastActive
+        || armBoxConfigured != lastConfigured || cms != lastCms) {
+        lastFlags = flags;
+        lastActive = armBoxActive;
+        lastConfigured = armBoxConfigured;
+        lastCms = cms;
+        sitlAuditLog("arm path: stick positions processed (armFlags=0x%08X throttle=%d "
+                     "armBox active/configured=%d/%d cmsInMenu=%d)",
+                     (unsigned)flags, throttle, armBoxActive, armBoxConfigured, cms);
+    }
+    sitlProcessRcStickPositionsReal();
+}
+
+void sitlTryArmTraced(void)
+{
+    extern void sitlTryArmReal(void);
+    static uint32_t calls = 0;
+    extern timeUs_t sitlLastDshotBeaconCommandTimeUs(void);
+    sitlTryArmReal();
+    const uint32_t n = ++calls;
+    if (n <= 3 || (n % 500) == 0) {
+        const timeDelta_t beaconAge = cmpTimeUs(micros(), getLastDshotBeaconCommandTimeUs());
+        sitlAuditLog("arm path: tryArm() #%u -> armed=%u (armFlags=0x%08X, beaconAge=%d us, "
+                     "guard %s)",
+                     (unsigned)n, (unsigned)(ARMING_FLAG(ARMED) ? 1 : 0),
+                     (unsigned)getArmingDisableFlags(), (int)beaconAge,
+                     (beaconAge >= 0 && beaconAge < 1200000) ? "ACTIVE" : "clear");
+    }
+}
+
+// Substitute for core.c's DShot beacon guard
+// (DSHOT_BEACON_GUARD_DELAY_US = 1.2 s, checked before every arming attempt).
+// A real FC plays beacon tones through the ESCs, so it refuses to arm for 1.2 s
+// after the last beacon command; SITL's motors are the virtual PWM backend and
+// never play one. Left to the real beeper state, a leftover/ongoing beep can
+// delay - or, while the beeper keeps refreshing the timestamp, block arming
+// indefinitely, with no arming-disable flag set to explain it.
+timeUs_t sitlLastDshotBeaconCommandTimeUs(void)
+{
+    // A DShot beacon can never have been played here (the motors are the virtual
+    // PWM backend), so report a timestamp old enough that core.c's guard is always
+    // clear. The firmware's own value is unusable in LOCAL mode: beeper.c clamps
+    // it to "now - 60 s", and the subtraction is done in uint32, so with a virtual
+    // clock younger than 60 s (always, in a stepped sim) the clamp wraps and the
+    // guard computes a ~1 s age - i.e. it stays ACTIVE for ever and blocks
+    // arming with no arming-disable flag set to explain it.
+    extern uint64_t micros64(void);
+    return (timeUs_t)(micros64() - 2000000);   // "2 s ago" in the same uint32 domain
+}
+
+// The RC switch-off disarm (rc_controls.c) only fires while the firmware
+// considers the RX link valid, which is why a probe that never sees a validated
+// link stays armed. Trace it so "the switch does not disarm" is visible.
+void sitlDisarmTraced(flightLogDisarmReason_e reason)
+{
+    sitlAuditLog("arm path: disarm() from the ARM switch, reason=%d", (int)reason);
+    disarm(reason);
+}
+
+// The flight thread's writeEEPROM() calls (fc/stats.c on disarm, cli.c and
+// gyro_init.c from their own paths - see CMakeLists.txt) land here instead of
+// doing a synchronous 32 KB file write inside a step. The real write is picked
+// up by the MSP thread within its next 1 ms poll, exactly like a configurator
+// save; the only visible difference is that the EEPROM lags the RAM config by a
+// millisecond or two.
+void sitlWriteEEPROMDeferred(void)
+{
+    extern void sitlLocalRequestEepromWrite(void);
+    sitlAuditLog("deferred writeEEPROM (flight thread) queued");
+    sitlLocalRequestEepromWrite();
 }
 
 // msp.c's writeEEPROM() calls are renamed to this in LOCAL mode so a save
@@ -1357,9 +1861,30 @@ static int sitlBlackboxCollect(const char *dir, sitlBlackboxLog_t *logs, int max
 // was freed by the previous step - it can never collide with a file that is
 // still to move. The log being written at this moment is untouched (it is
 // created with its final name by sitlBlackboxFopen()).
-static int sitlBlackboxEnforce(const char *dir, int keep)
+// The directory scan's working buffer (SITL_BLACKBOX_MAX_TRACKED * ~264 B, i.e.
+// ~270 KB). It must not live on the caller's stack: both callers sit deep in
+// somebody else's stack (the boot/seed path runs under the host's step call, the
+// prune runs on the MSP thread), and 270 KB twice over overflows a 1 MB stack and
+// takes the whole process down. One shared buffer plus a lock instead.
+static sitlBlackboxLog_t gBlackboxScanBuf[SITL_BLACKBOX_MAX_TRACKED];
+static volatile LONG gBlackboxScanLock = 0;
+
+static void sitlBlackboxScanLockAcquire(void)
 {
-    sitlBlackboxLog_t logs[SITL_BLACKBOX_MAX_TRACKED];
+    while (InterlockedExchange(&gBlackboxScanLock, 1) != 0) {
+        Sleep(0);
+    }
+}
+
+static void sitlBlackboxScanLockRelease(void)
+{
+    InterlockedExchange(&gBlackboxScanLock, 0);
+}
+
+static int sitlBlackboxEnforce(const char *dir, int keep, const char *openLogName)
+{
+    sitlBlackboxScanLockAcquire();
+    sitlBlackboxLog_t *logs = gBlackboxScanBuf;
     const int count = sitlBlackboxCollect(dir, logs, SITL_BLACKBOX_MAX_TRACKED);
     int first = 0;
 
@@ -1367,6 +1892,9 @@ static int sitlBlackboxEnforce(const char *dir, int keep)
         first = count - keep;
         for (int i = 0; i < first; i++) {
             char path[MAX_PATH];
+            if (openLogName != NULL && strcmp(logs[i].name, openLogName) == 0) {
+                continue;   // never delete the log being written
+            }
             _snprintf(path, sizeof(path), "%s\\%s", dir, logs[i].name);
             if (remove(path) == 0) {
                 sitlAuditLog("blackbox: pruned %s (keeping the newest %d logs in %s)",
@@ -1376,6 +1904,10 @@ static int sitlBlackboxEnforce(const char *dir, int keep)
     }
 
     for (int i = first; i < count; i++) {
+        if (openLogName != NULL && strcmp(logs[i].name, openLogName) == 0) {
+            continue;   // an open file cannot be renamed on Windows, and it is
+                        // the newest log, so leaving its number alone is fine
+        }
         const int target = i - first + 1;
         if (logs[i].number == target) {
             continue;
@@ -1389,7 +1921,66 @@ static int sitlBlackboxEnforce(const char *dir, int keep)
                          logs[i].name, target);
         }
     }
+    sitlBlackboxScanLockRelease();
     return count - first;
+}
+
+// The number of the next log this layer creates. Seeded from the biggest number
+// in the folder (the boot path and the prune below may both walk the directory)
+// and then incremented per log - that is what lets the flight thread name a new
+// log without scanning anything.
+static volatile LONG gBlackboxNextNumberValue = 0;
+// Path of the log currently being written, so the prune never deletes or
+// renames it (an open file cannot be renamed on Windows).
+static char gBlackboxOpenLogName[MAX_PATH];
+// Raised by the flight thread when it creates a log, cleared and executed by the
+// MSP thread.
+static volatile LONG gBlackboxPruneRequest = 0;
+
+static const char *sitlBlackboxDir(char *buf, size_t size);
+
+void sitlBlackboxSeedFromDisk(void)
+{
+    char dir[MAX_PATH];
+    int highest = 0;
+    if (sitlBlackboxDir(dir, sizeof(dir)) != NULL) {
+        sitlBlackboxScanLockAcquire();
+        const sitlBlackboxLog_t *logs = gBlackboxScanBuf;
+        const int count = sitlBlackboxCollect(dir, logs, SITL_BLACKBOX_MAX_TRACKED);
+        for (int i = 0; i < count; i++) {
+            if (logs[i].number > highest) {
+                highest = logs[i].number;
+            }
+        }
+        sitlBlackboxScanLockRelease();
+    }
+    InterlockedExchange(&gBlackboxNextNumberValue, highest);
+}
+
+static int sitlBlackboxNextNumber(void)
+{
+    if (gBlackboxNextNumberValue <= 0) {
+        sitlBlackboxSeedFromDisk();
+    }
+    return (int)InterlockedIncrement(&gBlackboxNextNumberValue);
+}
+
+// Called by the MSP thread: the directory walk the flight thread refuses to do.
+void sitlBlackboxRunPendingPrune(void)
+{
+    char dir[MAX_PATH];
+    if (sitlBlackboxDir(dir, sizeof(dir)) == NULL) {
+        return;
+    }
+    const int keep = (gBlackboxMaxLogs > 0) ? gBlackboxMaxLogs : -1;
+    const int remaining = sitlBlackboxEnforce(dir, keep,
+                                              gBlackboxOpenLogName[0] ? gBlackboxOpenLogName : NULL);
+    sitlAuditLog("blackbox: housekeeping done (%d logs kept, cap %d)", remaining, keep);
+}
+
+int sitlBlackboxTakePendingPrune(void)
+{
+    return InterlockedExchange(&gBlackboxPruneRequest, 0) != 0;
 }
 
 static void sitlBlackboxReadMaxLogsSetting(void)
@@ -1445,18 +2036,35 @@ FILE *sitlBlackboxFopen(const char *filename, const char *mode)
         const bool newLog = sitlIsBlackboxLogName(filename)
             && (mode[0] == 'w') && (mode[1] == '\0' || mode[1] == 'b');
         if (newLog) {
-            // Make room, compact the existing logs to LOG00001.. and give this
-            // one the next number: the folder stays a rolling window and the
-            // newest log is always the highest number (the firmware's own
-            // counter is not used for the name).
-            // Keep room for this log: cap 1 means "delete every existing log".
-            const int keep = (gBlackboxMaxLogs > 0) ? gBlackboxMaxLogs - 1 : -1;
-            const int existing = sitlBlackboxEnforce(dir, keep);
-            _snprintf(path, sizeof(path), "%s\\LOG%05d.BFL", dir, existing + 1);
+            // No directory walk and no prune here: sitlBlackboxCollect() and
+            // sitlBlackboxEnforce() are opendir + readdir + remove/rename walks,
+            // and this runs on the flight thread (blackboxVirtualBeginLog() is
+            // called from the blackbox task, i.e. inside a step). The name comes
+            // from a counter that the boot/prune path keeps in sync with the
+            // folder, and the housekeeping is requested instead - the MSP thread
+            // runs it a millisecond or two later.
+            // BF_SITL_BLACKBOX_LEGACY_OPEN=1 restores the old behaviour (scan
+            // the folder and prune inline, on the flight thread) so the A/B for
+            // "is the scan-free open responsible" can be run without a rebuild.
+            static int legacyOpen = -1;
+            if (legacyOpen < 0) {
+                const char *env = getenv("BF_SITL_BLACKBOX_LEGACY_OPEN");
+                legacyOpen = (env != NULL && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+            }
+            const int number = legacyOpen
+                ? sitlBlackboxEnforce(dir, (gBlackboxMaxLogs > 0) ? gBlackboxMaxLogs - 1 : -1,
+                                      NULL) + 1
+                : sitlBlackboxNextNumber();
+            _snprintf(path, sizeof(path), "%s\\LOG%05d.BFL", dir, number % 100000);
             fp = fopen(path, mode);
             if (fp != NULL) {
+                strncpy(gBlackboxOpenLogName, path, sizeof(gBlackboxOpenLogName) - 1);
+                gBlackboxOpenLogName[sizeof(gBlackboxOpenLogName) - 1] = '\0';
                 sitlAuditLog("blackbox: new log LOG%05d.BFL in %s (max %d)",
-                             existing + 1, dir, gBlackboxMaxLogs);
+                             number % 100000, dir, gBlackboxMaxLogs);
+                if (!legacyOpen) {
+                    gBlackboxPruneRequest = 1;
+                }
             }
         } else {
             _snprintf(path, sizeof(path), "%s\\%s", dir, filename);
@@ -1524,7 +2132,11 @@ bool blackboxVirtualOpen(void)
         // Trim to the cap and renumber the survivors to LOG00001.. so a folder
         // that was left with drifting numbers (or came from an older build) is
         // tidied up at every boot / directory switch.
-        (void)sitlBlackboxEnforce(dir, (gBlackboxMaxLogs > 0) ? gBlackboxMaxLogs : -1);
+        const int kept = sitlBlackboxEnforce(dir, (gBlackboxMaxLogs > 0) ? gBlackboxMaxLogs : -1, NULL);
+        // The survivors are LOG00001..LOG000kept, so the next log this layer
+        // creates is kept+1. Seeding the counter here is what lets the flight
+        // thread open a log without walking the folder (see sitlBlackboxFopen).
+        InterlockedExchange(&gBlackboxNextNumberValue, kept);
     }
     return sitlBlackboxVirtualOpenReal();
 }
@@ -1560,7 +2172,9 @@ int sitl_local_set_blackbox_max_logs(int maxLogs)
     gBlackboxMaxLogs = maxLogs;
     char dir[MAX_PATH];
     if (sitlBlackboxDir(dir, sizeof(dir)) != NULL) {
-        (void)sitlBlackboxEnforce(dir, (gBlackboxMaxLogs > 0) ? gBlackboxMaxLogs : -1);
+        const int kept = sitlBlackboxEnforce(dir, (gBlackboxMaxLogs > 0) ? gBlackboxMaxLogs : -1,
+                                             gBlackboxOpenLogName[0] ? gBlackboxOpenLogName : NULL);
+        InterlockedExchange(&gBlackboxNextNumberValue, kept);
     }
     return 0;
 }
@@ -1801,7 +2415,35 @@ void systemReset(void)
 // CMakeLists.txt so the virtual FC reports what the simulator sends.
 void sitlBatteryVoltageRefresh(void)
 {
-    // No-op: the value comes from the UDP telemetry feed.
+    // No-op: the value comes from the simulator (sitlBatteryVoltageRead).
+    //
+    // This hook runs *inside* batteryUpdateVoltage(), before voltageMeterADCRead()
+    // has produced this tick's value - so presence detection belongs in
+    // batteryUpdateVoltage() below, after the complete stock update.
+}
+
+// battery.c's batteryUpdateVoltage() is renamed to sitlBatteryUpdateVoltageReal()
+// by CMakeLists.txt; this is the firmware-facing entry point (TASK_BATTERY_VOLTAGE,
+// 50 Hz).
+void batteryUpdateVoltage(timeUs_t currentTimeUs)
+{
+    extern void sitlBatteryUpdateVoltageReal(timeUs_t currentTimeUs);
+
+    sitlBatteryUpdateVoltageReal(currentTimeUs);
+
+    // voltageMeter now holds this tick's filtered value.
+    //
+    // Stock firmware probes for the battery only from taskBatteryAlerts() and
+    // only while DISARMED. A host that arms before the voltage filter reports a
+    // stable pack (e.g. right after a reboot, when batteryInit() has just reset
+    // batteryCellCount to 0) would then never get a cell count - and every
+    // consumer of it (MSP/OSD cell voltage, current thresholds, mAh) stays at 0
+    // until a disarm/rearm cycle. The SITL battery is physically always
+    // connected, so keep probing from the 50 Hz voltage task until the count
+    // exists; batteryUpdatePresence() is idempotent once it does.
+    if (getBatteryCellCount() == 0) {
+        batteryUpdatePresence();
+    }
 }
 
 void sitlBatteryVoltageRead(voltageSensorADC_e adcChannel, voltageMeter_t *voltageMeter)

@@ -283,6 +283,25 @@ void sitlBoot(int argc, char *argv[])
     // motor output.
     extern void sitlLocalPreMotorInit(void);
     sitlLocalPreMotorInit();
+
+    // The virtual battery meters have to be selected before batteryInit() and
+    // tasksInit() run (both are in initPhase3): they enable TASK_BATTERY_VOLTAGE
+    // / TASK_BATTERY_CURRENT / TASK_BATTERY_ALERTS from the meter sources, and a
+    // stored EEPROM that says VOLTAGE_METER_NONE would otherwise leave all three
+    // off for the whole session (voltage/current/mAh stuck at 0).
+    extern void sitlLocalPreBatteryInit(void);
+    sitlLocalPreBatteryInit();
+
+    // The OSD is compiled in now, but the runtime gate in fc/init.c is
+    // featureIsEnabled(FEATURE_OSD), and a stored EEPROM's feature mask takes
+    // precedence over DEFAULT_FEATURES. The shipped EEPROM's mask
+    // (0x10400082) has no OSD bit and configurationState is CONFIGURED, so
+    // without this the OSD would stay switched off. Enable it here - after
+    // initPhase1 (the EEPROM read, which would otherwise overwrite it) and
+    // before initPhase3, where fc/init.c builds the displayport and
+    // fc/tasks.c enables TASK_OSD.
+    extern void sitlOsdEnableFeature(void);
+    sitlOsdEnableFeature();
 #endif
 
 #ifdef ENABLE_MULTICORE_INIT

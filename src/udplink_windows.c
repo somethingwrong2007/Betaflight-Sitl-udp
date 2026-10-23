@@ -96,6 +96,11 @@ void simTelemetryCurrentRefresh(int32_t lastUpdateAtUs)
     }
 }
 
+void simTelemetryResetMahDrawn(void)
+{
+    sitlMahDrawn = 0.0;
+}
+
 float simTelemetryMotorFrequencyHz(uint8_t motorIndex)
 {
     if (motorIndex >= SITL_FDM_EXT_MOTOR_RPM_COUNT) {

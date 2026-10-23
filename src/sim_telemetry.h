@@ -19,6 +19,10 @@ uint16_t simTelemetryVoltageCentiVolts(void);
 float simTelemetryCurrentAmps(void);
 float simTelemetryMahDrawn(void);
 void simTelemetryCurrentRefresh(int32_t lastUpdateAtUs);
+/** Drop the consumed-charge counter. A real FC starts a power cycle with an
+ *  empty mAh counter; an in-process restart has to clear it explicitly, or the
+ *  OSD / configurator mAh element keeps the previous session's total. */
+void simTelemetryResetMahDrawn(void);
 float simTelemetryMotorFrequencyHz(uint8_t motorIndex);
 
 // ESC temperature in whole degrees Celsius, clamped to the 0..255 range the
